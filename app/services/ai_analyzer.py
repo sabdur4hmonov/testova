@@ -1,0 +1,483 @@
+"""
+AI question extractor — Gemini Vision, 1 page per call, parallel.
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import re
+from typing import Any
+
+import google.generativeai as genai
+from PIL import Image
+
+from app.config import settings
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+genai.configure(api_key=settings.GEMINI_API_KEY)
+
+MAX_CONCURRENT = 4   # parallel Gemini calls
+CALL_TIMEOUT   = 90  # seconds
+
+# ── Prompt ──────────────────────────────────────────────────────────────────────
+VISION_PROMPT = """You are a professional exam question extractor. Extract ALL questions from this test page image.
+Return ONLY a valid JSON array. No markdown, no code blocks, no explanation. ONLY JSON.
+
+Format:
+[
+  {
+    "n": 1,
+    "q": "full question text exactly as written",
+    "A": "option A text exactly as written",
+    "B": "option B text exactly as written",
+    "C": "option C text exactly as written",
+    "D": "option D text exactly as written",
+    "ans": null,
+    "img": false,
+    "img_desc": null,
+    "group": null,
+    "group_context": null
+  }
+]
+
+CRITICAL RULES:
+1. Extract ALL questions visible on this page, do not skip any
+2. Keep the original question number (n) exactly as shown
+3. Copy ALL text EXACTLY as written - do not change +/- signs, do not modify equations
+4. For equations: copy character by character. If you see 3(x+1) write 3(x+1), NOT 3(x-1)
+5. If a question has an image/diagram/table: set img=true, describe it in img_desc
+6. For answer options: if options ARE on this page, copy them exactly
+7. If answer options are NOT visible on this page (cut off), leave A/B/C/D as empty string ""
+8. Do NOT invent or guess missing options - leave them as ""
+9. Do NOT use LaTeX or $ symbols. Write math in plain text:
+   - Fractions: write as (a)/(b) example: (1)/(2)
+   - Powers: write as x^2 or x^n
+   - Square root: write as sqrt(x)
+   - π symbol: write as π (the actual symbol)
+   - Infinity: write as ∞
+10. Keep Uzbek and Russian text exactly as is, do not translate
+11. IMPORTANT: Some questions may have NO answer options at all (open-ended questions).
+    If a question genuinely has no A/B/C/D options anywhere on the page, leave all as "".
+12. SHARED PASSAGES / READING GROUPS: Some questions share a common passage, text,
+    table, dialogue, or instruction that applies to several consecutive questions
+    (e.g. "Read the text and answer questions 4-6", or a paragraph followed by
+    several questions about it).
+    - For EVERY question that belongs to the same shared block, set "group" to the
+      SAME short label (e.g. "g1" for the first block, "g2" for the second).
+    - Put the shared passage/instruction text in "group_context" - the SAME text
+      for each question in that block.
+    - For a normal standalone question with no shared passage, set both "group"
+      and "group_context" to null.
+13. RETURN ONLY THE JSON ARRAY - nothing else"""
+
+ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
+Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
+FAQAT JSON: {{"answers": {{"1": "A", "2": null}}}}"""
+
+
+# ── LaTeX cleanup ────────────────────────────────────────────────────────────────
+
+def clean_latex(text: str) -> str:
+    """
+    Remove LaTeX math notation and convert to plain readable text.
+    Applied to all question text and answer options after Gemini returns them.
+    """
+    if not text:
+        return text
+
+    # \frac{a}{b} -> (a)/(b)
+    for _ in range(4):
+        text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'(\1)/(\2)', text)
+
+    # \sqrt{x} -> sqrt(x)
+    text = re.sub(r'\\sqrt\{([^{}]+)\}', r'sqrt(\1)', text)
+
+    # \sqrt[n]{x} -> nth_root(x)
+    text = re.sub(r'\\sqrt\[([^\]]+)\]\{([^{}]+)\}', r'\1_root(\2)', text)
+
+    # \cdot -> *
+    text = text.replace(r'\cdot', ' * ')
+
+    # \times -> x
+    text = text.replace(r'\times', ' x ')
+
+    # \div -> /
+    text = text.replace(r'\div', ' / ')
+
+    # \leq -> <=  \geq -> >=  \neq -> !=
+    text = text.replace(r'\leq', '<=')
+    text = text.replace(r'\geq', '>=')
+    text = text.replace(r'\neq', '!=')
+    text = text.replace(r'\ne',  '!=')
+
+    # \infty -> ∞
+    text = text.replace(r'\infty', '∞')
+
+    # \pi -> π
+    text = text.replace(r'\pi', 'π')
+
+    # Greek letters
+    greek = {
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+        r'\epsilon': 'ε', r'\theta': 'θ', r'\lambda': 'λ', r'\mu': 'μ',
+        r'\sigma': 'σ', r'\omega': 'ω', r'\phi': 'φ', r'\psi': 'ψ',
+    }
+    for latex_sym, unicode_sym in greek.items():
+        text = text.replace(latex_sym, unicode_sym)
+
+    # Set symbols
+    text = text.replace(r'\in',    '∈')
+    text = text.replace(r'\notin', '∉')
+    text = text.replace(r'\cup',   '∪')
+    text = text.replace(r'\cap',   '∩')
+    text = text.replace(r'\subset','⊂')
+
+    # ^{...} and _{...}
+    text = re.sub(r'\^\{([^{}]+)\}', r'^(\1)', text)
+    text = re.sub(r'_\{([^{}]+)\}',  r'_(\1)', text)
+
+    # Simple ^x and _x
+    text = re.sub(r'\^([A-Za-z0-9])', r'^\1', text)
+    text = re.sub(r'_([A-Za-z0-9])',  r'_\1', text)
+
+    # Remove $...$ inline math markers
+    text = re.sub(r'\$\$([^$]+)\$\$', r'\1', text)
+    text = re.sub(r'\$([^$]+)\$',     r'\1', text)
+
+    # Remove \begin{...} \end{...}
+    text = re.sub(r'\\begin\{[^}]+\}', '', text)
+    text = re.sub(r'\\end\{[^}]+\}',   '', text)
+
+    # Remove remaining backslash commands
+    text = re.sub(r'\\text\{([^{}]+)\}', r'\1', text)
+    text = re.sub(r'\\[a-zA-Z]+\b', '', text)
+
+    # Clean up extra whitespace
+    text = re.sub(r'  +', ' ', text)
+    return text.strip()
+
+
+def clean_question(q: dict) -> dict:
+    """Apply clean_latex to all text fields of a question dict."""
+    q["question_text"] = clean_latex(q.get("question_text", ""))
+    opts = q.get("options", {})
+    q["options"] = {k: clean_latex(v) for k, v in opts.items() if v}
+    if q.get("image_description"):
+        q["image_description"] = clean_latex(q["image_description"])
+    return q
+
+
+def _is_open_ended(q: dict) -> bool:
+    """
+    BUG FIX: Detect questions that genuinely have no answer options.
+    These are open-ended questions (like 'n ∈ N, 7n+4 juft bo'lsa...').
+    They should be kept but marked clearly so the PDF generator can
+    render them without A/B/C/D slots.
+    """
+    opts = q.get("options", {})
+    filled = [v for v in opts.values() if v and v.strip()]
+    return len(filled) == 0
+
+
+class AIAnalyzer:
+    def __init__(self) -> None:
+        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        self._sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+    # ── Gemini call ─────────────────────────────────────────────────────────────
+
+    def _call_sync(self, prompt: str, image_bytes: bytes) -> str:
+        """Call Gemini with one PNG image."""
+        inline = {"mime_type": "image/png", "data": image_bytes}
+        response = self.model.generate_content(
+            [prompt, inline],
+            generation_config=genai.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=4096,
+                response_mime_type="application/json",
+            ),
+        )
+        if response.candidates:
+            fr = response.candidates[0].finish_reason
+            if fr == 4:
+                raise RuntimeError("RECITATION_BLOCK page blocked by Gemini copyright filter")
+        return response.text
+
+    async def _call(self, prompt: str, image_bytes: bytes) -> str:
+        async with self._sem:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._call_sync, prompt, image_bytes),
+                timeout=CALL_TIMEOUT,
+            )
+
+    # ── Per-page extraction ─────────────────────────────────────────────────────
+
+    async def _extract_page(self, page_num: int, img: Image.Image) -> list[dict]:
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        for attempt in range(settings.GEMINI_MAX_RETRIES):
+            try:
+                raw = await self._call(VISION_PROMPT, img_bytes)
+                questions = self._parse(raw, page_num)
+                for q in questions:
+                    q["page_number"] = page_num
+                    clean_question(q)
+                if questions:
+                    logger.info("page_ok", page=page_num, found=len(questions))
+                else:
+                    logger.warning("page_empty", page=page_num, raw_preview=raw[:300])
+                return questions
+            except asyncio.TimeoutError:
+                logger.warning("page_timeout", page=page_num, attempt=attempt + 1)
+            except Exception as e:
+                logger.warning("page_error", page=page_num, attempt=attempt + 1, error=str(e))
+            if attempt < settings.GEMINI_MAX_RETRIES - 1:
+                await asyncio.sleep(2 ** attempt)
+        return []
+
+    # ── Public ──────────────────────────────────────────────────────────────────
+
+    async def extract_all_questions(
+        self,
+        images: list[Image.Image],
+        **_kw,
+    ) -> list[dict[str, Any]]:
+        if not images:
+            return []
+
+        # BUG FIX: Run pages in order, preserving page_num sequence.
+        # asyncio.gather preserves result ORDER (index matches task index),
+        # so results[0] = page 1, results[1] = page 2, etc.
+        # We use return_exceptions=True to not crash on one bad page.
+        tasks = [self._extract_page(i + 1, img) for i, img in enumerate(images)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # BUG FIX: Collect questions PAGE BY PAGE in order.
+        # This ensures that when we merge a question split across pages,
+        # we always see the earlier page's version first.
+        all_q_by_page: list[list[dict]] = []
+        for page_idx, r in enumerate(results):
+            page_num = page_idx + 1
+            if isinstance(r, Exception):
+                logger.error("page_task_failed", page=page_num, error=str(r))
+                all_q_by_page.append([])
+            else:
+                all_q_by_page.append(r)
+
+        # ── Merge: questions split across pages ─────────────────────────────
+        # Strategy:
+        # 1. First pass — collect all occurrences of each question number,
+        #    in page order.
+        # 2. For each question number, start from the first occurrence and
+        #    fill in missing options from subsequent pages (handles 3-page splits).
+        # 3. Mark open-ended questions (no options anywhere) clearly.
+
+        # {question_number: [q_dict from page1, q_dict from page2, ...]}
+        occurrences: dict[int, list[dict]] = {}
+        for page_questions in all_q_by_page:
+            for q in page_questions:
+                n = q.get("question_number", 0)
+                if not n:
+                    continue
+                occurrences.setdefault(n, []).append(q)
+
+        merged: dict[int, dict] = {}
+        for n, qs in occurrences.items():
+            # Start with the first occurrence (earliest page = most complete text)
+            primary = qs[0]
+
+            # BUG FIX: Merge options from ALL subsequent occurrences, not just one.
+            # This handles questions whose options span pages 2 AND 3.
+            for subsequent in qs[1:]:
+                sub_opts = subsequent.get("options", {})
+                for letter in "ABCD":
+                    existing_val = primary.get("options", {}).get(letter, "")
+                    new_val = sub_opts.get(letter, "")
+                    if not existing_val and new_val:
+                        primary.setdefault("options", {})[letter] = new_val
+                        logger.info(
+                            "merged_option",
+                            question=n,
+                            letter=letter,
+                            from_page=subsequent.get("page_number"),
+                        )
+
+                # Also merge image info if primary lacks it
+                if not primary.get("has_image") and subsequent.get("has_image"):
+                    primary["has_image"] = True
+                    primary["image_description"] = subsequent.get("image_description")
+
+            # BUG FIX: Detect and mark open-ended questions instead of
+            # leaving them with no options and confusing the PDF generator.
+            if _is_open_ended(primary):
+                primary["is_open_ended"] = True
+                logger.info(
+                    "open_ended_question",
+                    question=n,
+                    text_preview=primary.get("question_text", "")[:60],
+                )
+            else:
+                primary["is_open_ended"] = False
+
+            merged[n] = primary
+
+        # Sort by question number for clean output
+        unique = sorted(merged.values(), key=lambda x: x.get("question_number", 0))
+        logger.info("extraction_done", total=len(unique), pages=len(images))
+        return unique
+
+    async def analyze_answer_sheet(
+        self, image: Image.Image, total_questions: int
+    ) -> dict[str, str | None]:
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="PNG")
+        prompt = ANSWER_SHEET_PROMPT.format(total=total_questions)
+        for attempt in range(settings.GEMINI_MAX_RETRIES):
+            try:
+                raw = await self._call(prompt, buf.getvalue())
+                cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+                data = json.loads(cleaned)
+                answers: dict[str, str | None] = {}
+                for k, v in data.get("answers", {}).items():
+                    answers[str(k)] = str(v).strip().upper()[:1] if v else None
+                return answers
+            except asyncio.TimeoutError:
+                logger.warning("answer_sheet_timeout", attempt=attempt + 1)
+            except Exception as e:
+                logger.warning("answer_sheet_error", attempt=attempt + 1, error=str(e))
+            if attempt < settings.GEMINI_MAX_RETRIES - 1:
+                await asyncio.sleep(2 ** attempt)
+        return {}
+
+    # ── Parser ──────────────────────────────────────────────────────────────────
+
+    def _parse(self, raw: str, page_num: int = 0) -> list[dict[str, Any]]:
+        """Extract JSON array from Gemini response robustly."""
+        text = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+
+        data = self._try_json(text)
+
+        if data is None:
+            s = text.find("[")
+            e = text.rfind("]")
+            if s != -1 and e > s:
+                data = self._try_json(text[s: e + 1])
+
+        if data is None:
+            for m in re.finditer(r'\[[\s\S]+?\]', text):
+                data = self._try_json(m.group())
+                if data is not None:
+                    break
+
+        if data is None:
+            logger.error("parse_failed", page=page_num, raw=raw[:500])
+            return []
+
+        if isinstance(data, dict):
+            data = data.get("questions", data.get("groups", []))
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                if "questions" in data[0]:
+                    flat = []
+                    for g in data:
+                        flat.extend(g.get("questions", []))
+                    data = flat
+
+        if not isinstance(data, list):
+            logger.error("not_a_list", page=page_num, type=type(data).__name__)
+            return []
+
+        return self._normalize(data, page_num)
+
+    @staticmethod
+    def _try_json(text: str):
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _normalize(self, questions: list, page_num: int = 0) -> list[dict[str, Any]]:
+        """Convert various field-name styles to internal format."""
+        result = []
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+
+            num = (
+                q.get("question_number")
+                or q.get("n")
+                or q.get("number")
+                or q.get("num")
+                or 0
+            )
+            try:
+                num = int(num)
+            except (TypeError, ValueError):
+                num = 0
+
+            text = (
+                q.get("question_text")
+                or q.get("q")
+                or q.get("text")
+                or q.get("question")
+                or ""
+            )
+
+            opts_raw = q.get("options") or {}
+            if isinstance(opts_raw, dict):
+                options = {k: v for k, v in opts_raw.items() if k in "ABCDE" and v}
+            else:
+                options = {}
+            for letter in "ABCDE":
+                if not options.get(letter) and q.get(letter):
+                    options[letter] = q[letter]
+
+            ca = q.get("correct_answer") or q.get("ans") or q.get("answer")
+            ca = str(ca).strip().upper()[:1] if ca else None
+            if ca not in ("A", "B", "C", "D", "E"):
+                ca = None
+
+            has_img = bool(
+                q.get("has_image_or_table")
+                or q.get("has_image")
+                or q.get("img")
+            )
+            img_desc = (
+                q.get("visual_description")
+                or q.get("image_description")
+                or q.get("img_desc")
+            )
+
+            # Reading-comprehension / shared-passage grouping.
+            # Namespace the label by page so the same label ("g1") appearing on
+            # two different pages is never merged into one group. Truncate to fit
+            # the Question.group_id String(64) column.
+            grp = q.get("group") or q.get("group_id") or q.get("group_label")
+            grp_ctx = (
+                q.get("group_context")
+                or q.get("context")
+                or q.get("passage")
+            )
+            group_id = None
+            group_context = None
+            if grp not in (None, "", "null", "None"):
+                group_id = f"p{page_num}_{str(grp).strip()}"[:64]
+                group_context = clean_latex(str(grp_ctx)) if grp_ctx else None
+
+            result.append({
+                "question_number": num,
+                "question_text": str(text),
+                "options": options,
+                "correct_answer": ca,
+                "has_image": has_img,
+                "image_description": str(img_desc) if img_desc else None,
+                "image_path": None,
+                "is_open_ended": False,  # will be set in extract_all_questions
+                "group_id": group_id,
+                "group_context": group_context,
+            })
+        return result

@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.database import Base
+
+
+class Question(Base):
+    __tablename__ = "questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    question_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Answer options — stored as plain text
+    option_a: Mapped[str | None] = mapped_column(Text, nullable=True)
+    option_b: Mapped[str | None] = mapped_column(Text, nullable=True)
+    option_c: Mapped[str | None] = mapped_column(Text, nullable=True)
+    option_d: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    correct_answer: Mapped[str | None] = mapped_column(
+        String(4), nullable=True
+    )  # "A" | "B" | "C" | "D"
+
+    # Image support
+    has_image: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    image_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    image_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Reading-comprehension group support
+    group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    group_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Source location
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Relationships
+    project: Mapped["Project"] = relationship(back_populates="questions")  # type: ignore[name-defined]
+
+    def to_dict(self) -> dict:
+        return {
+            "question_id": str(self.id),
+            "question_number": self.question_number,
+            "question_text": self.question_text,
+            "options": {
+                "A": self.option_a,
+                "B": self.option_b,
+                "C": self.option_c,
+                "D": self.option_d,
+            },
+            "correct_answer": self.correct_answer,
+            "has_image": self.has_image,
+            "image_path": self.image_path,
+        }
+
+    def __repr__(self) -> str:
+        return f"<Question #{self.question_number} project={self.project_id}>"
