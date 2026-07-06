@@ -317,7 +317,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 ))
             else:
                 # Answer options (multiple-choice only)
-                for letter in ["A", "B", "C", "D"]:
+                for letter in ["A", "B", "C", "D", "E"]:
                     opt_text = options.get(letter)
                     if opt_text:
                         story.append(Paragraph(

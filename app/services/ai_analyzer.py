@@ -100,6 +100,26 @@ ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
 FAQAT JSON: {{"answers": {{"1": "A", "2": null}}}}"""
 
+# BUG FIX (#1): targeted second pass for questions extracted with zero options.
+RECOVER_OPTIONS_PROMPT = """These test-page image(s) contain questions whose answer options were NOT captured
+in a previous extraction pass.
+Question numbers to recover: {nums}
+
+For EACH of these question numbers, look for its printed answer options
+(A/B/C/D, sometimes E). The options may be detached from the question stem:
+after an image or table, at the bottom of the first page, or at the top of
+the second page (after header/footer lines).
+
+Return ONLY a JSON array, one item per question number:
+[{{"n": 20, "A": "option text", "B": "...", "C": "...", "D": "..."}}]
+
+CRITICAL RULES:
+- Copy option text EXACTLY as printed; keep math symbols (∈ ∅ π √ ...) as real Unicode
+- If a question genuinely has NO printed options anywhere on these pages,
+  return "" for all its letters
+- NEVER invent, guess or complete options that are not printed on the pages
+- RETURN ONLY THE JSON ARRAY - nothing else"""
+
 
 # ── LaTeX cleanup ────────────────────────────────────────────────────────────────
 
@@ -212,11 +232,12 @@ class AIAnalyzer:
 
     # ── Gemini call ─────────────────────────────────────────────────────────────
 
-    def _call_sync(self, prompt: str, image_bytes: bytes) -> str:
-        """Call Gemini with one PNG image."""
-        inline = {"mime_type": "image/png", "data": image_bytes}
+    def _call_sync_multi(self, prompt: str, images_bytes: list[bytes]) -> str:
+        """Call Gemini with one or more PNG images."""
+        parts: list = [prompt]
+        parts += [{"mime_type": "image/png", "data": b} for b in images_bytes]
         response = self.model.generate_content(
-            [prompt, inline],
+            parts,
             generation_config=genai.GenerationConfig(
                 temperature=0.1,
                 max_output_tokens=4096,
@@ -229,10 +250,26 @@ class AIAnalyzer:
                 raise RuntimeError("RECITATION_BLOCK page blocked by Gemini copyright filter")
         return response.text
 
+    def _call_sync(self, prompt: str, image_bytes: bytes) -> str:
+        """Call Gemini with one PNG image."""
+        return self._call_sync_multi(prompt, [image_bytes])
+
     async def _call(self, prompt: str, image_bytes: bytes) -> str:
         async with self._sem:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._call_sync, prompt, image_bytes),
+                timeout=CALL_TIMEOUT,
+            )
+
+    async def _call_multi(self, prompt: str, images: list[Image.Image]) -> str:
+        blobs: list[bytes] = []
+        for img in images:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="PNG")
+            blobs.append(buf.getvalue())
+        async with self._sem:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._call_sync_multi, prompt, blobs),
                 timeout=CALL_TIMEOUT,
             )
 
@@ -293,8 +330,94 @@ class AIAnalyzer:
                 all_q_by_page.append(r)
 
         unique = self._merge_pages(all_q_by_page)
+        unique = await self._recover_missing_options(unique, images)
         logger.info("extraction_done", total=len(unique), pages=len(images))
         return unique
+
+    # ── Zero-option recovery pass (#1) ──────────────────────────────────────────
+
+    async def _recover_missing_options(
+        self, questions: list[dict[str, Any]], images: list[Image.Image]
+    ) -> list[dict[str, Any]]:
+        """
+        BUG FIX (#1): a question that ends up with zero options is not always
+        open-ended — its options may simply have been lost during extraction.
+        Before declaring it open-ended, make ONE targeted Gemini call per
+        affected page asking specifically for those questions' options,
+        sending the page plus the following page (options may sit across
+        the break). Best-effort: any failure leaves today's behavior.
+        """
+        by_page: dict[int, list[dict]] = {}
+        for q in questions:
+            if q.get("is_open_ended") and not q.get("options"):
+                page = q.get("page_number") or 0
+                if 1 <= page <= len(images):
+                    by_page.setdefault(page, []).append(q)
+
+        if not by_page:
+            return questions
+
+        for page, page_targets in sorted(by_page.items()):
+            nums = [q.get("question_number") for q in page_targets]
+            prompt = RECOVER_OPTIONS_PROMPT.format(
+                nums=", ".join(str(n) for n in nums)
+            )
+            imgs = [images[page - 1]]
+            if page < len(images):
+                imgs.append(images[page])
+            try:
+                raw = await self._call_multi(prompt, imgs)
+                items = self._parse(raw, page_num=page)
+            except Exception as e:
+                logger.warning("options_recovery_failed", page=page, error=str(e))
+                continue
+            for item in items:
+                clean_question(item)
+            repaired = self._apply_recovered_options(page_targets, items)
+            logger.info(
+                "options_recovery_pass",
+                page=page,
+                asked=nums,
+                repaired=repaired,
+            )
+        return questions
+
+    @staticmethod
+    def _apply_recovered_options(
+        targets: list[dict], recovered: list[dict]
+    ) -> int:
+        """
+        Apply a recovery-pass result to zero-option questions.
+        Hallucination guard: a result is accepted only if it carries at
+        least 2 non-empty options for that question number — otherwise the
+        question stays open-ended. Returns how many questions were repaired.
+        """
+        by_num = {q.get("question_number"): q for q in targets}
+        repaired = 0
+        for item in recovered:
+            target = by_num.get(item.get("question_number"))
+            if target is None:
+                continue
+            opts = {
+                k: v
+                for k, v in (item.get("options") or {}).items()
+                if v and str(v).strip()
+            }
+            if len(opts) < 2:
+                logger.info(
+                    "recovery_confirmed_open_ended",
+                    question=item.get("question_number"),
+                )
+                continue
+            target["options"] = opts
+            target["is_open_ended"] = False
+            repaired += 1
+            logger.info(
+                "options_recovered",
+                question=item.get("question_number"),
+                letters=sorted(opts),
+            )
+        return repaired
 
     # ── Cross-page merge & stitching ────────────────────────────────────────────
 

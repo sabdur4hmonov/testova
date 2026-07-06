@@ -17,7 +17,10 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-OPTION_LETTERS = ["A", "B", "C", "D"]
+# BUG FIX (#9): include E — previously a 5-option question had its E option
+# silently dropped by the shuffle, and if E was the correct answer the
+# variant's answer key became None.
+OPTION_LETTERS = ["A", "B", "C", "D", "E"]
 
 
 # ── Pre-export validation ───────────────────────────────────────────────────────

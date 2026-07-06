@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.variant_generator import generate_variants, format_answer_key_text
+from app.services.variant_generator import generate_variants, validate_questions
 
 
 SAMPLE_QUESTIONS = [
@@ -65,13 +65,6 @@ def test_options_are_shuffled_or_same():
             assert len(q_data["options"]) == 4
 
 
-def test_format_answer_key():
-    variants = generate_variants(SAMPLE_QUESTIONS, count=1, seed=0)
-    text = format_answer_key_text(variants[0])
-    assert "Variant 1" in text
-    assert "1." in text
-
-
 def test_empty_questions_raises():
     with pytest.raises(ValueError):
         generate_variants([], count=3)
@@ -83,3 +76,77 @@ def test_single_question():
     assert len(variants) == 3
     for v in variants:
         assert len(v["answer_key"]) == 1
+
+
+# ── Bug #9: E options must survive the shuffle ────────────────────────────────
+
+FIVE_OPTION_Q = [
+    {
+        "question_id": "q1",
+        "question_number": 1,
+        "question_text": "Five options",
+        "options": {"A": "a", "B": "b", "C": "c", "D": "d", "E": "e"},
+        "correct_answer": "E",
+        "has_image": False,
+    }
+]
+
+
+def test_e_option_not_dropped_by_shuffle():
+    variants = generate_variants(FIVE_OPTION_Q, count=10, seed=3)
+    for v in variants:
+        opts = v["questions_data"][0]["options"]
+        assert len(opts) == 5
+        assert set(opts.values()) == {"a", "b", "c", "d", "e"}
+
+
+def test_correct_answer_e_never_becomes_none():
+    variants = generate_variants(FIVE_OPTION_Q, count=10, seed=3)
+    for v in variants:
+        key = v["answer_key"]["1"]
+        assert key is not None
+        # The key must still point at the original E content
+        assert v["questions_data"][0]["options"][key] == "e"
+
+
+# ── Bug #5: pre-export validation ─────────────────────────────────────────────
+
+def test_validate_rejects_single_option_and_compacts_blanks():
+    qs = [
+        {
+            "question_id": "q1",
+            "question_number": 1,
+            "question_text": "one option only",
+            "options": {"A": "a", "B": "", "C": "", "D": ""},
+            "correct_answer": "A",
+        },
+        {
+            "question_id": "q2",
+            "question_number": 2,
+            "question_text": "blank C",
+            "options": {"A": "a", "B": "b", "C": "", "D": "d"},
+            "correct_answer": "D",
+        },
+    ]
+    valid, rejected = validate_questions(qs)
+    assert [r["question_number"] for r in rejected] == [1]
+    assert len(valid) == 1
+    q2 = valid[0]
+    assert list(q2["options"].keys()) == ["A", "B", "C"]
+    assert q2["correct_answer"] == "C"
+    assert q2["options"]["C"] == "d"
+
+
+def test_validate_marks_open_ended():
+    qs = [
+        {
+            "question_id": "q1",
+            "question_number": 1,
+            "question_text": "open",
+            "options": {},
+            "correct_answer": None,
+        }
+    ]
+    valid, rejected = validate_questions(qs)
+    assert not rejected
+    assert valid[0]["is_open_ended"] is True

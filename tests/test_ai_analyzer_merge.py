@@ -160,3 +160,44 @@ def test_sorted_output():
     ]
     result = merge(pages)
     assert [x["question_number"] for x in result] == [1, 2, 3]
+
+
+# ── Bug #1: zero-option recovery pass (apply step) ────────────────────────────
+
+def test_recovery_applies_options_and_clears_open_ended():
+    target = q(20, "cut question", opts={})
+    target["is_open_ended"] = True
+    recovered = [q(20, "", opts={"A": "2n+2", "B": "3n+3", "C": "4+n", "D": "n+2"})]
+    repaired = AIAnalyzer._apply_recovered_options([target], recovered)
+    assert repaired == 1
+    assert target["options"] == {"A": "2n+2", "B": "3n+3", "C": "4+n", "D": "n+2"}
+    assert target["is_open_ended"] is False
+
+
+def test_recovery_rejects_fewer_than_two_options():
+    # Hallucination guard: 0 or 1 recovered options → question stays open-ended.
+    target = q(5, "truly open", opts={})
+    target["is_open_ended"] = True
+    recovered = [q(5, "", opts={"A": "only one"})]
+    repaired = AIAnalyzer._apply_recovered_options([target], recovered)
+    assert repaired == 0
+    assert target["options"] == {}
+    assert target["is_open_ended"] is True
+
+
+def test_recovery_ignores_unknown_question_numbers():
+    target = q(5, "open", opts={})
+    target["is_open_ended"] = True
+    recovered = [q(99, "", opts=FULL)]
+    repaired = AIAnalyzer._apply_recovered_options([target], recovered)
+    assert repaired == 0
+    assert target["is_open_ended"] is True
+
+
+def test_recovery_strips_blank_option_strings():
+    target = q(7, "cut", opts={})
+    target["is_open_ended"] = True
+    recovered = [q(7, "", opts={"A": "a", "B": "b", "C": "", "D": "  "})]
+    repaired = AIAnalyzer._apply_recovered_options([target], recovered)
+    assert repaired == 1
+    assert target["options"] == {"A": "a", "B": "b"}

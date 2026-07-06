@@ -70,6 +70,16 @@ T = {
         "en": "❌ No valid questions left — every question has blank or broken options. Check the file and upload again.",
         "ru": "❌ Не осталось корректных вопросов — во всех вопросах пустые или битые варианты ответов. Проверьте файл и загрузите снова.",
     },
+    "gaps_warning": {
+        "uz": "⚠️ Savollar 1–{max} gacha raqamlangan, lekin {found} ta topildi.\nTopilmagan savollar: {missing}\n\nFayldagi shu savollarni tekshirib ko'ring.",
+        "en": "⚠️ Questions are numbered 1–{max} but only {found} were found.\nMissing question numbers: {missing}\n\nPlease check these questions in the file.",
+        "ru": "⚠️ Вопросы пронумерованы 1–{max}, но найдено только {found}.\nНе найдены вопросы: {missing}\n\nПроверьте эти вопросы в файле.",
+    },
+    "open_info": {
+        "uz": "ℹ️ Javob variantlarisiz (ochiq) savollar: {nums}\nBular variantlarda yozma savol sifatida chiqadi.",
+        "en": "ℹ️ Questions without answer options (open-ended): {nums}\nThese will appear as write-in questions in the variants.",
+        "ru": "ℹ️ Вопросы без вариантов ответа (открытые): {nums}\nОни попадут в варианты как вопросы с письменным ответом.",
+    },
 }
 
 
@@ -80,14 +90,14 @@ def t(key: str, lang: str, **kw) -> str:
 def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
     result: dict[str, str] = {}
     text = text.strip().upper()
-    pairs = re.findall(r'(\d+)\s*([ABCD])', text)
+    pairs = re.findall(r'(\d+)\s*([ABCDE])', text)
     if pairs:
         for num_str, letter in pairs:
             n = int(num_str)
             if 1 <= n <= question_count:
                 result[str(n)] = letter
         return result
-    letters = re.findall(r'[ABCD]', text)
+    letters = re.findall(r'[ABCDE]', text)
     for i, letter in enumerate(letters, start=1):
         if i <= question_count:
             result[str(i)] = letter
@@ -218,6 +228,15 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     async with async_session_factory() as session:
         for rq in all_questions:
             opts = rq.get("options", {})
+            if opts.get("E"):
+                # BUG FIX (#9): the questions table only has option_a..option_d
+                # columns, so a 5th option cannot be persisted. Don't lose it
+                # silently — full E support needs an option_e column/migration.
+                logger.warning(
+                    "option_e_dropped_at_persistence",
+                    project_id=project_id,
+                    question=rq.get("question_number"),
+                )
             q = Question(
                 project_id=uuid.UUID(project_id),
                 question_number=rq.get("question_number", 0),
@@ -273,6 +292,24 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         await status_msg.edit_text(
             t("ans_all", lang, n=n), parse_mode="HTML",
         )
+
+    # ── BUG FIX (#16): reconcile numbering, surface anomalies to the teacher ──
+    numbers = sorted(
+        {q.get("question_number", 0) for q in all_questions if q.get("question_number")}
+    )
+    if numbers:
+        max_n = numbers[-1]
+        gaps = [str(x) for x in range(1, max_n + 1) if x not in set(numbers)]
+        if gaps:
+            await message.answer(
+                t("gaps_warning", lang, max=max_n, found=len(numbers),
+                  missing=", ".join(gaps))
+            )
+    open_qs = [
+        str(q["question_number"]) for q in all_questions if q.get("is_open_ended")
+    ]
+    if open_qs:
+        await message.answer(t("open_info", lang, nums=", ".join(open_qs)))
 
 
 @router.message(UploadStates.waiting_for_answers, F.text)
