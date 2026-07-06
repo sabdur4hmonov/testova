@@ -39,7 +39,8 @@ Format:
     "img": false,
     "img_desc": null,
     "group": null,
-    "group_context": null
+    "group_context": null,
+    "section": null
   }
 ]
 
@@ -94,7 +95,18 @@ CRITICAL RULES:
     - put any visible options in A/B/C/D exactly as written
     Do NOT skip such orphaned blocks, do NOT attach them to another question,
     and NEVER treat a header/title/footer line as a question or a question stem.
-14. RETURN ONLY THE JSON ARRAY - nothing else"""
+14. MULTIPLE TESTS IN ONE DOCUMENT: A document may contain several independent
+    tests/sections, each restarting its numbering from 1, usually introduced by
+    a section title line (e.g. "Anorganik moddalarning eng muhim sinflari").
+    If a NEW section/test title appears on this page and question numbering
+    restarts after it, set "section" to that title text on the FIRST question
+    of the new section. For all other questions set "section" to null.
+    Keep each question's printed number exactly as shown - do NOT renumber.
+15. TWO-COLUMN PAGES: If the page is laid out in TWO columns, read the LEFT
+    column completely top-to-bottom FIRST, then the RIGHT column top-to-bottom.
+    NEVER interleave lines or questions across columns. Return questions in
+    that reading order.
+16. RETURN ONLY THE JSON ARRAY - nothing else"""
 
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
@@ -211,6 +223,66 @@ def clean_question(q: dict) -> dict:
     if q.get("image_description"):
         q["image_description"] = clean_latex(q["image_description"])
     return q
+
+
+def renumber_sections(
+    questions: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Multi-test documents: numbering restarts per section, but the rest of the
+    pipeline (DB, answer keys, variants) requires unique question numbers.
+    Renumber continuously (section 1 keeps 1..N, section 2 becomes N+1.., etc.)
+    while keeping each question's printed number in "original_number".
+
+    MUST be called AFTER attach_images_to_questions — image attachment matches
+    PDF regions by the ORIGINAL printed numbers.
+
+    Returns (questions, sections_meta) where each meta entry is JSON-safe:
+    {"section", "title", "count", "max", "offset", "start", "end",
+     "gaps": [original numbers missing], "open": [original numbers open-ended]}
+    """
+    by_section: dict[int, list[dict]] = {}
+    for q in questions:
+        by_section.setdefault(q.get("section", 1), []).append(q)
+
+    sections_meta: list[dict] = []
+    offset = 0
+    for sec in sorted(by_section):
+        qs = sorted(by_section[sec], key=lambda x: x.get("question_number", 0))
+        nums = [q["question_number"] for q in qs if q.get("question_number")]
+        max_n = max(nums) if nums else 0
+        title = next(
+            (q.get("section_title") for q in qs if q.get("section_title")), None
+        )
+        present = set(nums)
+        meta = {
+            "section": sec,
+            "title": title,
+            "count": len(nums),
+            "max": max_n,
+            "offset": offset,
+            "start": offset + 1,
+            "end": offset + max_n,
+            "gaps": [x for x in range(1, max_n + 1) if x not in present],
+            "open": [
+                q["question_number"] for q in qs if q.get("is_open_ended")
+            ],
+        }
+        sections_meta.append(meta)
+        for q in qs:
+            q["original_number"] = q.get("question_number", 0)
+            q["question_number"] = q["original_number"] + offset
+        offset += max_n
+
+    if len(sections_meta) > 1:
+        logger.info(
+            "sections_renumbered",
+            sections=[
+                {k: m[k] for k in ("section", "title", "start", "end")}
+                for m in sections_meta
+            ],
+        )
+    return questions, sections_meta
 
 
 def _is_open_ended(q: dict) -> bool:
@@ -436,11 +508,20 @@ class AIAnalyzer:
            if that page yielded no numbered questions (failed/blocked), the
            fragment is dropped with a warning rather than risk stitching it
            onto the wrong question.
-        2. Merge duplicate question numbers across pages (fill missing options).
-        3. Mark genuinely open-ended questions (no options anywhere).
+        2. Assign section indexes: a document may contain several independent
+           tests whose numbering restarts at 1. A new section starts when
+           Gemini reports a section title, or when the question number drops
+           back to <= 3 (restart rule; the <= 3 tolerance prevents phantom
+           sections if pages are ever extracted slightly out of order).
+        3. Merge duplicate question numbers across pages (fill missing
+           options) — keyed by (section, number) so "question 1" of test 1
+           never collides with "question 1" of test 2.
+        4. Mark genuinely open-ended questions (no options anywhere).
         """
         prev_last: dict | None = None  # last numbered question of the previous page
         pages_clean: list[list[dict]] = []
+        current_section = 1
+        last_num: int | None = None
 
         for page_idx, page_questions in enumerate(all_q_by_page):
             page_num = page_idx + 1
@@ -501,6 +582,39 @@ class AIAnalyzer:
 
             pages_clean.append(rest)
 
+            # ── Section assignment (reading order) ──────────────────────────
+            inversions = 0
+            for q in rest:
+                n = q.get("question_number")
+                if not n:
+                    continue
+                if last_num is not None and n < last_num:
+                    # A genuine restart is a LARGE drop back to the start
+                    # (e.g. 52 -> 1). A small decrease (2 after 3) is far more
+                    # likely extraction noise, so require either Gemini's
+                    # section-title signal or a drop of >= 5 down to <= 3.
+                    if q.get("section_title") or (n <= 3 and last_num - n >= 5):
+                        current_section += 1
+                        logger.info(
+                            "section_start",
+                            section=current_section,
+                            page=page_num,
+                            first_question=n,
+                            title=q.get("section_title"),
+                        )
+                    else:
+                        # Decrease without a restart signature — suspicious
+                        # ordering (possible two-column interleave).
+                        inversions += 1
+                q["section"] = current_section
+                last_num = n
+            if inversions >= 3:
+                logger.warning(
+                    "possible_column_interleave",
+                    page=page_num,
+                    inversions=inversions,
+                )
+
             # The stitch target for the NEXT page is this page's last
             # numbered question (reading order = the one a break would cut).
             page_last: dict | None = None
@@ -517,17 +631,17 @@ class AIAnalyzer:
         #    fill in missing options from subsequent pages (handles 3-page splits).
         # 3. Mark open-ended questions (no options anywhere) clearly.
 
-        # {question_number: [q_dict from page1, q_dict from page2, ...]}
-        occurrences: dict[int, list[dict]] = {}
+        # {(section, question_number): [q_dict from page1, q_dict from page2, ...]}
+        occurrences: dict[tuple[int, int], list[dict]] = {}
         for page_questions in pages_clean:
             for q in page_questions:
                 n = q.get("question_number", 0)
                 if not n:
                     continue
-                occurrences.setdefault(n, []).append(q)
+                occurrences.setdefault((q.get("section", 1), n), []).append(q)
 
-        merged: dict[int, dict] = {}
-        for n, qs in occurrences.items():
+        merged: dict[tuple[int, int], dict] = {}
+        for (sec, n), qs in occurrences.items():
             # Start with the first occurrence (earliest page = most complete text)
             primary = qs[0]
 
@@ -564,10 +678,13 @@ class AIAnalyzer:
             else:
                 primary["is_open_ended"] = False
 
-            merged[n] = primary
+            merged[(sec, n)] = primary
 
-        # Sort by question number for clean output
-        return sorted(merged.values(), key=lambda x: x.get("question_number", 0))
+        # Sort by (section, question number) so sections never interleave
+        return sorted(
+            merged.values(),
+            key=lambda x: (x.get("section", 1), x.get("question_number", 0)),
+        )
 
     async def analyze_answer_sheet(
         self, image: Image.Image, total_questions: int
@@ -711,6 +828,12 @@ class AIAnalyzer:
             # Tag it so _merge_pages can stitch it instead of dropping it.
             is_fragment = num == 0 and (bool(options) or bool(str(text).strip()))
 
+            # Multi-test documents: Gemini flags the first question of a new
+            # section with its title. _merge_pages combines this with the
+            # deterministic numbering-restart rule.
+            sec_title = q.get("section") or q.get("section_title")
+            sec_title = str(sec_title).strip() if sec_title and str(sec_title).strip() not in ("null", "None") else None
+
             result.append({
                 "question_number": num,
                 "question_text": str(text),
@@ -721,6 +844,7 @@ class AIAnalyzer:
                 "image_path": None,
                 "is_open_ended": False,  # will be set in extract_all_questions
                 "is_fragment": is_fragment,
+                "section_title": sec_title,
                 "group_id": group_id,
                 "group_context": group_context,
             })

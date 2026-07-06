@@ -1,11 +1,12 @@
 """
-Tests for AIAnalyzer._merge_pages — cross-page stitching (bug #6) and the
-pre-existing merge-by-number behavior. Pure function, no Gemini/network.
+Tests for AIAnalyzer._merge_pages — cross-page stitching (bug #6), section
+awareness (multi-test documents), renumbering, and the pre-existing
+merge-by-number behavior. Pure functions, no Gemini/network.
 """
-from app.services.ai_analyzer import AIAnalyzer
+from app.services.ai_analyzer import AIAnalyzer, renumber_sections
 
 
-def q(n, text="text", opts=None, frag=False, page=1):
+def q(n, text="text", opts=None, frag=False, page=1, sec_title=None):
     return {
         "question_number": n,
         "question_text": text,
@@ -16,6 +17,7 @@ def q(n, text="text", opts=None, frag=False, page=1):
         "image_path": None,
         "is_open_ended": False,
         "is_fragment": frag,
+        "section_title": sec_title,
         "group_id": None,
         "group_context": None,
         "page_number": page,
@@ -201,3 +203,124 @@ def test_recovery_strips_blank_option_strings():
     repaired = AIAnalyzer._apply_recovered_options([target], recovered)
     assert repaired == 1
     assert target["options"] == {"A": "a", "B": "b"}
+
+
+# ── Multi-test documents: section detection & (section, number) keying ───────
+
+def test_numbering_restart_creates_second_section():
+    pages = [
+        [q(6, "s1q6", opts=FULL), q(7, "s1q7", opts=FULL)],
+        [q(8, "s1q8", opts=FULL, page=2),
+         q(1, "s2q1", opts=FULL, page=2), q(2, "s2q2", opts=FULL, page=2)],
+    ]
+    result = merge(pages)
+    assert len(result) == 5, "both sections' questions must survive"
+    assert [(x["section"], x["question_number"]) for x in result] == [
+        (1, 6), (1, 7), (1, 8), (2, 1), (2, 2),
+    ]
+    # No merging/overwriting across sections
+    assert result[0]["question_text"] == "s1q6"
+    assert result[3]["question_text"] == "s2q1"
+
+
+def test_small_decrease_to_one_is_not_a_restart():
+    # 2 -> 1 is extraction noise, not a second test (drop < 5, no title).
+    pages = [[q(2, opts=FULL), q(1, opts=FULL), q(3, opts=FULL)]]
+    result = merge(pages)
+    assert {x["section"] for x in result} == {1}
+    assert [x["question_number"] for x in result] == [1, 2, 3]
+
+
+def test_moderate_decrease_does_not_create_section():
+    # n drops but not to <= 3 and no title — column noise, not a restart.
+    pages = [[q(5, opts=FULL), q(4, opts=FULL)]]
+    result = merge(pages)
+    assert {x["section"] for x in result} == {1}
+    assert len(result) == 2
+
+
+def test_title_signal_triggers_section():
+    # Restart flagged by Gemini title even though n=5 (> the <=3 rule).
+    pages = [
+        [q(10, opts=FULL)],
+        [q(5, "new test", opts=FULL, page=2, sec_title="Anorganik moddalar")],
+    ]
+    result = merge(pages)
+    assert result[0]["section"] == 1
+    assert result[1]["section"] == 2
+    assert result[1]["section_title"] == "Anorganik moddalar"
+
+
+def test_same_number_merge_stays_within_section():
+    # Section 2's q1 must NOT merge into section 1's q1.
+    pages = [
+        [q(1, "s1q1", opts={})],
+        [q(1, "s1q1-continued", opts=FULL, page=2)],  # same section: 1 !< 1
+        [q(52, "s1q52", opts=FULL, page=3),
+         q(1, "s2q1", opts=FULL, page=3)],
+    ]
+    result = merge(pages)
+    nums = [(x["section"], x["question_number"]) for x in result]
+    assert nums == [(1, 1), (1, 52), (2, 1)]
+    assert result[0]["options"] == FULL          # cross-page merge worked
+    assert result[2]["question_text"] == "s2q1"  # not swallowed by (1,1)
+
+
+def test_fragment_stitches_across_section_boundary():
+    # Page ends with a cut sec-1 question; next page: fragment first, then
+    # the new section starts. Fragment must stitch to the sec-1 question.
+    pages = [
+        [q(51, opts=FULL), q(52, "cut", opts={})],
+        [q(0, "", opts=FULL, frag=True, page=2),
+         q(1, "s2q1", opts=FULL, page=2, sec_title="Test 2")],
+    ]
+    result = merge(pages)
+    assert [(x["section"], x["question_number"]) for x in result] == [
+        (1, 51), (1, 52), (2, 1),
+    ]
+    assert result[1]["options"] == FULL
+
+
+# ── renumber_sections ─────────────────────────────────────────────────────────
+
+def _sec_q(sec, n, open_ended=False):
+    d = q(n, f"s{sec}q{n}", opts={} if open_ended else FULL)
+    d["section"] = sec
+    d["is_open_ended"] = open_ended
+    return d
+
+
+def test_renumber_two_sections():
+    qs = [_sec_q(1, n) for n in (1, 2, 3)] + [_sec_q(2, n) for n in (1, 2)]
+    out, meta = renumber_sections(qs)
+    assert [x["question_number"] for x in out] == [1, 2, 3, 4, 5]
+    assert [x["original_number"] for x in out] == [1, 2, 3, 1, 2]
+    assert meta[0] == {
+        "section": 1, "title": None, "count": 3, "max": 3,
+        "offset": 0, "start": 1, "end": 3, "gaps": [], "open": [],
+    }
+    assert meta[1]["offset"] == 3
+    assert (meta[1]["start"], meta[1]["end"]) == (4, 5)
+
+
+def test_renumber_single_section_is_identity():
+    qs = [_sec_q(1, n) for n in (1, 2, 3)]
+    out, meta = renumber_sections(qs)
+    assert [x["question_number"] for x in out] == [1, 2, 3]
+    assert len(meta) == 1 and meta[0]["offset"] == 0
+
+
+def test_renumber_offset_uses_max_not_count():
+    # Section 1 has a gap (1, 3): offset must be max (3), not count (2),
+    # so section 2's q1 maps to 4 and the gap stays visible.
+    qs = [_sec_q(1, 1), _sec_q(1, 3), _sec_q(2, 1)]
+    out, meta = renumber_sections(qs)
+    assert meta[0]["gaps"] == [2]
+    assert meta[1]["offset"] == 3
+    assert out[2]["question_number"] == 4
+
+
+def test_renumber_records_open_ended_in_meta():
+    qs = [_sec_q(1, 1), _sec_q(1, 2, open_ended=True)]
+    _, meta = renumber_sections(qs)
+    assert meta[0]["open"] == [2]

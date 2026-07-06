@@ -10,8 +10,9 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from app.bot.keyboards.inline import section_choice_keyboard
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
 from app.config import settings
@@ -21,7 +22,7 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import storage
-from app.services.ai_analyzer import AIAnalyzer
+from app.services.ai_analyzer import AIAnalyzer, renumber_sections
 from app.services.file_processor import (
     attach_images_to_questions,
     detect_file_type,
@@ -79,6 +80,41 @@ T = {
         "uz": "ℹ️ Javob variantlarisiz (ochiq) savollar: {nums}\nBular variantlarda yozma savol sifatida chiqadi.",
         "en": "ℹ️ Questions without answer options (open-ended): {nums}\nThese will appear as write-in questions in the variants.",
         "ru": "ℹ️ Вопросы без вариантов ответа (открытые): {nums}\nОни попадут в варианты как вопросы с письменным ответом.",
+    },
+    "gaps_warning_multi": {
+        "uz": "⚠️ {i}-test: savollar 1–{max} raqamlangan, {found} ta topildi. Topilmadi: {missing}",
+        "en": "⚠️ Test {i}: numbered 1–{max}, but {found} found. Missing: {missing}",
+        "ru": "⚠️ Тест {i}: нумерация 1–{max}, найдено {found}. Не найдены: {missing}",
+    },
+    "sections_found": {
+        "uz": "📑 Faylda <b>{n} ta mustaqil test</b> topildi:\n{lines}\n\nQanday davom etamiz?",
+        "en": "📑 The file contains <b>{n} independent tests</b>:\n{lines}\n\nHow should we proceed?",
+        "ru": "📑 В файле найдено <b>{n} независимых теста(ов)</b>:\n{lines}\n\nКак продолжим?",
+    },
+    "ask_key_section": {
+        "uz": "🔑 <b>{i}-test</b> (savollar 1–{max}) javoblarini yuboring:\n<i>Masalan: <code>1A 2B 3C</code></i>\nYoki o'tkazib yuborish: <code>-</code>",
+        "en": "🔑 Send the answer key for <b>test {i}</b> (questions 1–{max}):\n<i>Example: <code>1A 2B 3C</code></i>\nOr skip: <code>-</code>",
+        "ru": "🔑 Отправьте ключ ответов для <b>теста {i}</b> (вопросы 1–{max}):\n<i>Пример: <code>1A 2B 3C</code></i>\nИли пропустить: <code>-</code>",
+    },
+    "key_undetected": {
+        "uz": "⚠️ Avtomatik aniqlanmagan: <code>{missing}</code>",
+        "en": "⚠️ Not auto-detected: <code>{missing}</code>",
+        "ru": "⚠️ Не определены автоматически: <code>{missing}</code>",
+    },
+    "key_bad": {
+        "uz": "❌ Bu javoblar mos kelmadi (savol yo'q yoki bunday varianti yo'q):\n{bad}\nQayta yuboring:",
+        "en": "❌ These answers don't match (no such question or no such option):\n{bad}\nPlease re-send:",
+        "ru": "❌ Эти ответы не подходят (нет такого вопроса или варианта):\n{bad}\nОтправьте заново:",
+    },
+    "key_incomplete": {
+        "uz": "⚠️ Hali javobsiz savollar: {missing}\nQolganini yuboring yoki o'tkazib yuborish: <code>-</code>",
+        "en": "⚠️ Still unanswered: {missing}\nSend the rest, or skip: <code>-</code>",
+        "ru": "⚠️ Ещё без ответа: {missing}\nОтправьте остальные или пропустите: <code>-</code>",
+    },
+    "merged_note": {
+        "uz": "🔗 Testlar birlashtirildi: {details}",
+        "en": "🔗 Tests merged: {details}",
+        "ru": "🔗 Тесты объединены: {details}",
     },
 }
 
@@ -224,6 +260,13 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         _pdf_bytes_for_crop,
     )
 
+    # ── Multi-test documents: renumber sections continuously ─────────────────
+    # MUST run after attach_images_to_questions (image matching uses the
+    # original printed numbers). Section 2's 1..39 becomes 53..91 etc.;
+    # teacher-facing answer entry stays in original per-section numbering
+    # (offset-mapped in the key rounds below).
+    all_questions, sections = renumber_sections(all_questions)
+
     # ── Save questions to DB ──────────────────────────────────────────────────
     async with async_session_factory() as session:
         for rq in all_questions:
@@ -265,51 +308,145 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         p.question_count = len(all_questions)
         await session.commit()
 
-    # ── Build answers dict and find missing ───────────────────────────────────
+    # ── Build answers dict (keyed by renumbered = unique numbers) ─────────────
     detected: dict[str, str | None] = {
         str(q.get("question_number", i + 1)): q.get("correct_answer")
         for i, q in enumerate(all_questions)
     }
-    missing_nums = sorted(
-        [num for num, ans in detected.items() if not ans],
-        key=lambda x: int(x),
-    )
 
     await state.update_data(
         project_id=project_id,
         question_count=len(all_questions),
         answers=detected,
+        sections=sections,
+        key_round=0,
     )
-    await state.set_state(UploadStates.waiting_for_answers)
 
-    n = len(all_questions)
-    if missing_nums:
-        missing_str = ", ".join(missing_nums)
+    # ── BUG FIX (#16): reconcile numbering per section (original numbering) ──
+    recon_msgs: list[str] = []
+    multi = len(sections) > 1
+    for m in sections:
+        if m["gaps"]:
+            gaps_str = ", ".join(str(x) for x in m["gaps"])
+            if multi:
+                recon_msgs.append(t(
+                    "gaps_warning_multi", lang, i=m["section"], max=m["max"],
+                    found=m["count"], missing=gaps_str,
+                ))
+            else:
+                recon_msgs.append(t(
+                    "gaps_warning", lang, max=m["max"],
+                    found=m["count"], missing=gaps_str,
+                ))
+    open_parts = [
+        (f"{m['section']}-test: " if multi else "")
+        + ", ".join(str(x) for x in m["open"])
+        for m in sections if m["open"]
+    ]
+    if open_parts:
+        recon_msgs.append(t("open_info", lang, nums=" | ".join(open_parts)))
+
+    # ── Branch: multi-test document → section choice; single → key entry ─────
+    if multi:
+        line_tpl = {
+            "uz": "• {i}-test: savollar 1–{max}{title}",
+            "en": "• Test {i}: questions 1–{max}{title}",
+            "ru": "• Тест {i}: вопросы 1–{max}{title}",
+        }.get(lang, "• Test {i}: questions 1–{max}{title}")
+        lines = []
+        for m in sections:
+            title = f" — {m['title']}" if m.get("title") else ""
+            lines.append(line_tpl.format(i=m["section"], max=m["max"], title=title))
+        await state.set_state(UploadStates.waiting_for_section_choice)
         await status_msg.edit_text(
-            t("ans_missing", lang, n=n, missing=missing_str), parse_mode="HTML",
+            t("sections_found", lang, n=len(sections), lines="\n".join(lines)),
+            parse_mode="HTML",
+            reply_markup=section_choice_keyboard(sections, lang),
         )
     else:
-        await status_msg.edit_text(
-            t("ans_all", lang, n=n), parse_mode="HTML",
+        missing_nums = sorted(
+            [num for num, ans in detected.items() if not ans],
+            key=lambda x: int(x),
+        )
+        await state.set_state(UploadStates.waiting_for_answers)
+        n = len(all_questions)
+        if missing_nums:
+            await status_msg.edit_text(
+                t("ans_missing", lang, n=n, missing=", ".join(missing_nums)),
+                parse_mode="HTML",
+            )
+        else:
+            await status_msg.edit_text(
+                t("ans_all", lang, n=n), parse_mode="HTML",
+            )
+
+    for msg_text in recon_msgs:
+        await message.answer(msg_text)
+
+
+def _key_prompt(meta: dict, answers: dict, lang: str) -> str:
+    """Compose the per-section answer-key prompt in ORIGINAL numbering."""
+    missing = [
+        str(n) for n in range(1, meta["max"] + 1)
+        if n not in meta["gaps"] and n not in meta["open"]
+        and not answers.get(str(n + meta["offset"]))
+    ]
+    txt = t("ask_key_section", lang, i=meta["section"], max=meta["max"])
+    if missing:
+        txt += "\n" + t("key_undetected", lang, missing=", ".join(missing))
+    return txt
+
+
+@router.callback_query(UploadStates.waiting_for_section_choice, F.data.startswith("sections:"))
+async def handle_section_choice(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    choice = callback.data.split(":", 1)[1]
+
+    data = await state.get_data()
+    sections: list[dict] = data.get("sections", [])
+    answers: dict = data.get("answers", {})
+    project_id: str = data.get("project_id", "")
+
+    if choice != "all":
+        # Keep only the chosen section: delete other rows, shift numbers back
+        # to the section's ORIGINAL numbering (no renumbering for one test).
+        sec = int(choice)
+        meta = next(m for m in sections if m["section"] == sec)
+
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            res = await session.execute(
+                select(Question).where(Question.project_id == uuid.UUID(project_id))
+            )
+            for q in res.scalars().all():
+                if not (meta["start"] <= q.question_number <= meta["end"]):
+                    await session.delete(q)
+                elif meta["offset"]:
+                    q.question_number -= meta["offset"]
+            pres = await session.execute(
+                select(Project).where(Project.id == uuid.UUID(project_id))
+            )
+            pres.scalar_one().question_count = meta["count"]
+            await session.commit()
+
+        answers = {
+            str(int(k) - meta["offset"]): v
+            for k, v in answers.items()
+            if meta["start"] <= int(k) <= meta["end"]
+        }
+        sections = [{**meta, "offset": 0, "start": 1, "end": meta["max"]}]
+        await state.update_data(
+            sections=sections, answers=answers, question_count=meta["count"]
         )
 
-    # ── BUG FIX (#16): reconcile numbering, surface anomalies to the teacher ──
-    numbers = sorted(
-        {q.get("question_number", 0) for q in all_questions if q.get("question_number")}
+    await state.update_data(key_round=0)
+    await state.set_state(UploadStates.waiting_for_answers)
+    await callback.message.edit_text(
+        _key_prompt(sections[0], answers, lang), parse_mode="HTML"
     )
-    if numbers:
-        max_n = numbers[-1]
-        gaps = [str(x) for x in range(1, max_n + 1) if x not in set(numbers)]
-        if gaps:
-            await message.answer(
-                t("gaps_warning", lang, max=max_n, found=len(numbers),
-                  missing=", ".join(gaps))
-            )
-    open_qs = [
-        str(q["question_number"]) for q in all_questions if q.get("is_open_ended")
-    ]
-    if open_qs:
-        await message.answer(t("open_info", lang, nums=", ".join(open_qs)))
+    await callback.answer()
 
 
 @router.message(UploadStates.waiting_for_answers, F.text)
@@ -317,30 +454,99 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
     lang = db_user.language.value
     data = await state.get_data()
 
-    project_id:     str                    = data.get("project_id", "")
-    question_count: int                    = data.get("question_count", 0)
-    answers:        dict[str, str | None]  = data.get("answers", {})
+    project_id: str = data.get("project_id", "")
+    answers: dict[str, str | None] = data.get("answers", {})
+    question_count: int = data.get("question_count", 0)
+    # Single-section uploads predate/skip the choice step — synthesize meta.
+    sections: list[dict] = data.get("sections") or [{
+        "section": 1, "title": None, "count": question_count,
+        "max": question_count, "offset": 0, "start": 1, "end": question_count,
+        "gaps": [], "open": [],
+    }]
+    key_round: int = data.get("key_round", 0)
+    meta = sections[min(key_round, len(sections) - 1)]
 
     text = message.text.strip()
     skip = text in ("-", "—", "skip", "o'tkazib", "otkazib", "пропустить")
 
     if not skip and text:
-        updates = _parse_answer_input(text, question_count)
-        if updates:
-            answers.update(updates)
-            async with async_session_factory() as session:
-                from sqlalchemy import select
-                res = await session.execute(
-                    select(Question).where(Question.project_id == uuid.UUID(project_id))
-                )
-                db_questions = res.scalars().all()
-                for q in db_questions:
-                    key = str(q.question_number)
-                    if key in updates:
-                        q.correct_answer = updates[key]
-                await session.commit()
+        # Teacher enters this section's key in its ORIGINAL numbering.
+        updates = _parse_answer_input(text, meta["max"])
+        if not updates:
+            await message.answer(t("key_bad", lang, bad=text[:60]), parse_mode="HTML")
+            return
 
-    await state.update_data(answers=answers)
+        # ── Validate against this section's questions/options in DB ──────────
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            res = await session.execute(
+                select(Question)
+                .where(Question.project_id == uuid.UUID(project_id))
+                .where(Question.question_number >= meta["start"])
+                .where(Question.question_number <= meta["end"])
+            )
+            rows = res.scalars().all()
+
+            letters_by_orig: dict[int, set[str]] = {}
+            for r in rows:
+                avail = {
+                    L for L, v in zip(
+                        "ABCD", (r.option_a, r.option_b, r.option_c, r.option_d)
+                    ) if v and str(v).strip()
+                }
+                letters_by_orig[r.question_number - meta["offset"]] = avail
+
+            bad = []
+            for num_str, letter in updates.items():
+                n_orig = int(num_str)
+                avail = letters_by_orig.get(n_orig)
+                if avail is None or letter not in avail:
+                    bad.append(f"{n_orig}{letter}")
+            if bad:
+                await message.answer(
+                    t("key_bad", lang, bad=", ".join(bad)), parse_mode="HTML"
+                )
+                return
+
+            # Apply: DB rows + answers dict (offset-mapped to unique numbers)
+            for r in rows:
+                key = str(r.question_number - meta["offset"])
+                if key in updates:
+                    r.correct_answer = updates[key]
+            await session.commit()
+
+        for num_str, letter in updates.items():
+            answers[str(int(num_str) + meta["offset"])] = letter
+        await state.update_data(answers=answers)
+
+        # ── Completeness: every MC question of the section needs an answer ───
+        still_missing = [
+            str(n) for n, avail in sorted(letters_by_orig.items())
+            if avail and not answers.get(str(n + meta["offset"]))
+        ]
+        if still_missing:
+            await message.answer(
+                t("key_incomplete", lang, missing=", ".join(still_missing)),
+                parse_mode="HTML",
+            )
+            return
+
+    # ── Section done (validated complete, or explicitly skipped) ─────────────
+    key_round += 1
+    await state.update_data(key_round=key_round)
+
+    if key_round < len(sections):
+        await message.answer(
+            _key_prompt(sections[key_round], answers, lang), parse_mode="HTML"
+        )
+        return
+
+    if len(sections) > 1:
+        details = "; ".join(
+            f"{m['section']}-test → {m['start']}–{m['end']}" for m in sections
+        )
+        await message.answer(t("merged_note", lang, details=details))
+
     await state.set_state(UploadStates.waiting_for_variant_count)
     await message.answer(t("ask_count", lang))
 

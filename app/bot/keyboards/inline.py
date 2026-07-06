@@ -23,6 +23,37 @@ def project_actions_keyboard(project_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def section_choice_keyboard(sections: list[dict], lang: str = "uz") -> InlineKeyboardMarkup:
+    """Multi-test document: merge all sections or keep just one."""
+    total = sum(s.get("count", 0) for s in sections)
+    merge_label = {
+        "uz": f"🔗 Birlashtirish ({total} savol)",
+        "en": f"🔗 Merge all ({total} questions)",
+        "ru": f"🔗 Объединить ({total} вопросов)",
+    }.get(lang, f"🔗 Merge all ({total})")
+    only_label = {
+        "uz": "Faqat {i}-test (1–{max})",
+        "en": "Only test {i} (1–{max})",
+        "ru": "Только {i}-й тест (1–{max})",
+    }.get(lang, "Only test {i} (1–{max})")
+    cancel = {
+        "uz": "❌ Bekor qilish",
+        "en": "❌ Cancel",
+        "ru": "❌ Отмена",
+    }.get(lang, "❌ Cancel")
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text=merge_label, callback_data="sections:all")
+    for s in sections:
+        builder.button(
+            text=only_label.format(i=s["section"], max=s["max"]),
+            callback_data=f"sections:{s['section']}",
+        )
+    builder.button(text=cancel, callback_data="cancel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
     """List the teacher's own projects to pick which test to grade against."""
     builder = InlineKeyboardBuilder()
