@@ -21,6 +21,18 @@ genai.configure(api_key=settings.GEMINI_API_KEY)
 
 MAX_CONCURRENT = 4   # parallel Gemini calls
 CALL_TIMEOUT   = 90  # seconds
+MAX_CONTINUATIONS = 3  # extra same-page calls when output hits the token cap
+
+# Appended to VISION_PROMPT when a page's output was truncated: fetch the
+# rest of the SAME page. Positional ("after ... in reading order"), so it
+# works even when a new section restarts numbering mid-page.
+CONTINUATION_NOTE = """
+
+IMPORTANT — CONTINUATION PASS: A previous pass already extracted this page's
+questions up to and including question number {last}. Extract ONLY the
+questions that appear AFTER question {last} on this page (later in reading
+order) — including the questions of a NEW section/test if one starts there.
+Do NOT re-extract earlier questions."""
 
 # ── Prompt ──────────────────────────────────────────────────────────────────────
 VISION_PROMPT = """You are a professional exam question extractor. Extract ALL questions from this test page image.
@@ -62,11 +74,12 @@ CRITICAL RULES:
    - Set/math symbols: preserve as REAL Unicode characters exactly as printed:
      ∈ ∉ ∅ ⊂ ⊆ ∪ ∩ ℝ ℕ ℤ ℚ ≤ ≥ ≠ ≈ ± °
      Example: "n ∈ N" must stay "n ∈ N", never "n □ N" or "n ? N"
-   - Chemical reaction arrows with conditions written above/below the arrow:
+   - Reaction/process arrows with conditions written above/below the arrow
+     (any subject: chemistry chains, physics processes, biology cycles):
      put the condition in parentheses right after the arrow.
-     Example: "X →(t°) Y →(CO mo'l) Z →(HNO3 kons.) W"
-     NEVER skip a question because its reaction chain is hard to format -
-     extract it using this notation
+     Example: "X →(t°) Y →(catalyst) Z"
+     NEVER skip a question because its notation is hard to format -
+     extract it using this convention
    - NEVER output □ (a box) or ? in place of a symbol you can see - if you
      recognize the symbol, output the proper Unicode character for it
 10. Keep Uzbek and Russian text exactly as is, do not translate
@@ -89,8 +102,8 @@ CRITICAL RULES:
     When deciding whether the page starts with a continuation, SKIP OVER lines
     such as:
     - exam/section title lines (often centered, ALL CAPS)
-    - author/footer lines like "Tuzuvchi: ..."
-    - Telegram channel mentions, @usernames, links
+    - author/compiler/source footer lines (e.g. "Tuzuvchi: ...", "Author: ...")
+    - channel/website/contact mentions, @usernames, links
     - page numbers, dates, horizontal rules
     If the FIRST REAL QUESTION CONTENT on the page (after skipping such lines)
     is an options block or unnumbered continuation text, return it as the
@@ -129,9 +142,9 @@ Return ONLY a JSON array, one item per found question:
 [{{"n": 33, "q": "full question text", "A": "...", "B": "...", "C": "...", "D": "...", "img": false, "img_desc": null}}]
 
 CRITICAL RULES:
-- Copy text EXACTLY as printed; keep math/chemistry symbols as real Unicode
-- Reaction arrows with conditions above/below: write the condition in
-  parentheses right after the arrow: "X →(t°) Y →(CO mo'l) Z"
+- Copy text EXACTLY as printed; keep math/science symbols as real Unicode
+- Reaction/process arrows with conditions above/below: write the condition
+  in parentheses right after the arrow: "X →(t°) Y →(catalyst) Z"
 - If a question has an image/diagram, set img=true and describe it in img_desc
 - Extract ONLY the question numbers listed above - no others
 - If you cannot find a question number on these pages, simply OMIT it
@@ -304,43 +317,46 @@ class AIAnalyzer:
 
     # ── Gemini call ─────────────────────────────────────────────────────────────
 
-    def _call_sync_multi(self, prompt: str, images_bytes: list[bytes]) -> str:
-        """Call Gemini with one or more PNG images."""
+    def _call_sync_multi(self, prompt: str, images_bytes: list[bytes]) -> tuple[str, int]:
+        """Call Gemini with one or more PNG images.
+        Returns (text, finish_reason) — finish_reason 2 means MAX_TOKENS,
+        i.e. the output was truncated and the caller should paginate."""
         parts: list = [prompt]
         parts += [{"mime_type": "image/png", "data": b} for b in images_bytes]
         response = self.model.generate_content(
             parts,
             generation_config=genai.GenerationConfig(
                 temperature=0.1,
-                # BUG FIX: 4096 was too small for dense (two-column) pages —
-                # the JSON array got truncated mid-object and the whole page
-                # was lost. 8192 + the salvage parser in _parse cover this.
+                # Dense (two-column) pages can exceed any fixed cap — callers
+                # must check finish_reason and paginate; the salvage parser in
+                # _parse is only the last-resort safety net.
                 max_output_tokens=8192,
                 response_mime_type="application/json",
             ),
         )
+        fr = 0
         if response.candidates:
-            fr = response.candidates[0].finish_reason
+            fr = int(response.candidates[0].finish_reason)
             if fr == 4:
                 raise RuntimeError("RECITATION_BLOCK page blocked by Gemini copyright filter")
             if fr == 2:  # MAX_TOKENS — output truncated
-                logger.warning("gemini_output_truncated", finish_reason=int(fr))
+                logger.warning("gemini_output_truncated", finish_reason=fr)
             elif fr not in (0, 1):  # anything but UNSPECIFIED/STOP
-                logger.warning("gemini_finish_reason", finish_reason=int(fr))
-        return response.text
+                logger.warning("gemini_finish_reason", finish_reason=fr)
+        return response.text, fr
 
-    def _call_sync(self, prompt: str, image_bytes: bytes) -> str:
+    def _call_sync(self, prompt: str, image_bytes: bytes) -> tuple[str, int]:
         """Call Gemini with one PNG image."""
         return self._call_sync_multi(prompt, [image_bytes])
 
-    async def _call(self, prompt: str, image_bytes: bytes) -> str:
+    async def _call(self, prompt: str, image_bytes: bytes) -> tuple[str, int]:
         async with self._sem:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._call_sync, prompt, image_bytes),
                 timeout=CALL_TIMEOUT,
             )
 
-    async def _call_multi(self, prompt: str, images: list[Image.Image]) -> str:
+    async def _call_multi(self, prompt: str, images: list[Image.Image]) -> tuple[str, int]:
         blobs: list[bytes] = []
         for img in images:
             buf = io.BytesIO()
@@ -361,8 +377,53 @@ class AIAnalyzer:
 
         for attempt in range(settings.GEMINI_MAX_RETRIES):
             try:
-                raw = await self._call(VISION_PROMPT, img_bytes)
+                raw, fr = await self._call(VISION_PROMPT, img_bytes)
                 questions = self._parse(raw, page_num)
+
+                # ── Continuation pagination ──────────────────────────────────
+                # BUG FIX: dense pages exceed the output-token cap; previously
+                # the truncated tail was simply lost (salvage kept only the
+                # head), which dropped whole blocks of questions, section
+                # markers and options. Now we keep asking the SAME page for
+                # the rest until it completes (bounded rounds).
+                rounds = 0
+                try:
+                    while fr == 2 and questions and rounds < MAX_CONTINUATIONS:
+                        rounds += 1
+                        last_n = next(
+                            (x.get("question_number")
+                             for x in reversed(questions)
+                             if x.get("question_number")),
+                            0,
+                        )
+                        raw, fr = await self._call(
+                            VISION_PROMPT + CONTINUATION_NOTE.format(last=last_n),
+                            img_bytes,
+                        )
+                        more = self._parse(raw, page_num)
+                        known = {
+                            x.get("question_number") for x in questions
+                            if x.get("question_number")
+                        }
+                        new_items = [
+                            m for m in more
+                            if not m.get("question_number")
+                            or m["question_number"] not in known
+                        ]
+                        if not new_items:
+                            break
+                        questions.extend(new_items)
+                        logger.info(
+                            "page_continuation",
+                            page=page_num, round=rounds, added=len(new_items),
+                        )
+                except Exception as e:
+                    # Keep what we have — a failed continuation must not
+                    # discard the questions already extracted.
+                    logger.warning(
+                        "page_continuation_failed", page=page_num, error=str(e)
+                    )
+
                 for q in questions:
                     q["page_number"] = page_num
                     clean_question(q)
@@ -409,8 +470,11 @@ class AIAnalyzer:
                 all_q_by_page.append(r)
 
         unique = self._merge_pages(all_q_by_page)
-        unique = await self._recover_missing_options(unique, images)
+        # Order matters: recover whole missing questions FIRST, then run the
+        # options pass — so a question recovered stem-only gets a targeted
+        # options fetch instead of silently becoming open-ended.
         unique = await self._recover_missing_questions(unique, images)
+        unique = await self._recover_missing_options(unique, images)
         unique.sort(key=lambda x: (x.get("section", 1), x.get("question_number", 0)))
         logger.info("extraction_done", total=len(unique), pages=len(images))
         return unique
@@ -462,31 +526,36 @@ class AIAnalyzer:
                 windows.setdefault((p_lo, p_hi), []).append(g)
 
             for (p1, p2), gnums in sorted(windows.items()):
-                prompt = RECOVER_QUESTIONS_PROMPT.format(
-                    nums=", ".join(str(n) for n in gnums)
-                )
-                imgs = [images[p1 - 1]]
-                if p2 != p1:
-                    imgs.append(images[p2 - 1])
-                try:
-                    raw = await self._call_multi(prompt, imgs)
-                    items = self._parse(raw, page_num=p1)
-                except Exception as e:
-                    logger.warning(
-                        "question_recovery_failed",
-                        section=sec, pages=(p1, p2), error=str(e),
+                # Chunk the request so the recovery response can never hit
+                # the output-token cap itself (self-truncation would insert
+                # stem-only questions — the 47-open-ended failure mode).
+                for i in range(0, len(gnums), 8):
+                    chunk = gnums[i:i + 8]
+                    prompt = RECOVER_QUESTIONS_PROMPT.format(
+                        nums=", ".join(str(n) for n in chunk)
                     )
-                    continue
-                for item in items:
-                    clean_question(item)
-                inserted = self._apply_recovered_questions(
-                    questions, items, set(gnums), sec, p1
-                )
-                logger.info(
-                    "question_recovery_pass",
-                    section=sec, pages=(p1, p2),
-                    asked=gnums, recovered=inserted,
-                )
+                    imgs = [images[p1 - 1]]
+                    if p2 != p1:
+                        imgs.append(images[p2 - 1])
+                    try:
+                        raw, _fr = await self._call_multi(prompt, imgs)
+                        items = self._parse(raw, page_num=p1)
+                    except Exception as e:
+                        logger.warning(
+                            "question_recovery_failed",
+                            section=sec, pages=(p1, p2), error=str(e),
+                        )
+                        continue
+                    for item in items:
+                        clean_question(item)
+                    inserted = self._apply_recovered_questions(
+                        questions, items, set(chunk), sec, p1
+                    )
+                    logger.info(
+                        "question_recovery_pass",
+                        section=sec, pages=(p1, p2),
+                        asked=chunk, recovered=inserted,
+                    )
         return questions
 
     @staticmethod
@@ -569,7 +638,7 @@ class AIAnalyzer:
             if page < len(images):
                 imgs.append(images[page])
             try:
-                raw = await self._call_multi(prompt, imgs)
+                raw, _fr = await self._call_multi(prompt, imgs)
                 items = self._parse(raw, page_num=page)
             except Exception as e:
                 logger.warning("options_recovery_failed", page=page, error=str(e))
@@ -825,7 +894,7 @@ class AIAnalyzer:
         prompt = ANSWER_SHEET_PROMPT.format(total=total_questions)
         for attempt in range(settings.GEMINI_MAX_RETRIES):
             try:
-                raw = await self._call(prompt, buf.getvalue())
+                raw, _fr = await self._call(prompt, buf.getvalue())
                 cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
                 data = json.loads(cleaned)
                 answers: dict[str, str | None] = {}

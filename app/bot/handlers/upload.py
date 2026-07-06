@@ -103,16 +103,62 @@ def t(key: str, lang: str, **kw) -> str:
     return T[key].get(lang, T[key]["en"]).format(**kw)
 
 
+# Reasons for rejected answer-key entries — shown line by line inside key_bad.
+KEY_REASONS = {
+    "no_question": {
+        "uz": "{n}{L} — bunday raqamli savol yo'q",
+        "en": "{n}{L} — no question with this number",
+        "ru": "{n}{L} — вопроса с таким номером нет",
+    },
+    "open": {
+        "uz": "{n}{L} — bu savolda javob variantlari yo'q (ochiq savol); o'tkazish uchun: {n}-",
+        "en": "{n}{L} — this question has no options (open-ended); send \"{n}-\" to skip it",
+        "ru": "{n}{L} — у этого вопроса нет вариантов (открытый); чтобы пропустить: {n}-",
+    },
+    "bad_letter": {
+        "uz": "{n}{L} — bu savolda {L} varianti yo'q (bor: {avail})",
+        "en": "{n}{L} — this question has no option {L} (available: {avail})",
+        "ru": "{n}{L} — у этого вопроса нет варианта {L} (есть: {avail})",
+    },
+}
+
+
+def _key_reason(kind: str, lang: str, **kw) -> str:
+    return KEY_REASONS[kind].get(lang, KEY_REASONS[kind]["en"]).format(**kw)
+
+
 def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
+    """
+    Parse a teacher's answer key. Tolerated formats, freely mixable and
+    separated by spaces or newlines:
+        "1A"  "1-A"  "1 A"  "1)A"  "1.A"  "1 - A"
+        Cyrillic answer letters (А В С Д Е) are mapped to Latin A-E
+        "47-"  (number + dash, NO letter)  = explicitly skip question 47
+    Returns {"1": "A", ..., "47": "-"} where "-" is the skip marker.
+    A digitless input like "ABCD..." maps letters to questions 1..N in order.
+    """
     result: dict[str, str] = {}
     text = text.strip().upper()
-    pairs = re.findall(r'(\d+)\s*([ABCDE])', text)
+    # Cyrillic look-alikes teachers commonly type on ru/uz keyboards
+    text = text.translate(str.maketrans("АВСДЕ", "ABCDE"))
+
+    # Skip markers first ("47-" with no letter after the dash) —
+    # an explicit number+letter later in the input overrides a skip.
+    for num_str in re.findall(r'(\d+)\s*[-–—](?=\s|$)', text):
+        n = int(num_str)
+        if 1 <= n <= question_count:
+            result[str(n)] = "-"
+
+    pairs = re.findall(r'(\d+)\s*[-–—).:]?\s*([ABCDE])', text)
     if pairs:
         for num_str, letter in pairs:
             n = int(num_str)
             if 1 <= n <= question_count:
                 result[str(n)] = letter
         return result
+    if result:
+        return result
+
     letters = re.findall(r'[ABCDE]', text)
     for i, letter in enumerate(letters, start=1):
         if i <= question_count:
@@ -458,18 +504,28 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
             bad = []
             for num_str, letter in updates.items():
                 avail = letters_by_num.get(int(num_str))
-                if avail is None or letter not in avail:
-                    bad.append(f"{num_str}{letter}")
+                if avail is None:
+                    bad.append(_key_reason("no_question", lang, n=num_str,
+                                           L="" if letter == "-" else letter))
+                elif letter == "-":
+                    continue  # explicit skip — always valid for an existing question
+                elif not avail:
+                    bad.append(_key_reason("open", lang, n=num_str, L=letter))
+                elif letter not in avail:
+                    bad.append(_key_reason(
+                        "bad_letter", lang, n=num_str, L=letter,
+                        avail=", ".join(sorted(avail)),
+                    ))
             if bad:
                 await message.answer(
-                    t("key_bad", lang, bad=", ".join(bad)), parse_mode="HTML"
+                    t("key_bad", lang, bad="\n".join(bad)), parse_mode="HTML"
                 )
                 return
 
             for r in rows:
-                key = str(r.question_number)
-                if key in updates:
-                    r.correct_answer = updates[key]
+                val = updates.get(str(r.question_number))
+                if val and val != "-":
+                    r.correct_answer = val
             await session.commit()
 
         answers.update(updates)
