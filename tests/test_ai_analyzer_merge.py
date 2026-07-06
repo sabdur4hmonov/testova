@@ -323,6 +323,63 @@ def test_summarize_captures_title():
     assert meta[1]["title"] == "Anorganik moddalar"
 
 
+# ── Gap recovery: whole missing questions (33-36 block bug) ──────────────────
+
+def test_gap_recovery_inserts_asked_questions():
+    existing = [_sec_q(1, n) for n in (32, 37)]
+    items = [q(n, f"recovered {n}", opts=FULL) for n in (33, 34, 35, 36)]
+    for it in items:
+        del it["page_number"]  # _normalize output carries no page key
+    inserted = AIAnalyzer._apply_recovered_questions(
+        existing, items, expected={33, 34, 35, 36}, section=1, default_page=3
+    )
+    assert inserted == 4
+    nums = sorted(x["question_number"] for x in existing)
+    assert nums == [32, 33, 34, 35, 36, 37]
+    rec = next(x for x in existing if x["question_number"] == 33)
+    assert rec["section"] == 1
+    assert rec["page_number"] == 3
+    assert rec["is_open_ended"] is False
+
+
+def test_gap_recovery_rejects_unasked_numbers():
+    # Hallucination guard: Gemini returns a number we didn't ask for.
+    existing = [_sec_q(1, 1)]
+    items = [q(99, "invented", opts=FULL)]
+    inserted = AIAnalyzer._apply_recovered_questions(
+        existing, items, expected={2}, section=1, default_page=1
+    )
+    assert inserted == 0
+    assert len(existing) == 1
+
+
+def test_gap_recovery_never_overwrites_existing():
+    existing = [_sec_q(1, 5)]
+    original_text = existing[0]["question_text"]
+    items = [q(5, "different text", opts=FULL)]
+    inserted = AIAnalyzer._apply_recovered_questions(
+        existing, items, expected={5}, section=1, default_page=1
+    )
+    assert inserted == 0
+    assert existing[0]["question_text"] == original_text
+
+
+def test_gap_recovery_rejects_empty_text_and_single_option():
+    existing = []
+    items = [
+        q(10, "", opts=FULL),                # empty text
+        q(11, "one option", opts={"A": "a"}),  # not gradeable
+        q(12, "open ended", opts={}),          # accepted as open-ended
+    ]
+    inserted = AIAnalyzer._apply_recovered_questions(
+        existing, items, expected={10, 11, 12}, section=2, default_page=4
+    )
+    assert inserted == 1
+    assert existing[0]["question_number"] == 12
+    assert existing[0]["is_open_ended"] is True
+    assert existing[0]["section"] == 2
+
+
 # ── Truncated-output salvage parser (only 37-39 survived bug) ────────────────
 
 def _analyzer():

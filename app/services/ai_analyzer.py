@@ -62,6 +62,11 @@ CRITICAL RULES:
    - Set/math symbols: preserve as REAL Unicode characters exactly as printed:
      ∈ ∉ ∅ ⊂ ⊆ ∪ ∩ ℝ ℕ ℤ ℚ ≤ ≥ ≠ ≈ ± °
      Example: "n ∈ N" must stay "n ∈ N", never "n □ N" or "n ? N"
+   - Chemical reaction arrows with conditions written above/below the arrow:
+     put the condition in parentheses right after the arrow.
+     Example: "X →(t°) Y →(CO mo'l) Z →(HNO3 kons.) W"
+     NEVER skip a question because its reaction chain is hard to format -
+     extract it using this notation
    - NEVER output □ (a box) or ? in place of a symbol you can see - if you
      recognize the symbol, output the proper Unicode character for it
 10. Keep Uzbek and Russian text exactly as is, do not translate
@@ -111,6 +116,27 @@ CRITICAL RULES:
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
 FAQAT JSON: {{"answers": {{"1": "A", "2": null}}}}"""
+
+# Targeted retry for question numbers that are ENTIRELY missing after
+# extraction (typically dense content: reaction chains, diagrams, tables).
+RECOVER_QUESTIONS_PROMPT = """A previous extraction pass MISSED these questions from the attached test page image(s): {nums}
+
+Find EACH of these question numbers on the pages and extract them COMPLETELY.
+They may be visually complex: chemical reaction chains with conditions written
+above/below arrows, diagrams, tables, or multi-line equations.
+
+Return ONLY a JSON array, one item per found question:
+[{{"n": 33, "q": "full question text", "A": "...", "B": "...", "C": "...", "D": "...", "img": false, "img_desc": null}}]
+
+CRITICAL RULES:
+- Copy text EXACTLY as printed; keep math/chemistry symbols as real Unicode
+- Reaction arrows with conditions above/below: write the condition in
+  parentheses right after the arrow: "X →(t°) Y →(CO mo'l) Z"
+- If a question has an image/diagram, set img=true and describe it in img_desc
+- Extract ONLY the question numbers listed above - no others
+- If you cannot find a question number on these pages, simply OMIT it
+- NEVER invent or reconstruct content that is not printed on the pages
+- RETURN ONLY THE JSON ARRAY - nothing else"""
 
 # BUG FIX (#1): targeted second pass for questions extracted with zero options.
 RECOVER_OPTIONS_PROMPT = """These test-page image(s) contain questions whose answer options were NOT captured
@@ -384,8 +410,132 @@ class AIAnalyzer:
 
         unique = self._merge_pages(all_q_by_page)
         unique = await self._recover_missing_options(unique, images)
+        unique = await self._recover_missing_questions(unique, images)
+        unique.sort(key=lambda x: (x.get("section", 1), x.get("question_number", 0)))
         logger.info("extraction_done", total=len(unique), pages=len(images))
         return unique
+
+    # ── Missing-question recovery pass (numbering gaps) ─────────────────────────
+
+    async def _recover_missing_questions(
+        self, questions: list[dict[str, Any]], images: list[Image.Image]
+    ) -> list[dict[str, Any]]:
+        """
+        Recover question numbers that are ENTIRELY absent after extraction
+        (e.g. a consecutive block of dense reaction-chain questions Gemini
+        skipped, or questions lost to output truncation). The gap's page is
+        inferred from its nearest extracted neighbors (a missing question was
+        never seen, so it carries no page itself). One targeted call per
+        page-window; best-effort — failures keep today's behavior, and the
+        #16 gap warning still reports anything left unrecovered.
+        """
+        by_sec: dict[int, list[dict]] = {}
+        for q in questions:
+            if q.get("question_number"):
+                by_sec.setdefault(q.get("section", 1), []).append(q)
+
+        for sec, qs in sorted(by_sec.items()):
+            nums = sorted(q["question_number"] for q in qs)
+            present = set(nums)
+            max_n = nums[-1]
+            gaps = [x for x in range(1, max_n + 1) if x not in present]
+            if not gaps:
+                continue
+
+            page_of = {
+                q["question_number"]: q.get("page_number") or 0 for q in qs
+            }
+
+            # Group gap numbers by the page window of their neighbors.
+            windows: dict[tuple[int, int], list[int]] = {}
+            for g in gaps:
+                lo = max((n for n in nums if n < g), default=None)
+                hi = min((n for n in nums if n > g), default=None)
+                p_lo = page_of.get(lo) or page_of.get(hi) or 0
+                p_hi = page_of.get(hi) or p_lo
+                if not (1 <= p_lo <= len(images)):
+                    continue
+                p_hi = min(max(p_hi, p_lo), len(images))
+                # Cap the window at 2 pages (neighbors of a consecutive
+                # block are almost always on the same or adjacent pages).
+                p_hi = min(p_hi, p_lo + 1)
+                windows.setdefault((p_lo, p_hi), []).append(g)
+
+            for (p1, p2), gnums in sorted(windows.items()):
+                prompt = RECOVER_QUESTIONS_PROMPT.format(
+                    nums=", ".join(str(n) for n in gnums)
+                )
+                imgs = [images[p1 - 1]]
+                if p2 != p1:
+                    imgs.append(images[p2 - 1])
+                try:
+                    raw = await self._call_multi(prompt, imgs)
+                    items = self._parse(raw, page_num=p1)
+                except Exception as e:
+                    logger.warning(
+                        "question_recovery_failed",
+                        section=sec, pages=(p1, p2), error=str(e),
+                    )
+                    continue
+                for item in items:
+                    clean_question(item)
+                inserted = self._apply_recovered_questions(
+                    questions, items, set(gnums), sec, p1
+                )
+                logger.info(
+                    "question_recovery_pass",
+                    section=sec, pages=(p1, p2),
+                    asked=gnums, recovered=inserted,
+                )
+        return questions
+
+    @staticmethod
+    def _apply_recovered_questions(
+        questions: list[dict],
+        items: list[dict],
+        expected: set[int],
+        section: int,
+        default_page: int,
+    ) -> int:
+        """
+        Insert recovered whole questions. Hallucination guards:
+        - only numbers we explicitly asked for are accepted
+        - never overwrites an existing (section, number)
+        - empty question text rejected
+        - exactly 1 option rejected (broken, not gradeable);
+          0 options accepted as open-ended
+        Returns how many questions were inserted.
+        """
+        existing = {
+            (q.get("section", 1), q.get("question_number")) for q in questions
+        }
+        inserted = 0
+        for item in items:
+            n = item.get("question_number")
+            if n not in expected or (section, n) in existing:
+                continue
+            if not str(item.get("question_text") or "").strip():
+                continue
+            opts = {
+                k: v for k, v in (item.get("options") or {}).items()
+                if v and str(v).strip()
+            }
+            if len(opts) == 1:
+                logger.info("gap_recovery_single_option_rejected", question=n)
+                continue
+            item["options"] = opts
+            item["is_open_ended"] = len(opts) == 0
+            item["section"] = section
+            if not item.get("page_number"):
+                item["page_number"] = default_page
+            questions.append(item)
+            existing.add((section, n))
+            inserted += 1
+            logger.info(
+                "question_recovered",
+                question=n, section=section, options=len(opts),
+            )
+        return inserted
 
     # ── Zero-option recovery pass (#1) ──────────────────────────────────────────
 
