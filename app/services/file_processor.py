@@ -91,6 +91,131 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = DPI) -> list[PageImage]:
     return pages
 
 
+# ── Two-column detection & splitting ─────────────────────────────────────────
+
+def _detect_column_split(img: Image.Image) -> float | None:
+    """
+    Detect a two-column page layout. Returns the split position as a fraction
+    of page width (0..1), or None for single-column / ambiguous pages.
+
+    Geometry-based, no tuning to any specific document:
+    - per-x ink profile = fraction of body rows (header/footer excluded)
+      containing dark pixels at that x
+    - a GUTTER is a wide near-zero run in the middle zone of the page
+    - a DIVIDER LINE is a thin near-solid run in the same zone
+    - conservative guards: both halves must carry substantial ink, otherwise
+      the page passes through unsplit (today's behavior).
+    """
+    import numpy as np
+
+    w0, h0 = img.size
+    if w0 < 100 or h0 < 100:
+        return None
+    target_w = 600
+    scale = target_w / w0
+    small = img.convert("L").resize((target_w, max(50, int(h0 * scale))))
+    a = np.asarray(small)
+    h, w = a.shape
+
+    # Exclude header/footer bands — titles often span both columns.
+    body = a[int(h * 0.12):int(h * 0.92), :]
+    ink = body < 160
+    total_ink = int(ink.sum())
+    if total_ink < body.size * 0.005:  # nearly blank page
+        return None
+
+    col_frac = ink.mean(axis=0)  # fraction of body rows inked, per x
+    lo, hi = int(w * 0.33), int(w * 0.67)
+    zone = col_frac[lo:hi]
+
+    def _runs(mask) -> list[tuple[int, int]]:
+        out, start = [], None
+        for i, v in enumerate(mask):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                out.append((start, i))
+                start = None
+        if start is not None:
+            out.append((start, len(mask)))
+        return out
+
+    split_x: float | None = None
+
+    # Gutter: widest near-empty run, at least ~1.5% of page width
+    min_gutter = max(3, int(w * 0.015))
+    best = None
+    for s, e in _runs(zone < 0.02):
+        if e - s >= min_gutter and (best is None or e - s > best[1] - best[0]):
+            best = (s, e)
+    if best:
+        split_x = lo + (best[0] + best[1]) / 2
+    else:
+        # Divider line: thin, near-solid vertical run
+        max_line = max(2, int(w * 0.008))
+        for s, e in _runs(zone > 0.65):
+            if e - s <= max_line:
+                split_x = lo + (s + e) / 2
+                break
+
+    if split_x is None:
+        return None
+
+    # Both halves must hold a substantial share of the ink
+    left_ink = int(ink[:, :int(split_x)].sum())
+    right_ink = total_ink - left_ink
+    if min(left_ink, right_ink) < total_ink * 0.25:
+        return None
+
+    return split_x / w
+
+
+def split_two_column_pages(
+    pages: list[PageImage],
+) -> tuple[list[PageImage], dict[int, dict]]:
+    """
+    Split two-column pages into single-column halves, renumbered sequentially
+    in reading order (p1-left, p1-right, p2, p3-left, ...). Gemini then only
+    ever sees single-column content: column interleaving becomes impossible
+    and image-region geometry is computed within the correct column.
+
+    Returns (new_pages, col_map) where col_map maps each NEW page number to
+    {"src_page": original page, "x0": left fraction, "x1": right fraction}.
+    Single-column pages pass through unchanged (x0=0.0, x1=1.0).
+    """
+    new_pages: list[PageImage] = []
+    col_map: dict[int, dict] = {}
+
+    for p in pages:
+        try:
+            split = _detect_column_split(p.image)
+        except Exception as e:
+            logger.warning("column_detect_failed", page=p.page_number, error=str(e))
+            split = None
+
+        if split is None:
+            n = len(new_pages) + 1
+            new_pages.append(PageImage(page_number=n, image=p.image))
+            col_map[n] = {"src_page": p.page_number, "x0": 0.0, "x1": 1.0}
+            continue
+
+        w, h = p.image.size
+        sx = int(w * split)
+        for x0f, x1f, half in (
+            (0.0, split, p.image.crop((0, 0, sx, h))),
+            (split, 1.0, p.image.crop((sx, 0, w, h))),
+        ):
+            n = len(new_pages) + 1
+            new_pages.append(PageImage(page_number=n, image=half))
+            col_map[n] = {"src_page": p.page_number, "x0": x0f, "x1": x1f}
+        logger.info(
+            "page_split_two_columns",
+            src_page=p.page_number, split_frac=round(split, 3),
+        )
+
+    return new_pages, col_map
+
+
 def pdf_extract_page_images(pdf_bytes: bytes) -> dict[int, list[bytes]]:
     """
     Extract embedded bitmap images from each page. {page_num: [png_bytes]}
@@ -256,13 +381,19 @@ def _get_question_y_positions(
     pdf_bytes: bytes,
     page_num: int,
     questions_on_page: list[dict],
+    x_range: tuple[float, float] | None = None,
 ) -> dict[int, float]:
     """
-    BUG FIX: Get the ACTUAL Y position of each question's text on the page
-    by searching for the question number text in the PDF text blocks.
+    Get the ACTUAL Y position of each question's text on the page by searching
+    for the question-number text in the PDF text blocks.
 
-    This replaces the old equal-band estimation which caused wrong image
-    assignment (Q7 getting Q9's image because band math was off).
+    x_range (PDF points): when the page is two-column, restrict the search to
+    that column's horizontal band — otherwise "12." from the OTHER column
+    poisons the geometry (the garbage-crop bug).
+
+    Questions whose number text cannot be located are OMITTED — never
+    estimated. Estimated positions produced crops containing other
+    questions' content; no image is better than a wrong one.
 
     Returns: {question_number: y_position_in_pdf_points}
     """
@@ -272,9 +403,18 @@ def _get_question_y_positions(
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_num - 1]
 
-    # Get all text blocks with their positions
-    blocks = page.get_text("blocks", sort=True)
+    # WORD-level positions, not blocks: PyMuPDF merges same-baseline text
+    # from BOTH columns into one block ("1. Left ... 3. Right ..."), which
+    # both breaks the startswith match and mis-centers the x filter.
+    # Words never merge across columns.
+    words = page.get_text("words")  # (x0, y0, x1, y1, text, block, line, word)
     doc.close()
+
+    if x_range is not None:
+        words = [
+            w for w in words
+            if x_range[0] <= (w[0] + w[2]) / 2 <= x_range[1]
+        ]
 
     y_positions: dict[int, float] = {}
 
@@ -283,126 +423,130 @@ def _get_question_y_positions(
         if not q_num:
             continue
 
-        # Search for the question number pattern in text blocks
-        # Patterns: "7.", "7 .", "Q7", or just the number at start of block
-        search_patterns = [
-            f"{q_num}.",
-            f"{q_num} .",
-            f"{q_num})",
+        # The question number as its own word: "7." / "7)" or glued to the
+        # first word of the stem ("7.Savol"). Note "12." does NOT match a
+        # search for "1." — startswith compares the full "1." prefix.
+        prefixes = (f"{q_num}.", f"{q_num})")
+        matches = [
+            w[1] for w in words
+            if w[4] in prefixes or w[4].startswith(prefixes)
         ]
-
-        best_y = None
-        for block in blocks:
-            if block[6] != 0:  # skip non-text blocks
-                continue
-            block_text = block[4].strip()
-            block_y = block[1]  # y0 of the block
-
-            for pattern in search_patterns:
-                if block_text.startswith(pattern) or block_text.startswith(f" {pattern}"):
-                    best_y = block_y
-                    break
-            if best_y is not None:
-                break
-
-        if best_y is not None:
-            y_positions[q_num] = best_y
-        else:
-            # Fallback: estimate from question order
-            page_qs_sorted = sorted(questions_on_page, key=lambda x: x.get("question_number", 0))
-            total = len(page_qs_sorted)
-            pos = next((i for i, x in enumerate(page_qs_sorted) if x.get("question_number") == q_num), 0)
-            doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
-            ph = doc2[page_num - 1].rect.height
-            doc2.close()
-            y_positions[q_num] = (pos / total) * ph
+        if matches:
+            y_positions[q_num] = min(matches)
 
     return y_positions
 
 
-def _find_best_image_rect_for_question(
+def _question_y_band(
     pdf_bytes: bytes,
-    page_num: int,
+    src_page: int,
+    analysis_page: int,
     question_number: int,
-    all_questions_on_page: list[dict],
+    all_questions: list[dict],
     page_pdf_height: float,
-) -> fitz.Rect | None:
+    x_range: tuple[float, float] | None,
+) -> tuple[float, float] | None:
     """
-    Find which image rect on the page belongs to a specific question.
-
-    BUG FIX: Now uses ACTUAL text Y positions instead of equal-band estimation.
-    This prevents wrong image assignment (e.g. Q7 getting Q9's fraction image).
-
-    Strategy:
-    1. Get actual Y position of each question's text from PDF
-    2. Get all image rects on the page (excluding backgrounds)
-    3. Each image rect is assigned to the question whose text is directly ABOVE it
-       (image appears below/after the question text, before the next question)
+    Vertical band a question occupies: from its own number's Y position down
+    to the next question's Y position within the SAME column (x_range).
+    Returns None when the question's number can't be located in the PDF text —
+    no band means no crop (never estimated).
     """
-    rects = _get_image_rects_on_page(pdf_bytes, page_num)
-    if not rects:
-        return None
-
-    questions_on_page = [q for q in all_questions_on_page if q.get("page_number") == page_num]
+    questions_on_page = [
+        q for q in all_questions if q.get("page_number") == analysis_page
+    ]
     if not questions_on_page:
         return None
 
-    # Get actual Y positions of all questions on this page
-    y_positions = _get_question_y_positions(pdf_bytes, page_num, questions_on_page)
-
-    if not y_positions:
-        # No text positions found — fall back to old band method
-        page_qs = sorted(questions_on_page, key=lambda x: x.get("question_number", 0))
-        total_qs = len(page_qs)
-        pos = next(
-            (i for i, q in enumerate(page_qs) if q.get("question_number") == question_number),
-            None,
-        )
-        if pos is None:
-            return None
-        band_top = (pos / total_qs) * page_pdf_height
-        band_bottom = ((pos + 1) / total_qs) * page_pdf_height
-        band_center = (band_top + band_bottom) / 2
-        best = min(rects, key=lambda r: abs((r.y0 + r.y1) / 2 - band_center))
-        return best
-
+    y_positions = _get_question_y_positions(
+        pdf_bytes, src_page, questions_on_page, x_range
+    )
     this_q_y = y_positions.get(question_number)
     if this_q_y is None:
         return None
 
-    # Find the Y position of the NEXT question on this page (or end of page)
-    sorted_qs = sorted(
-        [(qn, y) for qn, y in y_positions.items()],
-        key=lambda x: x[1],
-    )
-    next_q_y = page_pdf_height  # default: end of page
-    for qn, y in sorted_qs:
+    next_q_y = page_pdf_height  # default: end of column
+    for y in sorted(y_positions.values()):
         if y > this_q_y + 5:  # +5pt tolerance for same-line text
             next_q_y = y
             break
+    return this_q_y, next_q_y
 
-    # Find image rects that fall BETWEEN this question's text and the next question
-    # i.e., image Y center is between this_q_y and next_q_y
-    candidate_rects = []
-    for rect in rects:
-        rect_center_y = (rect.y0 + rect.y1) / 2
-        if this_q_y <= rect_center_y < next_q_y:
-            candidate_rects.append(rect)
 
-    if candidate_rects:
-        # If multiple images in range, pick the largest (most likely to be the diagram)
-        return max(candidate_rects, key=lambda r: r.width * r.height)
+def _rect_in_xrange(rect: fitz.Rect, x_range: tuple[float, float] | None) -> bool:
+    if x_range is None:
+        return True
+    cx = (rect.x0 + rect.x1) / 2
+    return x_range[0] <= cx <= x_range[1]
 
-    # No image found strictly in range — try nearest image below question text
-    below_rects = [(r, (r.y0 + r.y1) / 2) for r in rects if (r.y0 + r.y1) / 2 >= this_q_y]
-    if below_rects:
-        closest = min(below_rects, key=lambda x: x[1])
-        # Only use if reasonably close (within 1.5x the question's vertical span)
-        span = next_q_y - this_q_y
-        if closest[1] - this_q_y < span * 1.5:
+
+def _find_image_rect_in_band(
+    pdf_bytes: bytes,
+    src_page: int,
+    band: tuple[float, float],
+    x_range: tuple[float, float] | None,
+) -> fitz.Rect | None:
+    """Embedded raster image whose center falls inside the question's band
+    AND column. Largest wins; nearest-below allowed within 1.5x band span."""
+    rects = [
+        r for r in _get_image_rects_on_page(pdf_bytes, src_page)
+        if _rect_in_xrange(r, x_range)
+    ]
+    if not rects:
+        return None
+
+    y_top, y_bottom = band
+    in_band = [r for r in rects if y_top <= (r.y0 + r.y1) / 2 < y_bottom]
+    if in_band:
+        return max(in_band, key=lambda r: r.width * r.height)
+
+    below = [(r, (r.y0 + r.y1) / 2) for r in rects if (r.y0 + r.y1) / 2 >= y_top]
+    if below:
+        closest = min(below, key=lambda x: x[1])
+        if closest[1] - y_top < (y_bottom - y_top) * 1.5:
             return closest[0]
-
     return None
+
+
+def _find_drawing_figure_rect(
+    pdf_bytes: bytes,
+    src_page: int,
+    band: tuple[float, float],
+    x_range: tuple[float, float] | None,
+) -> fitz.Rect | None:
+    """
+    Vector diagram detection: union of drawing bboxes (lines, curves, shapes)
+    inside the question's band and column. Size guards reject stray rules or
+    underlines — if nothing figure-like is found, the caller attaches NOTHING
+    rather than a garbage region.
+    """
+    y_top, y_bottom = band
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        drawings = doc[src_page - 1].get_drawings()
+        doc.close()
+    except Exception as e:
+        logger.warning("get_drawings_failed", page=src_page, error=str(e))
+        return None
+
+    union: fitz.Rect | None = None
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        cy = (r.y0 + r.y1) / 2
+        if not (y_top <= cy < y_bottom) or not _rect_in_xrange(r, x_range):
+            continue
+        union = fitz.Rect(r) if union is None else union | r
+
+    if union is None:
+        return None
+    # Must look like a figure: not a hairline rule, not spilling past the band
+    if union.width < 40 or union.height < 25:
+        return None
+    if union.height > (y_bottom - y_top) * 1.05:
+        return None
+    return union
 
 
 # ── Crop & save ───────────────────────────────────────────────────────────────
@@ -450,67 +594,44 @@ def crop_and_save_image(
         return None
 
 
-def _fallback_crop(
-    page_image: Image.Image,
-    question_number: int,
-    page_number: int,
-    all_questions_on_page: list[dict],
-) -> str | None:
-    """
-    Fallback: divide page into equal horizontal bands and crop the question's band.
-    Used when PyMuPDF rect detection finds nothing.
-    """
-    try:
-        img_w, img_h = page_image.size
-        page_qs = sorted(
-            [q for q in all_questions_on_page if q.get("page_number") == page_number],
-            key=lambda x: x.get("question_number", 0),
-        )
-        total = len(page_qs)
-        pos = next(
-            (i for i, q in enumerate(page_qs) if q.get("question_number") == question_number),
-            None,
-        )
-        if pos is None:
-            return None
-
-        band_h  = img_h // total
-        padding = max(10, band_h // 20)
-        top     = max(0, pos * band_h - padding)
-        bottom  = min(img_h, (pos + 1) * band_h + padding)
-
-        cropped = page_image.crop((0, top, img_w, bottom))
-        save_dir = _ensure_image_dir()
-        filename = f"q{question_number}_p{page_number}_fb_{uuid.uuid4().hex[:8]}.png"
-        save_path = save_dir / filename
-        cropped.save(str(save_path), format="PNG")
-
-        logger.info("fallback_crop_saved", question=question_number, page=page_number)
-        return str(save_path)
-    except Exception as e:
-        logger.error("fallback_crop_failed", error=str(e))
-        return None
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def attach_images_to_questions(
     questions: list[dict],
     page_images: list[PageImage],
     pdf_bytes: bytes | None = None,
+    col_map: dict[int, dict] | None = None,
+    src_pages: list[PageImage] | None = None,
 ) -> list[dict]:
     """
-    For every question with has_image=True, find the image region on the page,
-    crop it, save it as a PNG, and store its path in question["image_path"].
+    For every question with has_image=True, isolate its figure region, crop
+    it from the SOURCE page render, and store the path in q["image_path"].
+
+    A figure is attached only when confidently isolated (embedded raster
+    rect, or a vector-drawing cluster, inside the question's own band and
+    column). Otherwise image_path stays None — the PDF renders the
+    description box instead. NEVER a band-of-the-page fallback: those crops
+    contained other questions' content on multi-column pages.
 
     Args:
-        questions:    Output of AIAnalyzer.extract_all_questions()
-        page_images:  Output of pdf_to_images()
-        pdf_bytes:    Original PDF bytes (enables precise rect detection).
-                      If None, falls back to equal-band cropping.
+        questions:   Output of AIAnalyzer.extract_all_questions(); their
+                     page_number values refer to page_images entries.
+        page_images: Analysis pages (possibly column-split halves).
+        pdf_bytes:   Original PDF bytes (enables figure isolation).
+        col_map:     From split_two_column_pages: {analysis_page:
+                     {"src_page", "x0", "x1"}}. None = identity.
+        src_pages:   Original (unsplit) page renders for cropping.
+                     None = page_images are the sources.
     """
-    page_lookup: dict[int, Image.Image] = {
-        p.page_number: p.image for p in page_images
+    if col_map is None:
+        col_map = {
+            p.page_number: {"src_page": p.page_number, "x0": 0.0, "x1": 1.0}
+            for p in page_images
+        }
+    if src_pages is None:
+        src_pages = page_images
+    src_lookup: dict[int, Image.Image] = {
+        p.page_number: p.image for p in src_pages
     }
 
     # Pre-compute PDF page sizes if we have the PDF
@@ -533,44 +654,56 @@ def attach_images_to_questions(
 
         page_num = q.get("page_number")
         q_num    = q.get("question_number", 0)
+        mapping  = col_map.get(page_num) if page_num else None
 
-        if not page_num or page_num not in page_lookup:
+        if not mapping or mapping["src_page"] not in src_lookup:
             logger.warning("no_page_image", question=q_num, page=page_num)
+            q["image_path"] = None
             continue
 
-        page_img = page_lookup[page_num]
+        src_page = mapping["src_page"]
         path: str | None = None
 
-        # ── Strategy 1: precise rect from PyMuPDF ──────────────────────────
-        if pdf_bytes and page_num in pdf_page_sizes:
+        if pdf_bytes and src_page in pdf_page_sizes:
             try:
-                rect = _find_best_image_rect_for_question(
+                pdf_w, pdf_h = pdf_page_sizes[src_page]
+                x_range = (mapping["x0"] * pdf_w, mapping["x1"] * pdf_w)
+                band = _question_y_band(
                     pdf_bytes=pdf_bytes,
-                    page_num=page_num,
+                    src_page=src_page,
+                    analysis_page=page_num,
                     question_number=q_num,
-                    all_questions_on_page=questions,
-                    page_pdf_height=pdf_page_sizes[page_num][1],
+                    all_questions=questions,
+                    page_pdf_height=pdf_h,
+                    x_range=x_range,
                 )
-                if rect:
-                    path = crop_and_save_image(
-                        page_image=page_img,
-                        rect_pdf=rect,
-                        page_pdf_size=pdf_page_sizes[page_num],
-                        question_number=q_num,
-                        page_number=page_num,
+                if band:
+                    # Strategy 1: embedded raster image in band+column
+                    rect = _find_image_rect_in_band(
+                        pdf_bytes, src_page, band, x_range
                     )
+                    # Strategy 2: vector-drawing cluster (drawn diagrams)
+                    if rect is None:
+                        rect = _find_drawing_figure_rect(
+                            pdf_bytes, src_page, band, x_range
+                        )
+                    if rect is not None:
+                        path = crop_and_save_image(
+                            page_image=src_lookup[src_page],
+                            rect_pdf=rect,
+                            page_pdf_size=pdf_page_sizes[src_page],
+                            question_number=q_num,
+                            page_number=src_page,
+                        )
             except Exception as e:
                 logger.warning("precise_crop_fail", question=q_num, error=str(e))
 
-        # ── Strategy 2: fallback equal-band crop ───────────────────────────
         if not path:
-            path = _fallback_crop(
-                page_image=page_img,
-                question_number=q_num,
-                page_number=page_num,
-                all_questions_on_page=questions,
+            logger.info(
+                "no_confident_figure",
+                question=q_num, page=page_num,
+                detail="attaching nothing; PDF will show the description box",
             )
-
         q["image_path"] = path
 
     return questions

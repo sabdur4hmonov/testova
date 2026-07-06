@@ -29,6 +29,7 @@ from app.services.file_processor import (
     docx_to_images,
     image_to_pages,
     pdf_to_images,
+    split_two_column_pages,
 )
 from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
 from app.services.variant_generator import generate_variants, validate_questions
@@ -292,7 +293,13 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     else:
         raw_pages = await asyncio.to_thread(image_to_pages, content)
 
-    page_images = raw_pages[:MAX_PAGES]
+    src_pages = raw_pages[:MAX_PAGES]
+
+    # ── Two-column pages → single-column halves in reading order ─────────────
+    # Gemini never sees a two-column layout: interleaving becomes impossible
+    # and figure-region geometry stays within the correct column. Single-
+    # column pages pass through unchanged.
+    page_images, col_map = await asyncio.to_thread(split_two_column_pages, src_pages)
     images = [p.image for p in page_images]
 
     # ── Extract via Gemini Vision ─────────────────────────────────────────────
@@ -340,6 +347,8 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         all_questions,
         page_images,
         _pdf_bytes_for_crop,
+        col_map,
+        src_pages,
     )
 
     # ── Multi-test documents: detect sections, teacher picks ONE ─────────────
