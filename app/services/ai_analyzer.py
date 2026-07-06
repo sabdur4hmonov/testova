@@ -71,7 +71,14 @@ CRITICAL RULES:
       for each question in that block.
     - For a normal standalone question with no shared passage, set both "group"
       and "group_context" to null.
-13. RETURN ONLY THE JSON ARRAY - nothing else"""
+13. PAGE-BREAK CONTINUATIONS: If the page STARTS with a continuation of a question
+    from the PREVIOUS page (an answer-options block without a question stem, or
+    question text without a question number), return it as the FIRST array item:
+    - "n": 0  (do NOT guess the real question number)
+    - "q": the continuation text, or "" if the block is only answer options
+    - put any visible options in A/B/C/D exactly as written
+    Do NOT skip such orphaned blocks and do NOT attach them to another question.
+14. RETURN ONLY THE JSON ARRAY - nothing else"""
 
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
@@ -269,6 +276,100 @@ class AIAnalyzer:
             else:
                 all_q_by_page.append(r)
 
+        unique = self._merge_pages(all_q_by_page)
+        logger.info("extraction_done", total=len(unique), pages=len(images))
+        return unique
+
+    # ── Cross-page merge & stitching ────────────────────────────────────────────
+
+    @staticmethod
+    def _merge_pages(all_q_by_page: list[list[dict]]) -> list[dict[str, Any]]:
+        """
+        Merge per-page extractions into one ordered question list.
+
+        Steps:
+        1. BUG FIX (#6): stitch page-leading fragments (an options block or
+           text continuation with no question number) onto the last numbered
+           question of the IMMEDIATELY preceding page. Previously these
+           orphans were silently dropped, so a question whose options landed
+           on the next page lost them and was misrendered as open-ended.
+           Only the directly preceding page is used as the stitch target —
+           if that page yielded no numbered questions (failed/blocked), the
+           fragment is dropped with a warning rather than risk stitching it
+           onto the wrong question.
+        2. Merge duplicate question numbers across pages (fill missing options).
+        3. Mark genuinely open-ended questions (no options anywhere).
+        """
+        prev_last: dict | None = None  # last numbered question of the previous page
+        pages_clean: list[list[dict]] = []
+
+        for page_idx, page_questions in enumerate(all_q_by_page):
+            page_num = page_idx + 1
+            rest = list(page_questions)
+
+            # ── Stitch leading fragments onto the question cut by the break ──
+            while rest and rest[0].get("is_fragment"):
+                frag = rest.pop(0)
+                if prev_last is None:
+                    logger.warning("stitch_orphan_dropped", page=page_num)
+                    continue
+
+                opts = prev_last.setdefault("options", {})
+                complete_before = sum(
+                    1 for v in opts.values() if v and str(v).strip()
+                ) >= 4
+
+                frag_opts = frag.get("options", {})
+                filled: list[str] = []
+                for letter in "ABCDE":
+                    if not opts.get(letter) and frag_opts.get(letter):
+                        opts[letter] = frag_opts[letter]
+                        filled.append(letter)
+
+                frag_text = str(frag.get("question_text") or "").strip()
+                appended = False
+                if frag_text:
+                    if filled or not complete_before:
+                        prev_last["question_text"] = (
+                            str(prev_last.get("question_text") or "").rstrip()
+                            + " " + frag_text
+                        )
+                        appended = True
+                    else:
+                        # Target already complete and the fragment brings no
+                        # options — more likely an unnumbered NEW question.
+                        # Don't corrupt the previous one.
+                        logger.warning(
+                            "stitch_text_dropped",
+                            page=page_num,
+                            target=prev_last.get("question_number"),
+                        )
+
+                if filled or appended:
+                    logger.info(
+                        "stitched_fragment",
+                        page=page_num,
+                        target=prev_last.get("question_number"),
+                        letters=filled,
+                        text_appended=appended,
+                    )
+                else:
+                    logger.warning(
+                        "stitch_noop",
+                        page=page_num,
+                        target=prev_last.get("question_number"),
+                    )
+
+            pages_clean.append(rest)
+
+            # The stitch target for the NEXT page is this page's last
+            # numbered question (reading order = the one a break would cut).
+            page_last: dict | None = None
+            for q in rest:
+                if q.get("question_number"):
+                    page_last = q
+            prev_last = page_last
+
         # ── Merge: questions split across pages ─────────────────────────────
         # Strategy:
         # 1. First pass — collect all occurrences of each question number,
@@ -279,7 +380,7 @@ class AIAnalyzer:
 
         # {question_number: [q_dict from page1, q_dict from page2, ...]}
         occurrences: dict[int, list[dict]] = {}
-        for page_questions in all_q_by_page:
+        for page_questions in pages_clean:
             for q in page_questions:
                 n = q.get("question_number", 0)
                 if not n:
@@ -327,9 +428,7 @@ class AIAnalyzer:
             merged[n] = primary
 
         # Sort by question number for clean output
-        unique = sorted(merged.values(), key=lambda x: x.get("question_number", 0))
-        logger.info("extraction_done", total=len(unique), pages=len(images))
-        return unique
+        return sorted(merged.values(), key=lambda x: x.get("question_number", 0))
 
     async def analyze_answer_sheet(
         self, image: Image.Image, total_questions: int
@@ -468,6 +567,11 @@ class AIAnalyzer:
                 group_id = f"p{page_num}_{str(grp).strip()}"[:64]
                 group_context = clean_latex(str(grp_ctx)) if grp_ctx else None
 
+            # BUG FIX (#6): an unnumbered item that carries options or text is
+            # a page-break continuation of the previous page's last question.
+            # Tag it so _merge_pages can stitch it instead of dropping it.
+            is_fragment = num == 0 and (bool(options) or bool(str(text).strip()))
+
             result.append({
                 "question_number": num,
                 "question_text": str(text),
@@ -477,6 +581,7 @@ class AIAnalyzer:
                 "image_description": str(img_desc) if img_desc else None,
                 "image_path": None,
                 "is_open_ended": False,  # will be set in extract_all_questions
+                "is_fragment": is_fragment,
                 "group_id": group_id,
                 "group_context": group_context,
             })
