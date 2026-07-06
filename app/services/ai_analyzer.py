@@ -58,6 +58,11 @@ CRITICAL RULES:
    - Square root: write as sqrt(x)
    - π symbol: write as π (the actual symbol)
    - Infinity: write as ∞
+   - Set/math symbols: preserve as REAL Unicode characters exactly as printed:
+     ∈ ∉ ∅ ⊂ ⊆ ∪ ∩ ℝ ℕ ℤ ℚ ≤ ≥ ≠ ≈ ± °
+     Example: "n ∈ N" must stay "n ∈ N", never "n □ N" or "n ? N"
+   - NEVER output □ (a box) or ? in place of a symbol you can see - if you
+     recognize the symbol, output the proper Unicode character for it
 10. Keep Uzbek and Russian text exactly as is, do not translate
 11. IMPORTANT: Some questions may have NO answer options at all (open-ended questions).
     If a question genuinely has no A/B/C/D options anywhere on the page, leave all as "".
@@ -71,13 +76,24 @@ CRITICAL RULES:
       for each question in that block.
     - For a normal standalone question with no shared passage, set both "group"
       and "group_context" to null.
-13. PAGE-BREAK CONTINUATIONS: If the page STARTS with a continuation of a question
+13. PAGE-BREAK CONTINUATIONS: A page may start with the continuation of a question
     from the PREVIOUS page (an answer-options block without a question stem, or
-    question text without a question number), return it as the FIRST array item:
+    question text without a question number).
+    IMPORTANT: headers, footers and decorative lines are NOT question content.
+    When deciding whether the page starts with a continuation, SKIP OVER lines
+    such as:
+    - exam/section title lines (often centered, ALL CAPS)
+    - author/footer lines like "Tuzuvchi: ..."
+    - Telegram channel mentions, @usernames, links
+    - page numbers, dates, horizontal rules
+    If the FIRST REAL QUESTION CONTENT on the page (after skipping such lines)
+    is an options block or unnumbered continuation text, return it as the
+    FIRST array item:
     - "n": 0  (do NOT guess the real question number)
     - "q": the continuation text, or "" if the block is only answer options
     - put any visible options in A/B/C/D exactly as written
-    Do NOT skip such orphaned blocks and do NOT attach them to another question.
+    Do NOT skip such orphaned blocks, do NOT attach them to another question,
+    and NEVER treat a header/title/footer line as a question or a question stem.
 14. RETURN ONLY THE JSON ARRAY - nothing else"""
 
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
