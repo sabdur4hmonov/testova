@@ -3,7 +3,7 @@ Tests for AIAnalyzer._merge_pages — cross-page stitching (bug #6), section
 awareness (multi-test documents), renumbering, and the pre-existing
 merge-by-number behavior. Pure functions, no Gemini/network.
 """
-from app.services.ai_analyzer import AIAnalyzer, renumber_sections
+from app.services.ai_analyzer import AIAnalyzer, summarize_sections
 
 
 def q(n, text="text", opts=None, frag=False, page=1, sec_title=None):
@@ -281,7 +281,7 @@ def test_fragment_stitches_across_section_boundary():
     assert result[1]["options"] == FULL
 
 
-# ── renumber_sections ─────────────────────────────────────────────────────────
+# ── summarize_sections (no merging, no renumbering) ─────────────────────────
 
 def _sec_q(sec, n, open_ended=False):
     d = q(n, f"s{sec}q{n}", opts={} if open_ended else FULL)
@@ -290,37 +290,63 @@ def _sec_q(sec, n, open_ended=False):
     return d
 
 
-def test_renumber_two_sections():
+def test_summarize_two_sections_leaves_questions_untouched():
     qs = [_sec_q(1, n) for n in (1, 2, 3)] + [_sec_q(2, n) for n in (1, 2)]
-    out, meta = renumber_sections(qs)
-    assert [x["question_number"] for x in out] == [1, 2, 3, 4, 5]
-    assert [x["original_number"] for x in out] == [1, 2, 3, 1, 2]
+    meta = summarize_sections(qs)
+    # No renumbering: numbers stay exactly as printed
+    assert [x["question_number"] for x in qs] == [1, 2, 3, 1, 2]
     assert meta[0] == {
         "section": 1, "title": None, "count": 3, "max": 3,
-        "offset": 0, "start": 1, "end": 3, "gaps": [], "open": [],
+        "gaps": [], "open": [],
     }
-    assert meta[1]["offset"] == 3
-    assert (meta[1]["start"], meta[1]["end"]) == (4, 5)
+    assert meta[1]["section"] == 2
+    assert (meta[1]["count"], meta[1]["max"]) == (2, 2)
 
 
-def test_renumber_single_section_is_identity():
-    qs = [_sec_q(1, n) for n in (1, 2, 3)]
-    out, meta = renumber_sections(qs)
-    assert [x["question_number"] for x in out] == [1, 2, 3]
-    assert len(meta) == 1 and meta[0]["offset"] == 0
+def test_summarize_single_section():
+    meta = summarize_sections([_sec_q(1, n) for n in (1, 2, 3)])
+    assert len(meta) == 1
+    assert meta[0]["max"] == 3
 
 
-def test_renumber_offset_uses_max_not_count():
-    # Section 1 has a gap (1, 3): offset must be max (3), not count (2),
-    # so section 2's q1 maps to 4 and the gap stays visible.
-    qs = [_sec_q(1, 1), _sec_q(1, 3), _sec_q(2, 1)]
-    out, meta = renumber_sections(qs)
+def test_summarize_reports_gaps_and_open():
+    qs = [_sec_q(1, 1), _sec_q(1, 3, open_ended=True)]
+    meta = summarize_sections(qs)
     assert meta[0]["gaps"] == [2]
-    assert meta[1]["offset"] == 3
-    assert out[2]["question_number"] == 4
+    assert meta[0]["open"] == [3]
 
 
-def test_renumber_records_open_ended_in_meta():
-    qs = [_sec_q(1, 1), _sec_q(1, 2, open_ended=True)]
-    _, meta = renumber_sections(qs)
-    assert meta[0]["open"] == [2]
+def test_summarize_captures_title():
+    qs = [_sec_q(1, 1), _sec_q(2, 1)]
+    qs[1]["section_title"] = "Anorganik moddalar"
+    meta = summarize_sections(qs)
+    assert meta[1]["title"] == "Anorganik moddalar"
+
+
+# ── Truncated-output salvage parser (only 37-39 survived bug) ────────────────
+
+def _analyzer():
+    return AIAnalyzer()
+
+
+def test_parse_salvages_truncated_array():
+    # Output hit the token cap: array never closed, last object cut mid-field.
+    raw = (
+        '[{"n": 1, "q": "first", "A": "a", "B": "b", "C": "c", "D": "d"},'
+        ' {"n": 2, "q": "second", "A": "a", "B": "b", "C": "c", "D": "d"},'
+        ' {"n": 3, "q": "third cut of'
+    )
+    parsed = _analyzer()._parse(raw, page_num=1)
+    assert [x["question_number"] for x in parsed] == [1, 2]
+    assert parsed[1]["question_text"] == "second"
+
+
+def test_parse_valid_json_unaffected():
+    raw = '[{"n": 7, "q": "ok", "A": "a", "B": "b", "C": "c", "D": "d"}]'
+    parsed = _analyzer()._parse(raw, page_num=1)
+    assert len(parsed) == 1
+    assert parsed[0]["question_number"] == 7
+
+
+def test_parse_garbage_still_returns_empty():
+    assert _analyzer()._parse("no json here at all", page_num=1) == []

@@ -24,18 +24,12 @@ def project_actions_keyboard(project_id: str) -> InlineKeyboardMarkup:
 
 
 def section_choice_keyboard(sections: list[dict], lang: str = "uz") -> InlineKeyboardMarkup:
-    """Multi-test document: merge all sections or keep just one."""
-    total = sum(s.get("count", 0) for s in sections)
-    merge_label = {
-        "uz": f"🔗 Birlashtirish ({total} savol)",
-        "en": f"🔗 Merge all ({total} questions)",
-        "ru": f"🔗 Объединить ({total} вопросов)",
-    }.get(lang, f"🔗 Merge all ({total})")
-    only_label = {
-        "uz": "Faqat {i}-test (1–{max})",
-        "en": "Only test {i} (1–{max})",
-        "ru": "Только {i}-й тест (1–{max})",
-    }.get(lang, "Only test {i} (1–{max})")
+    """Multi-test document: the teacher picks ONE test; the rest is discarded."""
+    label = {
+        "uz": "{i}-test (savollar 1–{max})",
+        "en": "Test {i} (questions 1–{max})",
+        "ru": "Тест {i} (вопросы 1–{max})",
+    }.get(lang, "Test {i} (questions 1–{max})")
     cancel = {
         "uz": "❌ Bekor qilish",
         "en": "❌ Cancel",
@@ -43,10 +37,9 @@ def section_choice_keyboard(sections: list[dict], lang: str = "uz") -> InlineKey
     }.get(lang, "❌ Cancel")
 
     builder = InlineKeyboardBuilder()
-    builder.button(text=merge_label, callback_data="sections:all")
     for s in sections:
         builder.button(
-            text=only_label.format(i=s["section"], max=s["max"]),
+            text=label.format(i=s["section"], max=s["max"]),
             callback_data=f"sections:{s['section']}",
         )
     builder.button(text=cancel, callback_data="cancel")

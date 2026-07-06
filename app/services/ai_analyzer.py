@@ -225,64 +225,38 @@ def clean_question(q: dict) -> dict:
     return q
 
 
-def renumber_sections(
-    questions: list[dict],
-) -> tuple[list[dict], list[dict]]:
+def summarize_sections(questions: list[dict]) -> list[dict]:
     """
-    Multi-test documents: numbering restarts per section, but the rest of the
-    pipeline (DB, answer keys, variants) requires unique question numbers.
-    Renumber continuously (section 1 keeps 1..N, section 2 becomes N+1.., etc.)
-    while keeping each question's printed number in "original_number".
+    Multi-test documents: describe each detected section WITHOUT touching the
+    questions (no merging, no renumbering — the teacher picks ONE section and
+    the others are discarded; combining tests is a separate future feature).
 
-    MUST be called AFTER attach_images_to_questions — image attachment matches
-    PDF regions by the ORIGINAL printed numbers.
-
-    Returns (questions, sections_meta) where each meta entry is JSON-safe:
-    {"section", "title", "count", "max", "offset", "start", "end",
-     "gaps": [original numbers missing], "open": [original numbers open-ended]}
+    Returns JSON-safe meta per section:
+    {"section", "title", "count", "max",
+     "gaps": [numbers missing in 1..max], "open": [open-ended numbers]}
     """
     by_section: dict[int, list[dict]] = {}
     for q in questions:
         by_section.setdefault(q.get("section", 1), []).append(q)
 
     sections_meta: list[dict] = []
-    offset = 0
     for sec in sorted(by_section):
-        qs = sorted(by_section[sec], key=lambda x: x.get("question_number", 0))
+        qs = by_section[sec]
         nums = [q["question_number"] for q in qs if q.get("question_number")]
         max_n = max(nums) if nums else 0
-        title = next(
-            (q.get("section_title") for q in qs if q.get("section_title")), None
-        )
         present = set(nums)
-        meta = {
+        sections_meta.append({
             "section": sec,
-            "title": title,
+            "title": next(
+                (q.get("section_title") for q in qs if q.get("section_title")),
+                None,
+            ),
             "count": len(nums),
             "max": max_n,
-            "offset": offset,
-            "start": offset + 1,
-            "end": offset + max_n,
             "gaps": [x for x in range(1, max_n + 1) if x not in present],
-            "open": [
-                q["question_number"] for q in qs if q.get("is_open_ended")
-            ],
-        }
-        sections_meta.append(meta)
-        for q in qs:
-            q["original_number"] = q.get("question_number", 0)
-            q["question_number"] = q["original_number"] + offset
-        offset += max_n
-
-    if len(sections_meta) > 1:
-        logger.info(
-            "sections_renumbered",
-            sections=[
-                {k: m[k] for k in ("section", "title", "start", "end")}
-                for m in sections_meta
-            ],
-        )
-    return questions, sections_meta
+            "open": [q["question_number"] for q in qs if q.get("is_open_ended")],
+        })
+    return sections_meta
 
 
 def _is_open_ended(q: dict) -> bool:
@@ -312,7 +286,10 @@ class AIAnalyzer:
             parts,
             generation_config=genai.GenerationConfig(
                 temperature=0.1,
-                max_output_tokens=4096,
+                # BUG FIX: 4096 was too small for dense (two-column) pages —
+                # the JSON array got truncated mid-object and the whole page
+                # was lost. 8192 + the salvage parser in _parse cover this.
+                max_output_tokens=8192,
                 response_mime_type="application/json",
             ),
         )
@@ -320,6 +297,10 @@ class AIAnalyzer:
             fr = response.candidates[0].finish_reason
             if fr == 4:
                 raise RuntimeError("RECITATION_BLOCK page blocked by Gemini copyright filter")
+            if fr == 2:  # MAX_TOKENS — output truncated
+                logger.warning("gemini_output_truncated", finish_reason=int(fr))
+            elif fr not in (0, 1):  # anything but UNSPECIFIED/STOP
+                logger.warning("gemini_finish_reason", finish_reason=int(fr))
         return response.text
 
     def _call_sync(self, prompt: str, image_bytes: bytes) -> str:
@@ -728,6 +709,22 @@ class AIAnalyzer:
                 data = self._try_json(m.group())
                 if data is not None:
                     break
+
+        # BUG FIX: salvage a TRUNCATED array (output hit the token limit and
+        # the closing "]" never arrived). Cut back to the last complete
+        # object and close the array — recovers every fully-emitted question
+        # instead of losing the whole page.
+        if data is None:
+            s = text.find("[")
+            e = text.rfind("}")
+            if s != -1 and e > s:
+                data = self._try_json(text[s:e + 1] + "]")
+                if data is not None:
+                    logger.warning(
+                        "parse_salvaged_truncated",
+                        page=page_num,
+                        items=len(data) if isinstance(data, list) else 0,
+                    )
 
         if data is None:
             logger.error("parse_failed", page=page_num, raw=raw[:500])
