@@ -285,16 +285,25 @@ def clean_question(q: dict) -> dict:
     return q
 
 
-def summarize_sections(questions: list[dict]) -> list[dict]:
+def summarize_sections(
+    questions: list[dict],
+    removed: set[tuple[int, int]] | None = None,
+) -> list[dict]:
     """
     Multi-test documents: describe each detected section WITHOUT touching the
     questions (no merging, no renumbering — the teacher picks ONE section and
     the others are discarded; combining tests is a separate future feature).
 
+    removed: {(section, number)} registry of questions deliberately removed
+    (exact duplicates). A number is only reported "missing" (gap) if it was
+    never extracted AND not removed — a deduped question must never alarm
+    the teacher as missing.
+
     Returns JSON-safe meta per section:
     {"section", "title", "count", "max",
      "gaps": [numbers missing in 1..max], "open": [open-ended numbers]}
     """
+    removed = removed or set()
     by_section: dict[int, list[dict]] = {}
     for q in questions:
         by_section.setdefault(q.get("section", 1), []).append(q)
@@ -313,7 +322,10 @@ def summarize_sections(questions: list[dict]) -> list[dict]:
             ),
             "count": len(nums),
             "max": max_n,
-            "gaps": [x for x in range(1, max_n + 1) if x not in present],
+            "gaps": [
+                x for x in range(1, max_n + 1)
+                if x not in present and (sec, x) not in removed
+            ],
             "open": [q["question_number"] for q in qs if q.get("is_open_ended")],
         })
     return sections_meta
@@ -710,7 +722,10 @@ class AIAnalyzer:
     # ── Missing-question recovery pass (numbering gaps) ─────────────────────────
 
     async def _recover_missing_questions(
-        self, questions: list[dict[str, Any]], images: list[Image.Image]
+        self,
+        questions: list[dict[str, Any]],
+        images: list[Image.Image],
+        excluded: set[tuple[int, int]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Recover question numbers that are ENTIRELY absent after extraction
@@ -720,7 +735,14 @@ class AIAnalyzer:
         never seen, so it carries no page itself). One targeted call per
         page-window; best-effort — failures keep today's behavior, and the
         #16 gap warning still reports anything left unrecovered.
+
+        excluded: {(section, number)} that must NEVER be re-requested — the
+        dedup removal registry. NOTE the pipeline-order contract: this pass
+        runs BEFORE dedupe_questions (extract → recover → dedupe), so a
+        removed duplicate cannot re-enter within one upload; the parameter
+        is a guard for any future reordering.
         """
+        excluded = excluded or set()
         by_sec: dict[int, list[dict]] = {}
         for q in questions:
             if q.get("question_number"):
@@ -730,7 +752,10 @@ class AIAnalyzer:
             nums = sorted(q["question_number"] for q in qs)
             present = set(nums)
             max_n = nums[-1]
-            gaps = [x for x in range(1, max_n + 1) if x not in present]
+            gaps = [
+                x for x in range(1, max_n + 1)
+                if x not in present and (sec, x) not in excluded
+            ]
             if not gaps:
                 continue
 

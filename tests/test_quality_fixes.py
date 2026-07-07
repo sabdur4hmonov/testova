@@ -17,7 +17,7 @@ from app.services.file_processor import (
     recrop_scheme_region,
 )
 from app.services import pdf_generator as pg
-from app.bot.handlers.upload import _quality_messages
+from app.bot.handlers.upload import _remap_removed_answers, _summary_message
 
 
 # ── FIX 1: crop garbage detector ─────────────────────────────────────────────
@@ -201,17 +201,127 @@ def test_variant_pdf_layout():
     assert footer_words, "page number missing from footer"
 
 
-# ── Teacher quality messages ─────────────────────────────────────────────────
+# ── Dedup ↔ reconciliation registry (Q35 false-missing bug) ──────────────────
 
-def test_quality_messages_filtered_by_section():
-    quality = {
-        "dups": [[1, 12, 47], [2, 3, 8]],
-        "siblings": [[1, [16, 17, 18]]],
-        "scheme_failed": [[2, 23]],
-    }
-    sec1 = " ".join(_quality_messages(quality, 1, "en"))
-    sec2 = " ".join(_quality_messages(quality, 2, "en"))
-    assert "47 (=12)" in sec1 and "16, 17, 18" in sec1 and "23" not in sec1
-    assert "8 (=3)" in sec2 and "23" in sec2 and "16" not in sec2
-    both = " ".join(_quality_messages(quality, None, "en"))
-    assert "47 (=12)" in both and "23" in both
+def test_summarize_excludes_deduped_numbers_from_gaps():
+    from app.services.ai_analyzer import summarize_sections
+    # 52 questions extracted, Q35 removed as duplicate of Q15 → NOT a gap.
+    qs = [_q(n, f"savol {n}", {"A": "x", "B": "y"}) for n in range(1, 53) if n != 35]
+    meta = summarize_sections(qs, removed={(1, 35)})
+    assert meta[0]["gaps"] == []
+    # A genuinely missing number still reports.
+    qs2 = [q for q in qs if q["question_number"] != 40]
+    meta2 = summarize_sections(qs2, removed={(1, 35)})
+    assert meta2[0]["gaps"] == [40]
+
+
+def test_summary_message_order_and_content():
+    meta = {"section": 1, "title": None, "count": 51, "max": 52,
+            "gaps": [40], "open": []}
+    quality = {"dups": [[1, 15, 35]], "siblings": [], "scheme_failed": []}
+    msg = _summary_message(meta, quality, "en")
+    assert "51 questions captured" in msg
+    assert "Question 35 is an exact copy of question 15" in msg
+    assert "Missing question numbers: 40" in msg
+    # Order: total → duplicates → missing
+    assert msg.index("captured") < msg.index("exact copy") < msg.index("Missing")
+    # The deduped number is never in the missing list
+    assert "Missing question numbers: 35" not in msg
+
+
+def test_summary_message_no_missing_line_when_only_dups():
+    meta = {"section": 1, "title": None, "count": 51, "max": 52,
+            "gaps": [], "open": []}
+    quality = {"dups": [[1, 15, 35]], "siblings": [], "scheme_failed": []}
+    msg = _summary_message(meta, quality, "en")
+    assert "Missing" not in msg
+    assert "check" not in msg.lower()  # never "check the file" for removed Qs
+
+
+def test_summary_message_filters_other_sections():
+    meta = {"section": 2, "title": None, "count": 39, "max": 39,
+            "gaps": [], "open": []}
+    quality = {"dups": [[1, 15, 35]], "siblings": [[1, [16, 17]]],
+               "scheme_failed": [[1, 23]]}
+    msg = _summary_message(meta, quality, "en")
+    assert "35" not in msg and "16" not in msg and "23" not in msg
+
+
+# ── FIX 3: gap recovery respects the removal registry ────────────────────────
+
+def test_gap_recovery_skips_excluded_numbers():
+    import asyncio
+    from app.services.ai_analyzer import AIAnalyzer
+    a = AIAnalyzer()
+    calls = []
+
+    async def fake_call_multi(prompt, imgs):
+        calls.append(prompt)
+        return "[]", 1
+
+    a._call_multi = fake_call_multi
+    qs = [
+        {"question_number": n, "section": 1, "page_number": 1,
+         "options": {"A": "a"}, "is_open_ended": False}
+        for n in range(1, 37) if n != 35
+    ]
+    # The ONLY gap is 35, and 35 is in the registry → no recovery call at all.
+    out = asyncio.run(a._recover_missing_questions(
+        qs, images=["img"], excluded={(1, 35)}
+    ))
+    assert len(out) == 35
+    assert calls == []
+
+
+def test_no_cycle_recovered_duplicate_removed_once():
+    # A recovered question that is an exact duplicate is removed by dedup in
+    # ONE pass, registry records it, and summarize reports no gap for it.
+    from app.services.ai_analyzer import summarize_sections
+    original = _q(15, "Takror savol", {"A": "x", "B": "y"})
+    recovered_dup = _q(35, "Takror savol", {"A": "x", "B": "y"})
+    others = [_q(n, f"savol {n}", {"A": "x"}) for n in (34, 36)]
+    kept, dups, _ = dedupe_questions([original, recovered_dup] + others)
+    assert dups == [(1, 15, 35)]
+    kept2, dups2, _ = dedupe_questions(kept)  # idempotent
+    assert kept2 == kept and not dups2
+    meta = summarize_sections(kept, removed={(d[0], d[2]) for d in dups})
+    assert 35 not in meta[0]["gaps"]
+
+
+# ── FIX 4: answer-key remap for removed numbers ──────────────────────────────
+
+def test_removed_number_answer_maps_to_survivor():
+    mapped, conflicts = _remap_removed_answers(
+        {"35": "B"}, {35: 15}, current_answers={},
+    )
+    assert mapped == {"15": "B"} and not conflicts
+
+
+def test_conflicting_answer_not_applied_and_reported():
+    mapped, conflicts = _remap_removed_answers(
+        {"35": "B"}, {35: 15}, current_answers={"15": "A"},
+    )
+    assert mapped == {}
+    assert conflicts == [(35, 15, "B", "A")]
+
+
+def test_same_answer_for_both_numbers_is_fine():
+    mapped, conflicts = _remap_removed_answers(
+        {"15": "A", "35": "A"}, {35: 15}, current_answers={},
+    )
+    assert mapped == {"15": "A"} and not conflicts
+
+
+def test_both_numbers_in_one_message_conflict_detected():
+    mapped, conflicts = _remap_removed_answers(
+        {"15": "A", "35": "B"}, {35: 15}, current_answers={},
+    )
+    assert mapped == {"15": "A"}
+    assert conflicts == [(35, 15, "B", "A")]
+
+
+def test_skip_marker_for_removed_number_is_noop():
+    mapped, conflicts = _remap_removed_answers(
+        {"35": "-", "36": "C"}, {35: 15}, current_answers={},
+    )
+    assert mapped == {"36": "C"} and not conflicts

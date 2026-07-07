@@ -72,10 +72,25 @@ T = {
         "en": "❌ No valid questions left — every question has blank or broken options. Check the file and upload again.",
         "ru": "❌ Не осталось корректных вопросов — во всех вопросах пустые или битые варианты ответов. Проверьте файл и загрузите снова.",
     },
-    "gaps_warning": {
-        "uz": "⚠️ Savollar 1–{max} gacha raqamlangan, lekin {found} ta topildi.\nTopilmagan savollar: {missing}\n\nFayldagi shu savollarni tekshirib ko'ring.",
-        "en": "⚠️ Questions are numbered 1–{max} but only {found} were found.\nMissing question numbers: {missing}\n\nPlease check these questions in the file.",
-        "ru": "⚠️ Вопросы пронумерованы 1–{max}, но найдено только {found}.\nНе найдены вопросы: {missing}\n\nПроверьте эти вопросы в файле.",
+    "sum_found": {
+        "uz": "📊 Jami {found} ta savol olindi (raqamlash 1–{max}).",
+        "en": "📊 {found} questions captured (numbered 1–{max}).",
+        "ru": "📊 Извлечено {found} вопросов (нумерация 1–{max}).",
+    },
+    "sum_dup_line": {
+        "uz": "♻️ {dropped}-savol {kept}-savolning aynan nusxasi — olib tashlandi.",
+        "en": "♻️ Question {dropped} is an exact copy of question {kept} — removed.",
+        "ru": "♻️ Вопрос {dropped} — точная копия вопроса {kept}, удалён.",
+    },
+    "sum_missing": {
+        "uz": "⚠️ Topilmagan savollar: {nums}\nFayldagi shu savollarni tekshirib ko'ring.",
+        "en": "⚠️ Missing question numbers: {nums}\nPlease check these questions in the file.",
+        "ru": "⚠️ Не найдены вопросы: {nums}\nПроверьте эти вопросы в файле.",
+    },
+    "dup_answer_conflict": {
+        "uz": "⚠️ {dropped}- va {kept}-savollar bir xil deb topilgan edi, lekin siz kiritgan javoblar farq qiladi ({new} ≠ {old}).\nTekshirib ko'ring — agar {kept}-savol javobini o'zgartirmoqchi bo'lsangiz, <code>{kept}{new}</code> yuboring.",
+        "en": "⚠️ Questions {dropped} and {kept} were treated as identical, but the answers you entered differ ({new} ≠ {old}).\nPlease verify — to change question {kept}'s answer, send <code>{kept}{new}</code>.",
+        "ru": "⚠️ Вопросы {dropped} и {kept} были признаны одинаковыми, но введённые ответы различаются ({new} ≠ {old}).\nПроверьте — чтобы изменить ответ вопроса {kept}, отправьте <code>{kept}{new}</code>.",
     },
     "open_info": {
         "uz": "ℹ️ Javob variantlarisiz (ochiq) savollar: {nums}\nBular variantlarda yozma savol sifatida chiqadi.",
@@ -96,11 +111,6 @@ T = {
         "uz": "⚠️ Hali javobsiz savollar: {missing}\nQolganini yuboring yoki o'tkazib yuborish: <code>-</code>",
         "en": "⚠️ Still unanswered: {missing}\nSend the rest, or skip: <code>-</code>",
         "ru": "⚠️ Ещё без ответа: {missing}\nОтправьте остальные или пропустите: <code>-</code>",
-    },
-    "dup_removed": {
-        "uz": "⚠️ Takroriy savollar olib tashlandi: {pairs}",
-        "en": "⚠️ Duplicate questions removed: {pairs}",
-        "ru": "⚠️ Удалены дублирующиеся вопросы: {pairs}",
     },
     "siblings_info": {
         "uz": "ℹ️ O'xshash savollar (matni bir xil, variantlari/sxemasi har xil): {groups}",
@@ -228,53 +238,75 @@ async def _persist_questions(project_id: str, questions: list[dict]) -> None:
         await session.commit()
 
 
-def _recon_messages(meta: dict, lang: str) -> list[str]:
-    """BUG FIX (#16): numbering-gap and open-ended warnings for one section."""
-    msgs: list[str] = []
+def _summary_message(meta: dict, quality: dict, lang: str) -> str:
+    """
+    ONE combined post-extraction summary for a section, in this order:
+    total extracted → duplicates removed (with mapping) → genuinely missing
+    (already excludes deduped numbers) → open-ended → siblings → scheme
+    failures. Contradicting separate warnings ("35 missing" + "35 was a
+    duplicate") are impossible by construction.
+    """
+    sec = meta["section"]
+    lines = [t("sum_found", lang, found=meta["count"], max=meta["max"])]
+
+    for d in quality.get("dups", []):
+        if d[0] == sec:
+            lines.append(t("sum_dup_line", lang, kept=d[1], dropped=d[2]))
+
     if meta["gaps"]:
-        msgs.append(t(
-            "gaps_warning", lang, max=meta["max"], found=meta["count"],
-            missing=", ".join(str(x) for x in meta["gaps"]),
+        lines.append(t(
+            "sum_missing", lang,
+            nums=", ".join(str(x) for x in meta["gaps"]),
         ))
     if meta["open"]:
-        msgs.append(t(
+        lines.append(t(
             "open_info", lang, nums=", ".join(str(x) for x in meta["open"]),
         ))
-    return msgs
 
-
-def _quality_messages(quality: dict, section: int | None, lang: str) -> list[str]:
-    """Duplicate / sibling / scheme warnings, filtered to one section
-    (None = all). quality holds JSON-safe lists from handle_file."""
-    msgs: list[str] = []
-    dups = [
-        d for d in quality.get("dups", [])
-        if section is None or d[0] == section
-    ]
-    if dups:
-        msgs.append(t(
-            "dup_removed", lang,
-            pairs=", ".join(f"{d[2]} (={d[1]})" for d in dups),
-        ))
-    sibs = [
-        s for s in quality.get("siblings", [])
-        if section is None or s[0] == section
-    ]
+    sibs = [s for s in quality.get("siblings", []) if s[0] == sec]
     if sibs:
-        msgs.append(t(
+        lines.append(t(
             "siblings_info", lang,
             groups="; ".join(", ".join(str(n) for n in s[1]) for s in sibs),
         ))
-    failed = [
-        f for f in quality.get("scheme_failed", [])
-        if section is None or f[0] == section
-    ]
+    failed = [f for f in quality.get("scheme_failed", []) if f[0] == sec]
     if failed:
-        msgs.append(t(
+        lines.append(t(
             "scheme_failed", lang,
             nums=", ".join(str(f[1]) for f in failed),
         ))
-    return msgs
+    return "\n\n".join(lines)
+
+
+def _remap_removed_answers(
+    updates: dict[str, str],
+    removed_map: dict[int, int],
+    current_answers: dict,
+) -> tuple[dict[str, str], list[tuple[int, int, str, str]]]:
+    """
+    Teachers enter keys from their printed source, which still contains
+    deduped numbers ("35-B" when Q35 was removed as a copy of Q15).
+    Map such entries onto the surviving question. If the surviving question
+    already has a DIFFERENT answer, the entry is NOT applied and a conflict
+    (dropped, kept, new_letter, old_letter) is reported — disagreeing answers
+    mean dedup may have collapsed two genuinely different questions.
+    """
+    mapped: dict[str, str] = {}
+    conflicts: list[tuple[int, int, str, str]] = []
+    for num_str, letter in updates.items():
+        n = int(num_str)
+        target = removed_map.get(n)
+        if target is None:
+            mapped[num_str] = letter
+            continue
+        if letter == "-":
+            continue  # skip marker for a removed number: nothing to skip
+        existing = mapped.get(str(target)) or current_answers.get(str(target))
+        if existing and existing != "-" and existing != letter:
+            conflicts.append((n, target, letter, existing))
+            continue
+        mapped[str(target)] = letter
+    return mapped, conflicts
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -422,7 +454,10 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     # No merging, no renumbering — combining tests is a separate future
     # feature (Multi-Source Builder). Questions are NOT saved to the DB
     # until a section is chosen; the other sections are discarded.
-    sections = summarize_sections(all_questions)
+    # The dedup removal registry keeps deliberately-removed duplicates out
+    # of the "missing numbers" gap report.
+    removed_registry = {(d[0], d[2]) for d in dup_pairs}
+    sections = summarize_sections(all_questions, removed_registry)
 
     if len(sections) > 1:
         line_tpl = {
@@ -464,6 +499,10 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         project_id=project_id,
         question_count=len(all_questions),
         answers=detected,
+        quality=quality,  # dedup registry needed at answer-key entry (FIX 4)
+        # Numbering can exceed the question count (dedup/gaps): parse the
+        # teacher's key against the real max number, not the count.
+        key_max=sections[0]["max"],
     )
     await state.set_state(UploadStates.waiting_for_answers)
 
@@ -476,10 +515,7 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     else:
         await status_msg.edit_text(t("ans_all", lang, n=n), parse_mode="HTML")
 
-    for msg_text in _recon_messages(sections[0], lang):
-        await message.answer(msg_text)
-    for msg_text in _quality_messages(quality, None, lang):
-        await message.answer(msg_text)
+    await message.answer(_summary_message(sections[0], quality, lang))
 
 
 @router.callback_query(UploadStates.waiting_for_section_choice, F.data.startswith("sections:"))
@@ -527,6 +563,7 @@ async def handle_section_choice(
         question_count=len(chosen),
         answers=detected,
         pending_questions=None,  # free the stash
+        key_max=meta["max"],
     )
     await state.set_state(UploadStates.waiting_for_answers)
 
@@ -540,10 +577,9 @@ async def handle_section_choice(
         await callback.message.edit_text(
             t("ans_all", lang, n=n), parse_mode="HTML",
         )
-    for msg_text in _recon_messages(meta, lang):
-        await callback.message.answer(msg_text)
-    for msg_text in _quality_messages(data.get("quality") or {}, sec, lang):
-        await callback.message.answer(msg_text)
+    await callback.message.answer(
+        _summary_message(meta, data.get("quality") or {}, lang)
+    )
     await callback.answer()
 
 
@@ -560,10 +596,28 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
     skip = text in ("-", "—", "skip", "o'tkazib", "otkazib", "пропустить")
 
     if not skip and text:
-        updates = _parse_answer_input(text, question_count)
+        key_max = data.get("key_max") or question_count
+        updates = _parse_answer_input(text, key_max)
         if not updates:
             await message.answer(t("key_bad", lang, bad=text[:60]), parse_mode="HTML")
             return
+
+        # ── FIX 4: entries for dedup-removed numbers map to survivors ────────
+        removed_map = {
+            d[2]: d[1] for d in (data.get("quality") or {}).get("dups", [])
+        }
+        updates, dup_conflicts = _remap_removed_answers(updates, removed_map, answers)
+        for dropped, kept_n, new_l, old_l in dup_conflicts:
+            await message.answer(
+                t("dup_answer_conflict", lang, dropped=dropped, kept=kept_n,
+                  new=new_l, old=old_l),
+                parse_mode="HTML",
+            )
+        if not updates:
+            # Everything entered was either conflicting or a skip for a
+            # removed number — nothing to apply; stay in this step.
+            if dup_conflicts:
+                return
 
         # ── Validate: question exists, letter exists among its options ───────
         async with async_session_factory() as session:
