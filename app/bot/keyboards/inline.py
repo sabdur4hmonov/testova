@@ -47,6 +47,19 @@ def section_choice_keyboard(sections: list[dict], lang: str = "uz") -> InlineKey
     return builder.as_markup()
 
 
+def reextract_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Offer strict re-extraction of flagged suspicious questions."""
+    label = {
+        "uz": "🔁 Shubhalilarni qayta o'qish",
+        "en": "🔁 Re-read suspicious questions",
+        "ru": "🔁 Перечитать подозрительные",
+    }.get(lang, "🔁 Re-read suspicious questions")
+    builder = InlineKeyboardBuilder()
+    builder.button(text=label, callback_data="reextract")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
     """List the teacher's own projects to pick which test to grade against."""
     builder = InlineKeyboardBuilder()

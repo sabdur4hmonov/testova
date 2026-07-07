@@ -7,6 +7,8 @@ import asyncio
 import io
 import json
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Any
 
 import google.generativeai as genai
@@ -80,6 +82,11 @@ CRITICAL RULES:
      Example: "X →(t°) Y →(catalyst) Z"
      NEVER skip a question because its notation is hard to format -
      extract it using this convention
+   - Isotope/nuclide notation: ALWAYS write as ^A_Z Symbol,
+     e.g. ^56_26 Fe, ^254_102 No, ^4_2 α.
+     NEVER glue the numbers together: "254102No" or "4ZE" is WRONG
+   - Bond symbols in structural formulas: preserve = (double) and
+     ≡ (triple) exactly as printed
    - NEVER output □ (a box) or ? in place of a symbol you can see - if you
      recognize the symbol, output the proper Unicode character for it
 10. Keep Uzbek and Russian text exactly as is, do not translate
@@ -129,6 +136,16 @@ CRITICAL RULES:
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
 FAQAT JSON: {{"answers": {{"1": "A", "2": null}}}}"""
+
+# FIX 7: appended to RECOVER_QUESTIONS_PROMPT when re-extracting questions
+# the suspicious-content heuristics flagged.
+REEXTRACT_STRICT_NOTE = """
+
+STRICT SYMBOL RULES for this pass:
+- preserve = (double bond) and ≡ (triple bond) symbols EXACTLY as printed
+- preserve superscripts/subscripts; isotopes as ^A_Z Symbol (e.g. ^56_26 Fe)
+- copy every formula character-by-character; never normalize or simplify
+- Roman numerals in parentheses like (II) must stay (II)"""
 
 # FIX 3(b): transcribe an unreadable/uncroppable scheme into a text chain.
 TRANSCRIBE_SCHEME_PROMPT = """Question {n} on this test page contains a scheme/diagram of transformations
@@ -374,8 +391,16 @@ def _has_scheme_content(q: dict) -> bool:
 
 # ── De-duplication (FIX 4) ──────────────────────────────────────────────────
 
+# Apostrophe look-alikes teachers'/Gemini's output mixes freely: keeping any
+# of them in the fingerprint made "o'zgarish" (U+2019) ≠ "oʻzgarish" (U+02BB)
+# and let exact duplicates through. All are DROPPED after NFKC folding.
+_APOSTROPHE_RE = re.compile(r"['‘’ʻʼʹ′`´]")
+
+
 def _fp_norm(s: str | None) -> str:
-    return re.sub(r'[^a-zа-яё0-9ʻʼ]', '', (s or '').lower())
+    s = unicodedata.normalize("NFKC", s or "")  # ² → 2, ligatures, width folds
+    s = _APOSTROPHE_RE.sub("", s.lower())
+    return re.sub(r'[^a-zа-яё0-9]', '', s)
 
 
 def _scheme_key(q: dict) -> str:
@@ -433,6 +458,129 @@ def dedupe_questions(
         if stem and len(nums) > 1
     ]
     return kept, duplicates, siblings
+
+
+def find_near_duplicates(
+    questions: list[dict], threshold: float = 0.9
+) -> list[tuple[int, list[int]]]:
+    """
+    FIX 5(c): after exact dedup, find SUSPECTED duplicates — identical
+    sorted-normalized option sets AND stem similarity >= threshold.
+    Reported to the teacher, never auto-deleted (small wording differences
+    can hide genuinely different questions).
+    """
+    by_opts: dict[tuple[int, str], list[dict]] = {}
+    for q in questions:
+        opts_key = "|".join(
+            sorted(_fp_norm(str(v)) for v in (q.get("options") or {}).values())
+        )
+        if not opts_key:
+            continue
+        by_opts.setdefault((q.get("section", 1), opts_key), []).append(q)
+
+    groups: list[tuple[int, list[int]]] = []
+    for (sec, _), qs in by_opts.items():
+        if len(qs) < 2:
+            continue
+        used = [False] * len(qs)
+        for i in range(len(qs)):
+            if used[i]:
+                continue
+            cluster = [qs[i]]
+            used[i] = True
+            a = _fp_norm(qs[i].get("question_text"))
+            for j in range(i + 1, len(qs)):
+                if used[j]:
+                    continue
+                b = _fp_norm(qs[j].get("question_text"))
+                if a and b and SequenceMatcher(None, a, b).ratio() >= threshold:
+                    cluster.append(qs[j])
+                    used[j] = True
+            if len(cluster) > 1:
+                nums = sorted(q.get("question_number", 0) for q in cluster)
+                groups.append((sec, nums))
+                logger.warning("near_duplicates_suspected", section=sec, numbers=nums)
+    return groups
+
+
+# ── Suspicious-question flagging (FIX 7: flag, never auto-rewrite) ───────────
+
+# Same element twice in one formula token (S2S) — CH3CH3 etc. don't match
+# because the repeat must be IMMEDIATELY adjacent (after optional digits).
+_REPEATED_ELEMENT_RE = re.compile(r'\b([A-Z][a-z]?)\d*\1\d*\b')
+_DANGLING_VA_RE = re.compile(r"\bva\s+hosil\s+bo", re.I)
+_RATIO_RE = re.compile(r'\b(\d+(?:\s*:\s*\d+)+)\b')
+_FORMULA_TOKEN_RE = re.compile(r'\b(?:[A-Z][a-z]?\d*){2,}\b')
+_ELEMENT_RE = re.compile(r'[A-Z][a-z]?')
+# Glued isotope digits: "254102No", "y24α" — mass/atomic numbers mashed
+_BROKEN_ISOTOPE_RES = (
+    re.compile(r'\b\d{4,6}[A-Z][a-z]?\b'),
+    re.compile(r'\b[a-z]\d+α'),
+)
+# Known OCR confusions ("(II)" read as "fill", ...). Extensible.
+_OCR_CONFUSION_TOKENS = ("fill",)
+
+
+def flag_suspicious_questions(
+    questions: list[dict],
+) -> list[tuple[int, int, str]]:
+    """
+    Heuristics for content that survived extraction but looks corrupted.
+    Returns (section, number, comma-joined reason slugs) — the teacher sees
+    the numbers and can trigger a strict re-extraction; nothing is rewritten
+    automatically.
+    """
+    flagged: list[tuple[int, int, str]] = []
+    for q in questions:
+        stem = q.get("question_text") or ""
+        full = " ".join(
+            [stem] + [str(v) for v in (q.get("options") or {}).values() if v]
+        )
+        reasons: list[str] = []
+
+        if _REPEATED_ELEMENT_RE.search(full):
+            reasons.append("repeated_element")
+
+        for line in stem.split("\n"):
+            ls = line.strip()
+            if ls.startswith("=") or ls.endswith("="):
+                reasons.append("empty_equation_side")
+                break
+
+        if _DANGLING_VA_RE.search(stem):
+            reasons.append("dangling_product")
+
+        rm = _RATIO_RE.search(full)
+        if rm and "birikma" in full.lower():
+            parts = len(rm.group(1).split(":"))
+            max_elems = 0
+            for ft in _FORMULA_TOKEN_RE.findall(full):
+                max_elems = max(max_elems, len(set(_ELEMENT_RE.findall(ft))))
+            if max_elems and parts > max_elems:
+                reasons.append("ratio_element_mismatch")
+
+        if ("oksidlan" in stem.lower() and re.search(r'\bC?H?\d*\(?CH', stem)
+                and "=" not in stem and "≡" not in stem):
+            reasons.append("possible_lost_bond")
+
+        low_tokens = set(re.findall(r'[^\W\d_]+', full.lower()))
+        if any(tok in low_tokens for tok in _OCR_CONFUSION_TOKENS):
+            reasons.append("ocr_confusion")
+
+        if any(rx.search(full) for rx in _BROKEN_ISOTOPE_RES):
+            reasons.append("broken_isotope")
+
+        if reasons:
+            flagged.append((
+                q.get("section", 1),
+                q.get("question_number", 0),
+                ",".join(reasons),
+            ))
+            logger.info(
+                "suspicious_question",
+                question=q.get("question_number"), reasons=reasons,
+            )
+    return flagged
 
 
 def _is_open_ended(q: dict) -> bool:
@@ -672,6 +820,7 @@ class AIAnalyzer:
                         q_num=n,
                         analysis_page=page,
                         all_questions=questions,
+                        stem_text=q.get("question_text"),
                     )
                 except Exception as e:
                     logger.warning("scheme_recrop_failed", question=n, error=str(e))
@@ -718,6 +867,61 @@ class AIAnalyzer:
             logger.warning("scheme_unrecoverable", question=n)
 
         return failed
+
+    # ── Strict re-extraction of flagged questions (FIX 7) ───────────────────────
+
+    async def reextract_questions(
+        self,
+        numbers: list[int],
+        questions: list[dict[str, Any]],
+        images: list[Image.Image],
+    ) -> dict[int, dict]:
+        """
+        Re-extract specific (suspicious) questions with strict symbol
+        preservation. Uses the existing targeted-recovery machinery.
+        Returns {number: fresh_question_dict} for successfully re-read ones —
+        the caller decides how to apply (DB update); nothing is auto-rewritten
+        here.
+        """
+        by_num = {q.get("question_number"): q for q in questions}
+        by_page: dict[int, list[int]] = {}
+        for n in numbers:
+            page = (by_num.get(n) or {}).get("page_number") or 0
+            if 1 <= page <= len(images):
+                by_page.setdefault(page, []).append(n)
+            else:
+                logger.warning("reextract_no_page", question=n)
+
+        fresh: dict[int, dict] = {}
+        for page, nums in sorted(by_page.items()):
+            for i in range(0, len(nums), 8):
+                chunk = nums[i:i + 8]
+                prompt = RECOVER_QUESTIONS_PROMPT.format(
+                    nums=", ".join(str(n) for n in chunk)
+                ) + REEXTRACT_STRICT_NOTE
+                imgs = [images[page - 1]]
+                if page < len(images):
+                    imgs.append(images[page])
+                try:
+                    raw, _fr = await self._call_multi(prompt, imgs)
+                    items = self._parse(raw, page_num=page)
+                except Exception as e:
+                    logger.warning("reextract_failed", page=page, error=str(e))
+                    continue
+                for item in items:
+                    clean_question(item)
+                    n = item.get("question_number")
+                    opts = {
+                        k: v for k, v in (item.get("options") or {}).items()
+                        if v and str(v).strip()
+                    }
+                    if (n in chunk
+                            and str(item.get("question_text") or "").strip()
+                            and len(opts) != 1):
+                        item["options"] = opts
+                        fresh[n] = item
+                        logger.info("question_reextracted", question=n)
+        return fresh
 
     # ── Missing-question recovery pass (numbering gaps) ─────────────────────────
 

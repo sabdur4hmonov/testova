@@ -601,6 +601,34 @@ def _rect_is_garbage(
     return None
 
 
+def _crop_echoes_stem(
+    pdf_bytes: bytes,
+    src_page: int,
+    rect: fitz.Rect,
+    stem_text: str | None,
+    threshold: float = 0.6,
+) -> bool:
+    """
+    FIX 6(b): text-echo detector. If most of the question's own stem tokens
+    appear inside the crop, the crop is a screenshot of the question text,
+    not a figure — reject it. Uses PDF words (no OCR needed).
+    """
+    if not stem_text:
+        return False
+    stem_tokens = set(re.findall(r'[^\W_]{3,}', stem_text.lower()))
+    if len(stem_tokens) < 4:
+        return False  # too little signal to judge
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        words = doc[src_page - 1].get_text("words", clip=rect)
+        doc.close()
+    except Exception:
+        return False
+    crop_tokens = {str(w[4]).lower().strip(".,;:!?()") for w in words}
+    overlap = len(stem_tokens & crop_tokens) / len(stem_tokens)
+    return overlap >= threshold
+
+
 def recrop_scheme_region(
     pdf_bytes: bytes,
     src_page: int,
@@ -610,11 +638,13 @@ def recrop_scheme_region(
     q_num: int,
     analysis_page: int,
     all_questions: list[dict],
+    stem_text: str | None = None,
 ) -> str | None:
     """
     FIX 3(a): geometric re-crop — the region between the question's first
     stem line and the start of its own options, within its column. Runs the
-    garbage detector on the result; returns a saved path or None.
+    garbage detector AND the text-echo detector on the result; returns a
+    saved path or None.
     """
     band = _question_y_band(
         pdf_bytes, src_page, analysis_page, q_num,
@@ -655,6 +685,11 @@ def recrop_scheme_region(
     reason = _rect_is_garbage(pdf_bytes, src_page, rect, q_num, page_area)
     if reason:
         logger.info("recrop_rejected", question=q_num, reason=reason)
+        return None
+    # FIX 6(b): a re-crop dominated by the question's own text is a
+    # screenshot of the stem, not a figure.
+    if _crop_echoes_stem(pdf_bytes, src_page, rect, stem_text):
+        logger.info("recrop_rejected", question=q_num, reason="text_echo")
         return None
 
     return crop_and_save_image(
@@ -770,6 +805,16 @@ def attach_images_to_questions(
         if q.get("image_path"):
             continue  # already assigned
 
+        # FIX 6(c): the stem already carries the transformation chain as
+        # text — any image would only echo it. Attach nothing.
+        if "→" in (q.get("question_text") or ""):
+            logger.info(
+                "image_skipped_chain_in_stem",
+                question=q.get("question_number"),
+            )
+            q["image_path"] = None
+            continue
+
         page_num = q.get("page_number")
         q_num    = q.get("question_number", 0)
         mapping  = col_map.get(page_num) if page_num else None
@@ -812,6 +857,10 @@ def attach_images_to_questions(
                             pdf_bytes, src_page, rect, q_num,
                             pdf_w * pdf_h,
                         )
+                        if reason is None and _crop_echoes_stem(
+                            pdf_bytes, src_page, rect, q.get("question_text")
+                        ):
+                            reason = "text_echo"  # FIX 6(b)
                         if reason:
                             logger.warning(
                                 "crop_rejected_garbage",
@@ -838,6 +887,7 @@ def attach_images_to_questions(
                             q_num=q_num,
                             analysis_page=page_num,
                             all_questions=questions,
+                            stem_text=q.get("question_text"),
                         )
             except Exception as e:
                 logger.warning("precise_crop_fail", question=q_num, error=str(e))

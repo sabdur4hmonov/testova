@@ -12,7 +12,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from app.bot.keyboards.inline import section_choice_keyboard
+from app.bot.keyboards.inline import reextract_keyboard, section_choice_keyboard
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
 from app.config import settings
@@ -22,7 +22,14 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import storage
-from app.services.ai_analyzer import AIAnalyzer, dedupe_questions, summarize_sections
+from app.services import storage
+from app.services.ai_analyzer import (
+    AIAnalyzer,
+    dedupe_questions,
+    find_near_duplicates,
+    flag_suspicious_questions,
+    summarize_sections,
+)
 from app.services.file_processor import (
     attach_images_to_questions,
     detect_file_type,
@@ -121,6 +128,41 @@ T = {
         "uz": "⚠️ Sxemasi tiklanmagan savollar: {nums}\nBu savollarni faylda tekshirib ko'ring.",
         "en": "⚠️ Questions whose scheme could not be recovered: {nums}\nPlease check them in the file.",
         "ru": "⚠️ Вопросы с невосстановленной схемой: {nums}\nПроверьте их в файле.",
+    },
+    "dup_ack": {
+        "uz": "♻️ {dropped} = {kept} (nusxa), javob mos ✓",
+        "en": "♻️ {dropped} = {kept} (duplicate), answer recorded ✓",
+        "ru": "♻️ {dropped} = {kept} (дубликат), ответ учтён ✓",
+    },
+    "near_dup_info": {
+        "uz": "❓ Shubhali takrorlar (bir xil variantlar, o'xshash matn) — tekshirib ko'ring: {groups}",
+        "en": "❓ Suspected duplicates (same options, very similar stems) — please check: {groups}",
+        "ru": "❓ Подозрение на дубликаты (одинаковые варианты, похожий текст) — проверьте: {groups}",
+    },
+    "suspicious_info": {
+        "uz": "🔍 Shubhali savollar — asl fayl bilan solishtiring: {nums}",
+        "en": "🔍 Suspicious questions — compare with the source file: {nums}",
+        "ru": "🔍 Подозрительные вопросы — сверьте с исходным файлом: {nums}",
+    },
+    "reextracting": {
+        "uz": "🔁 Shubhali savollar qayta o'qilmoqda...",
+        "en": "🔁 Re-reading the suspicious questions...",
+        "ru": "🔁 Повторно читаю подозрительные вопросы...",
+    },
+    "reextract_done": {
+        "uz": "✅ {n} ta savol qayta o'qildi: {nums}\nJavob kalitini tekshirib chiqing.",
+        "en": "✅ {n} question(s) re-read: {nums}\nPlease re-check the answer key.",
+        "ru": "✅ Повторно прочитано {n} вопрос(ов): {nums}\nПроверьте ключ ответов.",
+    },
+    "reextract_none": {
+        "uz": "ℹ️ Qayta o'qishdan yangi natija olinmadi.",
+        "en": "ℹ️ Re-reading produced no new result.",
+        "ru": "ℹ️ Повторное чтение не дало нового результата.",
+    },
+    "skipped_note": {
+        "uz": "ℹ️ O'tkazib yuborilgan savollar (baholanmaydi): {nums}",
+        "en": "ℹ️ Skipped questions (excluded from grading): {nums}",
+        "ru": "ℹ️ Пропущенные вопросы (не оцениваются): {nums}",
     },
     "count_mismatch": {
         "uz": "⚠️ Diqqat: loyihada {expected} ta savol bor, variantlarga {actual} ta kirdi.\nKirmay qolganlar: {nums}",
@@ -275,14 +317,31 @@ def _summary_message(meta: dict, quality: dict, lang: str) -> str:
             "scheme_failed", lang,
             nums=", ".join(str(f[1]) for f in failed),
         ))
+
+    near = [g for g in quality.get("near_dups", []) if g[0] == sec]
+    if near:
+        lines.append(t(
+            "near_dup_info", lang,
+            groups="; ".join(", ".join(str(n) for n in g[1]) for g in near),
+        ))
+    susp = _section_suspicious(quality, sec)
+    if susp:
+        lines.append(t(
+            "suspicious_info", lang,
+            nums=", ".join(str(s[1]) for s in susp),
+        ))
     return "\n\n".join(lines)
+
+
+def _section_suspicious(quality: dict, sec: int) -> list:
+    return [s for s in quality.get("suspicious", []) if s[0] == sec]
 
 
 def _remap_removed_answers(
     updates: dict[str, str],
     removed_map: dict[int, int],
     current_answers: dict,
-) -> tuple[dict[str, str], list[tuple[int, int, str, str]]]:
+) -> tuple[dict[str, str], list[tuple[int, int, str, str]], list[tuple[int, int, str]]]:
     """
     Teachers enter keys from their printed source, which still contains
     deduped numbers ("35-B" when Q35 was removed as a copy of Q15).
@@ -290,9 +349,14 @@ def _remap_removed_answers(
     already has a DIFFERENT answer, the entry is NOT applied and a conflict
     (dropped, kept, new_letter, old_letter) is reported — disagreeing answers
     mean dedup may have collapsed two genuinely different questions.
+
+    Returns (mapped, conflicts, acks) — acks are (dropped, kept, letter)
+    for registry entries that were accepted, so the teacher gets an explicit
+    "35 = 15 (nusxa), javob mos ✓" instead of silence or an error.
     """
     mapped: dict[str, str] = {}
     conflicts: list[tuple[int, int, str, str]] = []
+    acks: list[tuple[int, int, str]] = []
     for num_str, letter in updates.items():
         n = int(num_str)
         target = removed_map.get(n)
@@ -306,7 +370,8 @@ def _remap_removed_answers(
             conflicts.append((n, target, letter, existing))
             continue
         mapped[str(target)] = letter
-    return mapped, conflicts
+        acks.append((n, target, letter))
+    return mapped, conflicts, acks
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -444,10 +509,15 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     scheme_failed = await analyzer.ensure_scheme_content(
         all_questions, images, _pdf_bytes_for_crop, col_map, src_pages
     )
+    # FIX 5(c) + FIX 7: suspected near-duplicates and corrupted-content flags
+    near_dups = find_near_duplicates(all_questions)
+    suspicious = flag_suspicious_questions(all_questions)
     quality = {
         "dups": [list(d) for d in dup_pairs],
         "siblings": [[s[0], list(s[1])] for s in sibling_groups],
         "scheme_failed": [list(f) for f in scheme_failed],
+        "near_dups": [[g[0], list(g[1])] for g in near_dups],
+        "suspicious": [list(s) for s in suspicious],
     }
 
     # ── Multi-test documents: detect sections, teacher picks ONE ─────────────
@@ -515,7 +585,13 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     else:
         await status_msg.edit_text(t("ans_all", lang, n=n), parse_mode="HTML")
 
-    await message.answer(_summary_message(sections[0], quality, lang))
+    await message.answer(
+        _summary_message(sections[0], quality, lang),
+        reply_markup=(
+            reextract_keyboard(lang)
+            if _section_suspicious(quality, sections[0]["section"]) else None
+        ),
+    )
 
 
 @router.callback_query(UploadStates.waiting_for_section_choice, F.data.startswith("sections:"))
@@ -578,9 +654,101 @@ async def handle_section_choice(
             t("ans_all", lang, n=n), parse_mode="HTML",
         )
     await callback.message.answer(
-        _summary_message(meta, data.get("quality") or {}, lang)
+        _summary_message(meta, data.get("quality") or {}, lang),
+        reply_markup=(
+            reextract_keyboard(lang)
+            if _section_suspicious(data.get("quality") or {}, sec) else None
+        ),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "reextract")
+async def handle_reextract(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """FIX 7: re-read the suspicious questions with strict symbol rules.
+    Page images are re-rendered from the stored original file (they are not
+    kept in FSM); the column split is deterministic so page numbers match."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    project_id: str = data.get("project_id", "")
+    suspicious = (data.get("quality") or {}).get("suspicious", [])
+    if not project_id or not suspicious:
+        await callback.answer()
+        return
+
+    await callback.answer()
+    status = await callback.message.answer(t("reextracting", lang))
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        pres = await session.execute(
+            select(Project).where(
+                Project.id == uuid.UUID(project_id),
+                Project.user_id == db_user.id,
+            )
+        )
+        project = pres.scalar_one_or_none()
+        qres = await session.execute(
+            select(Question).where(Question.project_id == uuid.UUID(project_id))
+        )
+        rows = qres.scalars().all()
+
+    if not project or not project.original_file_path or not rows:
+        await status.edit_text(t("reextract_none", lang))
+        return
+
+    try:
+        content = await storage.read_file(project.original_file_path)
+        if project.file_type == "pdf":
+            raw_pages = await asyncio.to_thread(pdf_to_images, content)
+        elif project.file_type == "docx":
+            raw_pages, _ = await asyncio.to_thread(docx_to_images, content)
+        else:
+            raw_pages = await asyncio.to_thread(image_to_pages, content)
+        page_images, _cm = await asyncio.to_thread(
+            split_two_column_pages, raw_pages[:MAX_PAGES]
+        )
+        images = [p.image for p in page_images]
+
+        nums = [s[1] for s in suspicious]
+        qdicts = [
+            {"question_number": r.question_number, "page_number": r.page_number}
+            for r in rows
+        ]
+        analyzer = AIAnalyzer()
+        fresh = await analyzer.reextract_questions(nums, qdicts, images)
+    except Exception as e:
+        logger.error("reextract_error", project_id=project_id, error=str(e))
+        await status.edit_text(t("reextract_none", lang))
+        return
+
+    if not fresh:
+        await status.edit_text(t("reextract_none", lang))
+        return
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        qres = await session.execute(
+            select(Question).where(Question.project_id == uuid.UUID(project_id))
+        )
+        for r in qres.scalars().all():
+            item = fresh.get(r.question_number)
+            if not item:
+                continue
+            opts = item.get("options", {})
+            r.question_text = item.get("question_text", r.question_text)
+            r.option_a = opts.get("A")
+            r.option_b = opts.get("B")
+            r.option_c = opts.get("C")
+            r.option_d = opts.get("D")
+        await session.commit()
+
+    await status.edit_text(t(
+        "reextract_done", lang,
+        n=len(fresh), nums=", ".join(str(n) for n in sorted(fresh)),
+    ))
 
 
 @router.message(UploadStates.waiting_for_answers, F.text)
@@ -602,24 +770,15 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
             await message.answer(t("key_bad", lang, bad=text[:60]), parse_mode="HTML")
             return
 
-        # ── FIX 4: entries for dedup-removed numbers map to survivors ────────
+        # ── FIX 2: entries for dedup-removed numbers map to survivors ────────
         removed_map = {
             d[2]: d[1] for d in (data.get("quality") or {}).get("dups", [])
         }
-        updates, dup_conflicts = _remap_removed_answers(updates, removed_map, answers)
-        for dropped, kept_n, new_l, old_l in dup_conflicts:
-            await message.answer(
-                t("dup_answer_conflict", lang, dropped=dropped, kept=kept_n,
-                  new=new_l, old=old_l),
-                parse_mode="HTML",
-            )
-        if not updates:
-            # Everything entered was either conflicting or a skip for a
-            # removed number — nothing to apply; stay in this step.
-            if dup_conflicts:
-                return
+        updates, dup_conflicts, dup_acks = _remap_removed_answers(
+            updates, removed_map, answers
+        )
 
-        # ── Validate: question exists, letter exists among its options ───────
+        # ── FIX 3: partial save — validate per entry, apply every good one ────
         async with async_session_factory() as session:
             from sqlalchemy import select
             res = await session.execute(
@@ -636,46 +795,63 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
                 for r in rows
             }
 
-            bad = []
+            good: dict[str, str] = {}
+            bad_lines: list[str] = []
             for num_str, letter in updates.items():
                 avail = letters_by_num.get(int(num_str))
                 if avail is None:
-                    bad.append(_key_reason("no_question", lang, n=num_str,
-                                           L="" if letter == "-" else letter))
+                    bad_lines.append(_key_reason(
+                        "no_question", lang, n=num_str,
+                        L="" if letter == "-" else letter,
+                    ))
                 elif letter == "-":
-                    continue  # explicit skip — always valid for an existing question
+                    good[num_str] = "-"  # explicit skip for an existing question
                 elif not avail:
-                    bad.append(_key_reason("open", lang, n=num_str, L=letter))
+                    bad_lines.append(_key_reason("open", lang, n=num_str, L=letter))
                 elif letter not in avail:
-                    bad.append(_key_reason(
+                    bad_lines.append(_key_reason(
                         "bad_letter", lang, n=num_str, L=letter,
                         avail=", ".join(sorted(avail)),
                     ))
-            if bad:
-                await message.answer(
-                    t("key_bad", lang, bad="\n".join(bad)), parse_mode="HTML"
-                )
-                return
+                else:
+                    good[num_str] = letter
 
             for r in rows:
-                val = updates.get(str(r.question_number))
+                val = good.get(str(r.question_number))
                 if val and val != "-":
                     r.correct_answer = val
             await session.commit()
 
-        answers.update(updates)
+        answers.update(good)
         await state.update_data(answers=answers)
 
-        # ── Completeness: every MC question needs an answer (or '-' skips) ────
+        # ── One combined reply: acks, conflicts, per-line issues, remaining ──
+        reply_parts: list[str] = []
+        if dup_acks:
+            reply_parts.append("\n".join(
+                t("dup_ack", lang, dropped=a[0], kept=a[1]) for a in dup_acks
+            ))
+        for dropped, kept_n, new_l, old_l in dup_conflicts:
+            reply_parts.append(t(
+                "dup_answer_conflict", lang, dropped=dropped, kept=kept_n,
+                new=new_l, old=old_l,
+            ))
+        if bad_lines:
+            reply_parts.append(t("key_bad", lang, bad="\n".join(bad_lines)))
+
+        # Completeness: EXACT remaining numbers, never a count (skips count
+        # as answered; they're excluded from grading and listed later).
         still_missing = [
             str(n) for n, avail in sorted(letters_by_num.items())
             if avail and not answers.get(str(n))
         ]
         if still_missing:
-            await message.answer(
-                t("key_incomplete", lang, missing=", ".join(still_missing)),
-                parse_mode="HTML",
-            )
+            reply_parts.append(t(
+                "key_incomplete", lang, missing=", ".join(still_missing),
+            ))
+        if reply_parts:
+            await message.answer("\n\n".join(reply_parts), parse_mode="HTML")
+        if still_missing or dup_conflicts or bad_lines:
             return
 
     await state.set_state(UploadStates.waiting_for_variant_count)
@@ -713,6 +889,18 @@ async def _generate_and_send(
 ) -> None:
     lang   = db_user.language.value
     status = await message.answer(t("generating", lang, n=count))
+
+    # FIX 3: skip semantics — explicitly skipped numbers are excluded from
+    # grading (correct_answer stays NULL) and listed once, here.
+    data_pre = await state.get_data()
+    skipped_nums = sorted(
+        int(k) for k, v in (data_pre.get("answers") or {}).items() if v == "-"
+    )
+    if skipped_nums:
+        await message.answer(t(
+            "skipped_note", lang,
+            nums=", ".join(str(n) for n in skipped_nums),
+        ))
 
     async with async_session_factory() as session:
         from sqlalchemy import select
