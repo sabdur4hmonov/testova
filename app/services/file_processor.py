@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 import uuid
 from pathlib import Path
 from typing import NamedTuple
@@ -549,6 +550,123 @@ def _find_drawing_figure_rect(
     return union
 
 
+# ── Crop sanity check (FIX 1: garbage detector) ──────────────────────────────
+
+# Option marker word: "A)" .. "E)" (Latin or Cyrillic), possibly glued ("A)2")
+_OPTION_MARKER_RE = re.compile(r'^[A-EА-Е]\)')
+# Question-number word: "12." / "12)" but NOT decimals like "0.5"
+_QNUM_WORD_RE = re.compile(r'^(\d{1,2})[.)](?!\d)')
+
+MAX_CROP_PAGE_RATIO = 0.35  # a figure never legitimately covers >35% of a page
+
+
+def _rect_is_garbage(
+    pdf_bytes: bytes,
+    src_page: int,
+    rect: fitz.Rect,
+    own_qnum: int,
+    page_area: float,
+) -> str | None:
+    """
+    Decide whether a candidate figure rect is actually a chunk of OTHER
+    questions (the garbage-crop bug). Returns the rejection reason, or None
+    if the rect looks like a clean figure.
+
+    Signals:
+    - covers more than MAX_CROP_PAGE_RATIO of the page
+    - contains 2+ option markers ("A)".."E)") — schemes don't have options
+    - contains another question's number word ("39." / "39)")
+    """
+    if page_area > 0 and (rect.width * rect.height) / page_area > MAX_CROP_PAGE_RATIO:
+        return "too_large"
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        words = doc[src_page - 1].get_text("words", clip=rect)
+        doc.close()
+    except Exception as e:
+        logger.warning("crop_sanity_inspect_failed", page=src_page, error=str(e))
+        return None  # can't inspect — don't block the attach
+
+    option_markers = 0
+    for w in words:
+        token = str(w[4]).strip()
+        if _OPTION_MARKER_RE.match(token):
+            option_markers += 1
+        m = _QNUM_WORD_RE.match(token)
+        if m and int(m.group(1)) != own_qnum:
+            return "contains_question_number"
+    if option_markers >= 2:
+        return "contains_option_markers"
+    return None
+
+
+def recrop_scheme_region(
+    pdf_bytes: bytes,
+    src_page: int,
+    src_image: Image.Image,
+    page_pdf_size: tuple[float, float],
+    x_range: tuple[float, float] | None,
+    q_num: int,
+    analysis_page: int,
+    all_questions: list[dict],
+) -> str | None:
+    """
+    FIX 3(a): geometric re-crop — the region between the question's first
+    stem line and the start of its own options, within its column. Runs the
+    garbage detector on the result; returns a saved path or None.
+    """
+    band = _question_y_band(
+        pdf_bytes, src_page, analysis_page, q_num,
+        all_questions, page_pdf_size[1], x_range,
+    )
+    if not band:
+        return None
+    y_top, y_bottom = band
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        words = doc[src_page - 1].get_text("words")
+        doc.close()
+    except Exception:
+        return None
+    if x_range is not None:
+        words = [w for w in words if x_range[0] <= (w[0] + w[2]) / 2 <= x_range[1]]
+
+    # Trim the first stem line (words sharing the question number's baseline)
+    first_line = [w for w in words if abs(w[1] - y_top) < 3]
+    top = max((w[3] for w in first_line), default=y_top) + 2
+
+    # Stop at the question's own first option marker
+    option_ys = [
+        w[1] for w in words
+        if top < w[1] < y_bottom and _OPTION_MARKER_RE.match(str(w[4]).strip())
+    ]
+    bottom = min(option_ys) if option_ys else y_bottom
+
+    if bottom - top < 15:
+        return None
+
+    x0 = x_range[0] + 2 if x_range else 0
+    x1 = x_range[1] - 2 if x_range else page_pdf_size[0]
+    rect = fitz.Rect(x0, top, x1, bottom)
+
+    page_area = page_pdf_size[0] * page_pdf_size[1]
+    reason = _rect_is_garbage(pdf_bytes, src_page, rect, q_num, page_area)
+    if reason:
+        logger.info("recrop_rejected", question=q_num, reason=reason)
+        return None
+
+    return crop_and_save_image(
+        page_image=src_image,
+        rect_pdf=rect,
+        page_pdf_size=page_pdf_size,
+        question_number=q_num,
+        page_number=src_page,
+        padding_px=12,
+    )
+
+
 # ── Crop & save ───────────────────────────────────────────────────────────────
 
 def crop_and_save_image(
@@ -687,6 +805,19 @@ def attach_images_to_questions(
                         rect = _find_drawing_figure_rect(
                             pdf_bytes, src_page, band, x_range
                         )
+                    # FIX 1: garbage detector — reject crops containing other
+                    # questions' numbers/options or covering too much page.
+                    if rect is not None:
+                        reason = _rect_is_garbage(
+                            pdf_bytes, src_page, rect, q_num,
+                            pdf_w * pdf_h,
+                        )
+                        if reason:
+                            logger.warning(
+                                "crop_rejected_garbage",
+                                question=q_num, page=page_num, reason=reason,
+                            )
+                            rect = None
                     if rect is not None:
                         path = crop_and_save_image(
                             page_image=src_lookup[src_page],
@@ -694,6 +825,19 @@ def attach_images_to_questions(
                             page_pdf_size=pdf_page_sizes[src_page],
                             question_number=q_num,
                             page_number=src_page,
+                        )
+                    # FIX 3(a): rejected/missing figure → geometric re-crop
+                    # of the stem→options region (garbage-checked again).
+                    if not path:
+                        path = recrop_scheme_region(
+                            pdf_bytes=pdf_bytes,
+                            src_page=src_page,
+                            src_image=src_lookup[src_page],
+                            page_pdf_size=pdf_page_sizes[src_page],
+                            x_range=x_range,
+                            q_num=q_num,
+                            analysis_page=page_num,
+                            all_questions=questions,
                         )
             except Exception as e:
                 logger.warning("precise_crop_fail", question=q_num, error=str(e))

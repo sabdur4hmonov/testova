@@ -22,7 +22,7 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import storage
-from app.services.ai_analyzer import AIAnalyzer, summarize_sections
+from app.services.ai_analyzer import AIAnalyzer, dedupe_questions, summarize_sections
 from app.services.file_processor import (
     attach_images_to_questions,
     detect_file_type,
@@ -96,6 +96,26 @@ T = {
         "uz": "⚠️ Hali javobsiz savollar: {missing}\nQolganini yuboring yoki o'tkazib yuborish: <code>-</code>",
         "en": "⚠️ Still unanswered: {missing}\nSend the rest, or skip: <code>-</code>",
         "ru": "⚠️ Ещё без ответа: {missing}\nОтправьте остальные или пропустите: <code>-</code>",
+    },
+    "dup_removed": {
+        "uz": "⚠️ Takroriy savollar olib tashlandi: {pairs}",
+        "en": "⚠️ Duplicate questions removed: {pairs}",
+        "ru": "⚠️ Удалены дублирующиеся вопросы: {pairs}",
+    },
+    "siblings_info": {
+        "uz": "ℹ️ O'xshash savollar (matni bir xil, variantlari/sxemasi har xil): {groups}",
+        "en": "ℹ️ Similar questions (same stem, different options/scheme): {groups}",
+        "ru": "ℹ️ Похожие вопросы (одинаковый текст, разные варианты/схемы): {groups}",
+    },
+    "scheme_failed": {
+        "uz": "⚠️ Sxemasi tiklanmagan savollar: {nums}\nBu savollarni faylda tekshirib ko'ring.",
+        "en": "⚠️ Questions whose scheme could not be recovered: {nums}\nPlease check them in the file.",
+        "ru": "⚠️ Вопросы с невосстановленной схемой: {nums}\nПроверьте их в файле.",
+    },
+    "count_mismatch": {
+        "uz": "⚠️ Diqqat: loyihada {expected} ta savol bor, variantlarga {actual} ta kirdi.\nKirmay qolganlar: {nums}",
+        "en": "⚠️ Attention: the project has {expected} questions but the variants contain {actual}.\nLeft out: {nums}",
+        "ru": "⚠️ Внимание: в проекте {expected} вопросов, а в варианты вошло {actual}.\nНе вошли: {nums}",
     },
 }
 
@@ -223,6 +243,40 @@ def _recon_messages(meta: dict, lang: str) -> list[str]:
     return msgs
 
 
+def _quality_messages(quality: dict, section: int | None, lang: str) -> list[str]:
+    """Duplicate / sibling / scheme warnings, filtered to one section
+    (None = all). quality holds JSON-safe lists from handle_file."""
+    msgs: list[str] = []
+    dups = [
+        d for d in quality.get("dups", [])
+        if section is None or d[0] == section
+    ]
+    if dups:
+        msgs.append(t(
+            "dup_removed", lang,
+            pairs=", ".join(f"{d[2]} (={d[1]})" for d in dups),
+        ))
+    sibs = [
+        s for s in quality.get("siblings", [])
+        if section is None or s[0] == section
+    ]
+    if sibs:
+        msgs.append(t(
+            "siblings_info", lang,
+            groups="; ".join(", ".join(str(n) for n in s[1]) for s in sibs),
+        ))
+    failed = [
+        f for f in quality.get("scheme_failed", [])
+        if section is None or f[0] == section
+    ]
+    if failed:
+        msgs.append(t(
+            "scheme_failed", lang,
+            nums=", ".join(str(f[1]) for f in failed),
+        ))
+    return msgs
+
+
 # ── Handlers ─────────────────────────────────────────────────────────────────
 
 @router.message(F.text.in_({v["upload"] for v in MAIN_MENU_TEXTS.values()}))
@@ -341,6 +395,9 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     # ── Attach images — precise crop using PyMuPDF rects ─────────────────────
     # Pass pdf_bytes so the precise rect-detection path is used.
     # For non-PDF files, pdf_bytes=None → fallback to equal-band crop.
+    # ── FIX 4: exact-duplicate removal (siblings kept, reported as info) ──────
+    all_questions, dup_pairs, sibling_groups = dedupe_questions(all_questions)
+
     _pdf_bytes_for_crop = content if file_type == "pdf" else None
     all_questions = await asyncio.to_thread(
         attach_images_to_questions,
@@ -350,6 +407,16 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         col_map,
         src_pages,
     )
+
+    # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
+    scheme_failed = await analyzer.ensure_scheme_content(
+        all_questions, images, _pdf_bytes_for_crop, col_map, src_pages
+    )
+    quality = {
+        "dups": [list(d) for d in dup_pairs],
+        "siblings": [[s[0], list(s[1])] for s in sibling_groups],
+        "scheme_failed": [list(f) for f in scheme_failed],
+    }
 
     # ── Multi-test documents: detect sections, teacher picks ONE ─────────────
     # No merging, no renumbering — combining tests is a separate future
@@ -371,6 +438,7 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
             project_id=project_id,
             sections=sections,
             pending_questions=all_questions,
+            quality=quality,
         )
         await state.set_state(UploadStates.waiting_for_section_choice)
         await status_msg.edit_text(
@@ -409,6 +477,8 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         await status_msg.edit_text(t("ans_all", lang, n=n), parse_mode="HTML")
 
     for msg_text in _recon_messages(sections[0], lang):
+        await message.answer(msg_text)
+    for msg_text in _quality_messages(quality, None, lang):
         await message.answer(msg_text)
 
 
@@ -471,6 +541,8 @@ async def handle_section_choice(
             t("ans_all", lang, n=n), parse_mode="HTML",
         )
     for msg_text in _recon_messages(meta, lang):
+        await callback.message.answer(msg_text)
+    for msg_text in _quality_messages(data.get("quality") or {}, sec, lang):
         await callback.message.answer(msg_text)
     await callback.answer()
 
@@ -621,7 +693,15 @@ async def _generate_and_send(
     # BUG FIX: validate BEFORE export — reject blank/broken questions and
     # tell the teacher exactly which ones were excluded, instead of
     # silently printing a defective exam.
+    db_numbers = {q.question_number for q in questions}
     raw_qs, rejected = validate_questions(raw_qs)
+    logger.info(
+        "variant_question_counts",
+        project_id=project_id,
+        loaded_from_db=len(db_numbers),
+        after_validation=len(raw_qs),
+        rejected=len(rejected),
+    )
     if not raw_qs:
         await status.edit_text(t("no_valid_q", lang))
         await state.clear()
@@ -631,6 +711,24 @@ async def _generate_and_send(
         await message.answer(
             t("skipped_q", lang, n=len(rejected), nums=nums, total=len(raw_qs))
         )
+
+    # FIX 6: hard count reconciliation — the variants must contain every DB
+    # question except the explicitly rejected ones. Anything else missing
+    # (whatever the cause) is reported, never silent.
+    valid_numbers = {q["question_number"] for q in raw_qs}
+    rejected_numbers = {r["question_number"] for r in rejected}
+    unexplained = sorted(db_numbers - valid_numbers - rejected_numbers)
+    if unexplained:
+        logger.error(
+            "variant_count_mismatch",
+            project_id=project_id,
+            missing=unexplained,
+        )
+        await message.answer(t(
+            "count_mismatch", lang,
+            expected=len(db_numbers), actual=len(valid_numbers),
+            nums=", ".join(str(x) for x in unexplained),
+        ))
 
     variants     = await asyncio.to_thread(generate_variants, raw_qs, count)
     exam_title   = (db_user.full_name or "Test") + " — Test"

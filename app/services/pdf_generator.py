@@ -133,6 +133,11 @@ STYLES = {
         textColor=colors.HexColor("#555555"),
         spaceBefore=2, spaceAfter=4, leftIndent=12,
     ),
+    # Handwriting fill-in rows on each variant's first page
+    "fillin": ParagraphStyle(
+        "fillin", parent=_base["Normal"],
+        fontSize=11, fontName=_FONT, spaceBefore=3, spaceAfter=3,
+    ),
 }
 
 
@@ -223,7 +228,38 @@ def _load_image_rl(image_path: str, max_width: float = 10 * cm) -> RLImage | Non
 
 # ── PDF builders ─────────────────────────────────────────────────────────────
 
+def _page_footer(canvas, doc) -> None:
+    """Page number at the foot of EVERY page."""
+    canvas.saveState()
+    canvas.setFont(_FONT, 9)
+    canvas.setFillColor(colors.HexColor("#555555"))
+    canvas.drawCentredString(PAGE_WIDTH / 2, 1.1 * cm, str(canvas.getPageNumber()))
+    canvas.restoreState()
+
+
+# Fill-in header block: students write these by hand on the first page of
+# each variant. (The teacher-name title was removed — it served no one.)
+_FILLIN_ROWS = [
+    ("Test nomi:", 44),
+    ("Ism familiya:", 42),
+    ("Guruh:", 48),
+    ("Ball:", 16),
+]
+
+
+def _fillin_block() -> list:
+    flow = []
+    for label, dashes in _FILLIN_ROWS:
+        flow.append(Paragraph(
+            f"{label} " + "_" * dashes,
+            STYLES["fillin"],
+        ))
+    return flow
+
+
 def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
+    """exam_title is retained for signature compatibility but no longer
+    printed — each variant starts with a handwriting fill-in block."""
     buf = io.BytesIO()
     available_w = PAGE_WIDTH - 2 * MARGIN
     doc = SimpleDocTemplate(
@@ -237,8 +273,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        story.append(Paragraph(_esc(exam_title), STYLES["title"]))
+        # "Variant N" stays prominent — grading matches it to answer keys.
         story.append(Paragraph(f"Variant {vnum}", STYLES["variant_header"]))
+        story.extend(_fillin_block())
+        story.append(Spacer(1, 2 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(Spacer(1, 4 * mm))
@@ -328,14 +366,25 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
 
         story.append(PageBreak())
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)
     logger.info("variants_pdf_built", variants=len(variants))
     return buf.getvalue()
 
 
+import re as _re
+
+# FIX 3(d): a description box must carry real content — never placeholders
+# like "diagram is cut off".
+_USELESS_DESC = _re.compile(r'cut ?off|is cut|kesilgan|not (?:visible|readable)', _re.I)
+
+
 def _append_img_desc(story: list, img_desc: str | None, available_w: float) -> None:
-    """Append a styled description box when the actual image can't be shown."""
+    """Append a styled description box when the actual image can't be shown.
+    Contentless descriptions are dropped entirely."""
     if not img_desc:
+        return
+    if len(img_desc.strip()) < 8 or _USELESS_DESC.search(img_desc):
+        logger.info("img_desc_suppressed", preview=img_desc[:60])
         return
     desc_text = _esc(img_desc).replace("\n", "<br/>")
     desc_para = Paragraph(f"<i>[Rasm]: {desc_text}</i>", STYLES["img_desc"])
@@ -432,7 +481,7 @@ def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> byte
         story.append(tbl)
         story.append(Spacer(1, 8 * mm))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)
     logger.info("answer_key_pdf_built", variants=len(variants))
     return buf.getvalue()
 

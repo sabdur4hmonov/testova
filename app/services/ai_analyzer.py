@@ -130,6 +130,22 @@ ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
 FAQAT JSON: {{"answers": {{"1": "A", "2": null}}}}"""
 
+# FIX 3(b): transcribe an unreadable/uncroppable scheme into a text chain.
+TRANSCRIBE_SCHEME_PROMPT = """Question {n} on this test page contains a scheme/diagram of transformations
+(compounds or states connected by arrows, possibly branching).
+
+Transcribe that scheme as PLAIN TEXT:
+- start item, then each step as →(reagent/condition)
+- if the scheme branches into parallel paths, label them on separate lines:
+  "Yuqori yo'l: ..." (top path) and "Pastki yo'l: ..." (bottom path)
+- keep every formula/symbol EXACTLY as printed, as real Unicode
+
+Return ONLY JSON: {{"chain": "...", "desc": "..."}}
+- "chain": the transcribed text chain if you can read the scheme, else ""
+- "desc": one-sentence description that INCLUDES the actual printed
+  compounds/reagents, else ""
+NEVER invent compounds or reagents that are not printed on the page."""
+
 # Targeted retry for question numbers that are ENTIRELY missing after
 # extraction (typically dense content: reaction chains, diagrams, tables).
 RECOVER_QUESTIONS_PROMPT = """A previous extraction pass MISSED these questions from the attached test page image(s): {nums}
@@ -249,6 +265,11 @@ def clean_latex(text: str) -> str:
     text = re.sub(r'\\text\{([^{}]+)\}', r'\1', text)
     text = re.sub(r'\\[a-zA-Z]+\b', '', text)
 
+    # Targeted lexical repair: Gemini sometimes glues an element symbol to
+    # the following Uzbek word "tutgan" ("Fe tutgan" → "Fetutgan"). A general
+    # "unglue words" rule would corrupt formulas, so only this word is fixed.
+    text = re.sub(r'([A-Za-z0-9\)])tutgan\b', r'\1 tutgan', text)
+
     # Clean up extra whitespace
     text = re.sub(r'  +', ' ', text)
     return text.strip()
@@ -296,6 +317,110 @@ def summarize_sections(questions: list[dict]) -> list[dict]:
             "open": [q["question_number"] for q in qs if q.get("is_open_ended")],
         })
     return sections_meta
+
+
+# ── Scheme validation (FIX 2) ───────────────────────────────────────────────
+
+# Trigger phrases indicating the stem refers to a scheme the student must see.
+# Extensible list — general triggers (has_image / image_description) apply
+# regardless of language; the phrases are belt-and-braces for unflagged stems.
+SCHEME_TRIGGER_PHRASES = (
+    "o'zgarishlar asosida",
+    "oʻzgarishlar asosida",
+    "quyidagi sxema",
+    "quyidagi o'zgarish",
+)
+
+# Crude chemical/scientific formula detector: "CuSO4", "KOH", "Al4C3", "H2O"
+FORMULA_RE = re.compile(r'\b[A-Z][a-z]?\d|\b(?:[A-Z][a-z]?){2,}\b')
+
+# Descriptions that carry no content and must never reach the printed PDF.
+_USELESS_DESC_RE = re.compile(r'cut ?off|is cut|kesilgan|not (?:visible|readable)', re.I)
+
+
+def _needs_scheme(q: dict) -> bool:
+    """Does this question require visible scheme content to be answerable?"""
+    if q.get("has_image") or q.get("image_description"):
+        return True
+    stem = (q.get("question_text") or "").lower()
+    return any(p in stem for p in SCHEME_TRIGGER_PHRASES)
+
+
+def _has_scheme_content(q: dict) -> bool:
+    """Attached image, a text chain with arrows, or a formula-bearing description."""
+    if q.get("image_path"):
+        return True
+    text = q.get("question_text") or ""
+    opts = " ".join(str(v) for v in (q.get("options") or {}).values())
+    if "→" in text or "→" in opts:
+        return True
+    desc = q.get("image_description") or ""
+    if desc and not _USELESS_DESC_RE.search(desc) and FORMULA_RE.search(desc):
+        return True
+    return False
+
+
+# ── De-duplication (FIX 4) ──────────────────────────────────────────────────
+
+def _fp_norm(s: str | None) -> str:
+    return re.sub(r'[^a-zа-яё0-9ʻʼ]', '', (s or '').lower())
+
+
+def _scheme_key(q: dict) -> str:
+    """First compound of the chain, else first formula in the description —
+    distinguishes sibling questions that differ only by their scheme."""
+    text = q.get("question_text") or ""
+    if "→" in text:
+        head = text.split("→")[0].split()
+        if head:
+            return head[-1]
+    m = FORMULA_RE.search(q.get("image_description") or "")
+    return m.group() if m else ""
+
+
+def question_fingerprint(q: dict) -> str:
+    stem = _fp_norm(q.get("question_text"))
+    opts = "|".join(sorted(_fp_norm(str(v)) for v in (q.get("options") or {}).values()))
+    return f"{stem}::{opts}::{_fp_norm(_scheme_key(q))}"
+
+
+def dedupe_questions(
+    questions: list[dict],
+) -> tuple[list[dict], list[tuple[int, int]], list[list[int]]]:
+    """
+    Remove EXACT duplicates only (identical fingerprint within a section):
+    keep the first, report (kept_number, dropped_number) pairs.
+
+    Near-matches — same stem but different options or scheme (legitimate
+    sibling questions like KOH/NaOH variants) — are KEPT and reported as
+    sibling groups for the teacher's information only.
+    """
+    kept: list[dict] = []
+    seen_fp: dict[tuple[int, str], int] = {}    # (section, fingerprint) → number
+    stems: dict[tuple[int, str], list[int]] = {}  # (section, stem) → numbers
+    duplicates: list[tuple[int, int, int]] = []   # (section, kept_n, dropped_n)
+
+    for q in questions:
+        sec = q.get("section", 1)
+        n = q.get("question_number", 0)
+        fp = question_fingerprint(q)
+        key = (sec, fp)
+        if key in seen_fp:
+            duplicates.append((sec, seen_fp[key], n))
+            logger.warning(
+                "duplicate_question_dropped",
+                section=sec, kept=seen_fp[key], dropped=n,
+            )
+            continue
+        seen_fp[key] = n
+        stems.setdefault((sec, _fp_norm(q.get("question_text"))), []).append(n)
+        kept.append(q)
+
+    siblings = [
+        (sec, nums) for (sec, stem), nums in stems.items()
+        if stem and len(nums) > 1
+    ]
+    return kept, duplicates, siblings
 
 
 def _is_open_ended(q: dict) -> bool:
@@ -478,6 +603,109 @@ class AIAnalyzer:
         unique.sort(key=lambda x: (x.get("section", 1), x.get("question_number", 0)))
         logger.info("extraction_done", total=len(unique), pages=len(images))
         return unique
+
+    # ── Scheme recovery ladder (FIX 2 + FIX 3) ──────────────────────────────────
+
+    async def ensure_scheme_content(
+        self,
+        questions: list[dict[str, Any]],
+        images: list[Image.Image],
+        pdf_bytes: bytes | None = None,
+        col_map: dict[int, dict] | None = None,
+        src_pages: list | None = None,
+    ) -> list[tuple[int, int]]:
+        """
+        Every question that NEEDS scheme content (image flagged, description
+        present, or trigger phrase in the stem) must actually HAVE it. Ladder:
+        (a) geometric re-crop of the stem→options region (garbage-checked);
+        (b) Gemini transcription into a text chain (accepted only with "→"
+            and a formula);
+        (c) formula-bearing description from the same call;
+        (d) useless descriptions ("cut off" etc.) are nulled — never printed.
+        Returns (section, question_number) pairs still lacking content
+        (teacher warning).
+        """
+        failed: list[tuple[int, int]] = []
+        src_lookup = {p.page_number: p for p in (src_pages or [])}
+        pdf_sizes: dict[int, tuple[float, float]] = {}
+        if pdf_bytes:
+            try:
+                import fitz
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                for i, page in enumerate(doc):
+                    pdf_sizes[i + 1] = (page.rect.width, page.rect.height)
+                doc.close()
+            except Exception as e:
+                logger.warning("scheme_pdf_sizes_failed", error=str(e))
+
+        for q in questions:
+            if not _needs_scheme(q) or _has_scheme_content(q):
+                continue
+            n = q.get("question_number", 0)
+            page = q.get("page_number") or 0
+            mapping = (col_map or {}).get(page)
+
+            # (a) geometric re-crop within the question's own column band
+            if pdf_bytes and mapping and mapping["src_page"] in src_lookup \
+                    and mapping["src_page"] in pdf_sizes:
+                from app.services.file_processor import recrop_scheme_region
+                pdf_w, pdf_h = pdf_sizes[mapping["src_page"]]
+                try:
+                    path = recrop_scheme_region(
+                        pdf_bytes=pdf_bytes,
+                        src_page=mapping["src_page"],
+                        src_image=src_lookup[mapping["src_page"]].image,
+                        page_pdf_size=(pdf_w, pdf_h),
+                        x_range=(mapping["x0"] * pdf_w, mapping["x1"] * pdf_w),
+                        q_num=n,
+                        analysis_page=page,
+                        all_questions=questions,
+                    )
+                except Exception as e:
+                    logger.warning("scheme_recrop_failed", question=n, error=str(e))
+                    path = None
+                if path:
+                    q["image_path"] = path
+                    q["has_image"] = True
+                    logger.info("scheme_recovered_by_recrop", question=n)
+                    continue
+
+            # (b)/(c) Gemini transcription of the scheme
+            if 1 <= page <= len(images):
+                try:
+                    raw, _fr = await self._call_multi(
+                        TRANSCRIBE_SCHEME_PROMPT.format(n=n), [images[page - 1]]
+                    )
+                    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+                    data = self._try_json(cleaned) or {}
+                except Exception as e:
+                    logger.warning("scheme_transcribe_failed", question=n, error=str(e))
+                    data = {}
+                chain = clean_latex(str(data.get("chain") or "")).strip()
+                if "→" in chain and FORMULA_RE.search(chain):
+                    q["question_text"] = (
+                        str(q.get("question_text") or "").rstrip() + "\n" + chain
+                    )
+                    q["has_image"] = False
+                    q["image_description"] = None
+                    logger.info("scheme_recovered_by_transcription", question=n)
+                    continue
+                desc = clean_latex(str(data.get("desc") or "")).strip()
+                if desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
+                    q["image_description"] = desc
+                    logger.info("scheme_recovered_by_description", question=n)
+                    continue
+
+            # (d) unrecoverable: never print a contentless description
+            if q.get("image_description") and (
+                _USELESS_DESC_RE.search(q["image_description"])
+                or not FORMULA_RE.search(q["image_description"])
+            ):
+                q["image_description"] = None
+            failed.append((q.get("section", 1), n))
+            logger.warning("scheme_unrecoverable", question=n)
+
+        return failed
 
     # ── Missing-question recovery pass (numbering gaps) ─────────────────────────
 
