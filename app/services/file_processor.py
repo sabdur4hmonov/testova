@@ -9,7 +9,13 @@ from typing import NamedTuple
 
 import fitz  # PyMuPDF
 from docx import Document
-from PIL import Image
+from docx.document import Document as _DocxDocument
+from docx.oxml.ns import qn
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table as _DocxTable
+from docx.text.paragraph import Paragraph as _DocxParagraph
+from PIL import Image, ImageDraw, ImageFont
 
 from app.utils.logging import get_logger
 
@@ -1065,23 +1071,188 @@ def attach_images_to_questions(
 
 # ── DOCX / image helpers ──────────────────────────────────────────────────────
 
-def docx_to_images(docx_bytes: bytes) -> list[PageImage]:
-    doc = Document(io.BytesIO(docx_bytes))
-    images: list[PageImage] = []
-    img_counter = 0
-    for rel in doc.part.rels.values():
-        if "image" in rel.reltype:
-            img_data = rel.target_part.blob
-            try:
-                img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                img_counter += 1
-                images.append(PageImage(page_number=img_counter, image=img))
-            except Exception as e:
-                logger.warning("docx_image_skip", error=str(e))
+# ── DOCX → page images ────────────────────────────────────────────────────────
+# The old docx_to_images only harvested EMBEDDED pictures, so a normal typed
+# test (text + options, no pasted images) produced zero pages and "no
+# questions found". We now RENDER the document body (paragraphs, tables,
+# inline images) to page images with Pillow + the bundled DejaVu font, then
+# feed them into the SAME vision pipeline as PDFs/scans. No new system deps.
 
-    text_content = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
-    logger.info("docx_extracted", images=img_counter, text_chars=len(text_content))
-    return images, text_content  # type: ignore[return-value]
+_DOCX_PAGE_W = 1654   # A4 width  @ 200 DPI (matches pdf_to_images DPI)
+_DOCX_PAGE_H = 2339   # A4 height @ 200 DPI
+_DOCX_MARGIN = 120
+_DOCX_BODY_PT = 30
+_DOCX_LINE_H = 42
+_DOCX_TABLE_PAD = 12
+
+
+def _docx_font(size: int, bold: bool = False):
+    """Bundled DejaVu (Cyrillic/Uzbek/math coverage); Pillow default on miss."""
+    fonts_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(str(fonts_dir / name), size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _iter_docx_blocks(parent):
+    """Yield paragraphs and tables IN DOCUMENT ORDER (standard python-docx
+    recipe) so questions, their options and any tables stay interleaved as
+    the teacher wrote them."""
+    if isinstance(parent, _DocxDocument):
+        parent_elm = parent.element.body
+    else:
+        parent_elm = parent._tc  # table cell
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield _DocxParagraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield _DocxTable(child, parent)
+
+
+def _wrap_text(draw, text: str, font, max_w: int) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.split("\n"):
+        words = raw_line.split(" ")
+        cur = ""
+        for w in words:
+            trial = f"{cur} {w}".strip()
+            if draw.textlength(trial, font=font) <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+    return lines or [""]
+
+
+def _para_inline_images(doc: Document, para) -> list[Image.Image]:
+    """Inline images embedded in a paragraph (best-effort)."""
+    out: list[Image.Image] = []
+    for blip in para._p.findall(".//" + qn("a:blip")):
+        rid = blip.get(qn("r:embed"))
+        if not rid:
+            continue
+        try:
+            blob = doc.part.related_parts[rid].blob
+            out.append(Image.open(io.BytesIO(blob)).convert("RGB"))
+        except Exception as e:
+            logger.warning("docx_inline_image_skip", error=str(e))
+    return out
+
+
+class _DocxCanvas:
+    """A simple paginating page canvas."""
+
+    def __init__(self):
+        self.pages: list[Image.Image] = []
+        self._new_page()
+
+    def _new_page(self):
+        self.img = Image.new("RGB", (_DOCX_PAGE_W, _DOCX_PAGE_H), "white")
+        self.draw = ImageDraw.Draw(self.img)
+        self.y = _DOCX_MARGIN
+        self.pages.append(self.img)
+
+    def _ensure(self, height: int):
+        if self.y + height > _DOCX_PAGE_H - _DOCX_MARGIN:
+            self._new_page()
+
+    def text_block(self, text: str, font, bold_font=None):
+        if not text.strip():
+            self.y += _DOCX_LINE_H // 2
+            return
+        max_w = _DOCX_PAGE_W - 2 * _DOCX_MARGIN
+        for line in _wrap_text(self.draw, text, font, max_w):
+            self._ensure(_DOCX_LINE_H)
+            self.draw.text((_DOCX_MARGIN, self.y), line, font=font, fill="black")
+            self.y += _DOCX_LINE_H
+
+    def image_block(self, pic: Image.Image):
+        max_w = _DOCX_PAGE_W - 2 * _DOCX_MARGIN
+        scale = min(1.0, max_w / pic.width)
+        w, h = int(pic.width * scale), int(pic.height * scale)
+        if h > _DOCX_PAGE_H - 2 * _DOCX_MARGIN:
+            h2 = _DOCX_PAGE_H - 2 * _DOCX_MARGIN
+            w = int(w * h2 / h)
+            h = h2
+        self._ensure(h + 20)
+        self.img.paste(pic.resize((w, h)), (_DOCX_MARGIN, self.y))
+        self.y += h + 20
+
+    def table_block(self, table, font):
+        max_w = _DOCX_PAGE_W - 2 * _DOCX_MARGIN
+        rows = table.rows
+        if not rows:
+            return
+        ncols = max(len(r.cells) for r in rows)
+        col_w = max_w // max(1, ncols)
+        for row in rows:
+            cells = row.cells
+            wrapped = [
+                _wrap_text(self.draw, c.text, font, col_w - 2 * _DOCX_TABLE_PAD)
+                for c in cells
+            ]
+            row_h = max(
+                (len(w) * _DOCX_LINE_H + 2 * _DOCX_TABLE_PAD for w in wrapped),
+                default=_DOCX_LINE_H,
+            )
+            self._ensure(row_h)
+            x = _DOCX_MARGIN
+            for ci in range(ncols):
+                self.draw.rectangle(
+                    [x, self.y, x + col_w, self.y + row_h], outline="black", width=2
+                )
+                ty = self.y + _DOCX_TABLE_PAD
+                for line in (wrapped[ci] if ci < len(wrapped) else []):
+                    self.draw.text((x + _DOCX_TABLE_PAD, ty), line, font=font, fill="black")
+                    ty += _DOCX_LINE_H
+                x += col_w
+            self.y += row_h
+
+
+def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
+    """Render a DOCX into page images (fed to the vision pipeline) + its text.
+
+    Returns (pages, text). Falls back to a plain-text render if structured
+    walking fails, so a malformed DOCX still produces at least one page.
+    """
+    doc = Document(io.BytesIO(docx_bytes))
+    canvas = _DocxCanvas()
+    body_font = _docx_font(_DOCX_BODY_PT)
+    text_parts: list[str] = []
+
+    try:
+        for block in _iter_docx_blocks(doc):
+            if isinstance(block, _DocxParagraph):
+                if block.text.strip():
+                    canvas.text_block(block.text, body_font)
+                    text_parts.append(block.text)
+                for pic in _para_inline_images(doc, block):
+                    canvas.image_block(pic)
+            elif isinstance(block, _DocxTable):
+                canvas.table_block(block, body_font)
+                for row in block.rows:
+                    text_parts.append(" | ".join(c.text for c in row.cells))
+    except Exception as e:
+        logger.warning("docx_structured_render_failed", error=str(e))
+        # Fallback: dump all paragraph text onto fresh pages.
+        canvas = _DocxCanvas()
+        for para in doc.paragraphs:
+            if para.text.strip():
+                canvas.text_block(para.text, body_font)
+                text_parts.append(para.text)
+
+    pages = [
+        PageImage(page_number=i + 1, image=img)
+        for i, img in enumerate(canvas.pages)
+    ]
+    text_content = "\n".join(text_parts)
+    logger.info(
+        "docx_rendered", pages=len(pages), text_chars=len(text_content)
+    )
+    return pages, text_content
 
 
 def docx_extract_text(docx_bytes: bytes) -> str:
