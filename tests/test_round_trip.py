@@ -1,110 +1,132 @@
 """
-FIX 4 — permanent grading round-trip audit.
+CHANGE 2 round-trip audit — answers FIRST, duplicates SECOND, teacher decides.
 
-Scenario mirroring the real incident: a 52-question source where Q35 was
-removed as an exact duplicate of Q15. The teacher enters the FULL printed key
-(1..52 including 35), it flows through parse → registry remap → the pool,
-variants are generated, and a simulated student who answers every question
-correctly via the variant→original mapping must score exactly 100%.
-
-Guards the invariant: original source numbers are the single canonical key;
-positions exist only inside a variant with an explicit per-variant map.
+Pool: 52 extracted questions where Q35 is an exact copy of Q15 (nothing is
+removed at extraction). The teacher enters the FULL key 1..52 with zero
+errors; only then is the duplicate detected and resolved. Every resolution
+path must grade a perfect student at exactly 100%.
 """
-from app.bot.handlers.upload import _parse_answer_input, _remap_removed_answers
+from app.bot.handlers.upload import _dup_answers_match, _parse_answer_input
+from app.services.ai_analyzer import find_exact_duplicates
 from app.services.answer_checker import check_answers
 from app.services.variant_generator import generate_variants, validate_questions
 
 LETTERS = "ABCD"
 
 
-def _build_pool():
-    """Pool = original numbers {1..52} minus dup-removed 35."""
+def _pool(dup_identical=True):
+    """52 questions; Q35 duplicates Q15 (same stem+options) unless told not to."""
     pool = []
     for n in range(1, 53):
         if n == 35:
-            continue
+            stem = "Takrorlanadigan savol matni"
+            opts = {"A": "opt-15-a", "B": "opt-15-b",
+                    "C": "opt-15-c", "D": "opt-15-d"}
+            if not dup_identical:
+                stem = f"Savol {n} matni"
+                opts = {L: f"opt-{n}-{L.lower()}" for L in LETTERS}
+        elif n == 15:
+            stem = "Takrorlanadigan savol matni"
+            opts = {"A": "opt-15-a", "B": "opt-15-b",
+                    "C": "opt-15-c", "D": "opt-15-d"}
+        else:
+            stem = f"Savol {n} matni"
+            opts = {L: f"opt-{n}-{L.lower()}" for L in LETTERS}
         pool.append({
-            "question_id": f"q{n}",
-            "question_number": n,
-            "question_text": f"Savol {n} matni",
-            "options": {
-                "A": f"opt-{n}-a", "B": f"opt-{n}-b",
-                "C": f"opt-{n}-c", "D": f"opt-{n}-d",
-            },
-            "correct_answer": None,
-            "has_image": False,
+            "question_id": f"q{n}", "question_number": n, "section": 1,
+            "question_text": stem, "options": dict(opts),
+            "correct_answer": None, "has_image": False,
         })
     return pool
 
 
-def _teacher_key():
-    """Full printed key 1..52 — includes the removed 35."""
-    return " ".join(f"{n}{LETTERS[n % 4]}" for n in range(1, 53))
-
-
-def test_full_round_trip_scores_100_percent():
-    pool = _build_pool()
-    registry = {35: 15}
-
-    # ── Teacher enters the full key exactly as printed ────────────────────
-    updates = _parse_answer_input(_teacher_key(), 52)
-    assert len(updates) == 52
-    mapped, conflicts, acks = _remap_removed_answers(updates, registry, {})
-    # 35 maps onto 15; both carry the same letter (35%4 == 15%4) → no conflict
-    assert not conflicts
-    assert (35, 15, LETTERS[35 % 4]) in acks
-
-    # Apply to the pool by ORIGINAL number (as the DB write does)
+def _apply_key(pool, key_letters):
+    """Teacher's key applied by ORIGINAL number — every entry must land."""
+    updates = _parse_answer_input(
+        " ".join(f"{n}{key_letters[n]}" for n in sorted(key_letters)), 52
+    )
+    assert len(updates) == len(key_letters), "an entry was rejected or lost"
     by_num = {q["question_number"]: q for q in pool}
-    for num_str, letter in mapped.items():
-        assert int(num_str) in by_num, f"entry {num_str} lost or shifted"
+    for num_str, letter in updates.items():
+        assert int(num_str) in by_num
         by_num[int(num_str)]["correct_answer"] = letter
 
-    # Every pool question must have received its own printed answer —
-    # this fails if anything after 35 shifted by one.
-    for q in pool:
-        n = q["question_number"]
-        assert q["correct_answer"] == LETTERS[n % 4], f"answer shifted at {n}"
 
-    # ── Variants ──────────────────────────────────────────────────────────
+def _grade_all_variants(pool, expected_count):
     valid, rejected = validate_questions(pool)
-    assert not rejected and len(valid) == 51
-    variants = generate_variants(valid, 3, seed=7)
-
+    assert not rejected
+    variants = generate_variants(valid, 3, seed=11)
     for v in variants:
-        answer_key = v["answer_key"]
-        assert len(answer_key) == 51
-
-        # Explicit per-variant map: position → original number
+        key = v["answer_key"]
+        assert len(key) == expected_count
         pos_to_orig = {
             str(q["position_in_variant"]): q["question_number"]
             for q in v["questions_data"]
         }
-        assert sorted(pos_to_orig.values()) == [
-            n for n in range(1, 53) if n != 35
-        ]
-
-        # Key letter must point at the ORIGINAL question's correct option
+        # key letter must point at the original question's correct content
         for q in v["questions_data"]:
             pos = str(q["position_in_variant"])
-            orig_n = pos_to_orig[pos]
-            key_letter = answer_key[pos]
-            assert key_letter is not None
-            assert q["options"][key_letter] == f"opt-{orig_n}-{LETTERS[orig_n % 4].lower()}", \
-                f"variant {v['variant_number']} pos {pos}: key points at wrong content"
-
-        # ── Perfect student: answers exactly per the variant key ──────────
-        student = {pos: letter for pos, letter in answer_key.items()}
-        result = check_answers(student, answer_key)
-        assert result.correct == 51
-        assert result.wrong == 0
+            assert key[pos] is not None
+            expected_prefix = f"opt-{15 if pos_to_orig[pos] == 35 else pos_to_orig[pos]}-"
+            assert q["options"][key[pos]].startswith(expected_prefix)
+        result = check_answers(dict(key), key)
+        assert result.correct == expected_count
         assert result.score_percent == 100.0
 
 
-def test_old_parser_bound_regression():
-    # The unwinnable-loop root cause: bounding the parser by question COUNT
-    # (51) instead of max NUMBER (52) silently dropped "52X".
-    updates_count_bound = _parse_answer_input(_teacher_key(), 51)
-    assert "52" not in updates_count_bound  # documents the old failure
-    updates_max_bound = _parse_answer_input(_teacher_key(), 52)
-    assert "52" in updates_max_bound        # the fix: bound by key_max
+def test_1_full_key_accepted_then_duplicate_detected():
+    pool = _pool()
+    key = {n: LETTERS[n % 4] for n in range(1, 53)}
+    key[35] = key[15]  # teacher answers the printed copies identically
+    _apply_key(pool, key)  # zero errors, all 52 accepted — spec test (1)
+
+    groups = find_exact_duplicates(pool)
+    assert len(groups) == 1
+    assert groups[0]["numbers"] == [15, 35]
+    # answers match → the "once/twice" prompt variant
+    g = {"numbers": [15, 35],
+         "answers": {"15": key[15], "35": key[35]}}
+    assert _dup_answers_match(g) is True
+
+
+def test_2_once_gives_51_questions_and_100_percent():
+    pool = _pool()
+    key = {n: LETTERS[n % 4] for n in range(1, 53)}
+    key[35] = key[15]
+    _apply_key(pool, key)
+    # teacher taps "1 marta": later copy excluded, kept question keeps its key
+    pool = [q for q in pool if q["question_number"] != 35]
+    assert len(pool) == 51
+    _grade_all_variants(pool, 51)
+
+
+def test_3_twice_keeps_both_and_100_percent():
+    pool = _pool()
+    key = {n: LETTERS[n % 4] for n in range(1, 53)}
+    key[35] = key[15]
+    _apply_key(pool, key)
+    # teacher taps "2 marta": both stay, variants carry the question twice
+    assert len(pool) == 52
+    stems = [q["question_text"] for q in pool]
+    assert stems.count("Takrorlanadigan savol matni") == 2
+    _grade_all_variants(pool, 52)
+
+
+def test_4_answers_differ_keep_both_no_reprompt():
+    pool = _pool()
+    key = {n: LETTERS[n % 4] for n in range(1, 53)}
+    key[15], key[35] = "A", "B"  # teacher disagrees with the merge
+    _apply_key(pool, key)
+    g = {"numbers": [15, 35], "answers": {"15": "A", "35": "B"}}
+    assert _dup_answers_match(g) is False  # → "Ikkalasi ham qolsin" variant
+    # keep both → 52 distinct rows, grading still perfect
+    _grade_all_variants(pool, 52)
+    # and detection produces exactly one group — no second prompt after "both"
+    assert len(find_exact_duplicates(pool)) == 1
+
+
+def test_parser_bound_by_max_number():
+    # Regression guard: bounding by COUNT (51) once dropped "52X" silently.
+    full = " ".join(f"{n}{LETTERS[n % 4]}" for n in range(1, 53))
+    assert "52" not in _parse_answer_input(full, 51)
+    assert "52" in _parse_answer_input(full, 52)

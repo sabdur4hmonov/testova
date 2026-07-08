@@ -12,7 +12,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from app.bot.keyboards.inline import reextract_keyboard, section_choice_keyboard
+from app.bot.keyboards.inline import dup_resolution_keyboard, reextract_keyboard
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
 from app.config import settings
@@ -25,11 +25,14 @@ from app.services import storage
 from app.services import storage
 from app.services.ai_analyzer import (
     AIAnalyzer,
-    dedupe_questions,
+    collapse_sections,
     export_lint,
+    find_exact_duplicates,
     find_near_duplicates,
+    find_siblings,
     find_unanswerable,
     flag_suspicious_questions,
+    sections_confident,
     summarize_sections,
 )
 from app.services.file_processor import (
@@ -88,30 +91,50 @@ T = {
         "en": "📊 {found} questions captured (numbered 1–{max}).",
         "ru": "📊 Извлечено {found} вопросов (нумерация 1–{max}).",
     },
-    "sum_dup_line": {
-        "uz": "♻️ {dropped}-savol {kept}-savolning aynan nusxasi — olib tashlandi.",
-        "en": "♻️ Question {dropped} is an exact copy of question {kept} — removed.",
-        "ru": "♻️ Вопрос {dropped} — точная копия вопроса {kept}, удалён.",
-    },
     "sum_missing": {
         "uz": "⚠️ Topilmagan savollar: {nums}\nFayldagi shu savollarni tekshirib ko'ring.",
         "en": "⚠️ Missing question numbers: {nums}\nPlease check these questions in the file.",
         "ru": "⚠️ Не найдены вопросы: {nums}\nПроверьте эти вопросы в файле.",
-    },
-    "dup_answer_conflict": {
-        "uz": "⚠️ {dropped}- va {kept}-savollar bir xil deb topilgan edi, lekin siz kiritgan javoblar farq qiladi ({new} ≠ {old}).\nTekshirib ko'ring — agar {kept}-savol javobini o'zgartirmoqchi bo'lsangiz, <code>{kept}{new}</code> yuboring.",
-        "en": "⚠️ Questions {dropped} and {kept} were treated as identical, but the answers you entered differ ({new} ≠ {old}).\nPlease verify — to change question {kept}'s answer, send <code>{kept}{new}</code>.",
-        "ru": "⚠️ Вопросы {dropped} и {kept} были признаны одинаковыми, но введённые ответы различаются ({new} ≠ {old}).\nПроверьте — чтобы изменить ответ вопроса {kept}, отправьте <code>{kept}{new}</code>.",
     },
     "open_info": {
         "uz": "ℹ️ Javob variantlarisiz (ochiq) savollar: {nums}\nBular variantlarda yozma savol sifatida chiqadi.",
         "en": "ℹ️ Questions without answer options (open-ended): {nums}\nThese will appear as write-in questions in the variants.",
         "ru": "ℹ️ Вопросы без вариантов ответа (открытые): {nums}\nОни попадут в варианты как вопросы с письменным ответом.",
     },
-    "sections_pick": {
-        "uz": "📚 Bu faylda <b>{n} ta alohida test</b> bor:\n{lines}\n\nQaysi birini ishlatay?",
-        "en": "📚 This file contains <b>{n} separate tests</b>:\n{lines}\n\nWhich one should I use?",
-        "ru": "📚 В файле <b>{n} отдельных теста(ов)</b>:\n{lines}\n\nКакой использовать?",
+    "multi_refused": {
+        "uz": "📚 Bu faylda <b>{n} ta alohida test</b> aniqlandi ({ranges}).\nIltimos, har bir testni alohida fayl qilib yuboring.",
+        "en": "📚 This file contains <b>{n} separate tests</b> ({ranges}).\nPlease send each test as its own file.",
+        "ru": "📚 В файле обнаружено <b>{n} отдельных теста(ов)</b> ({ranges}).\nПожалуйста, отправьте каждый тест отдельным файлом.",
+    },
+    "dup_match_prompt": {
+        "uz": "♻️ {nums}-savollar bir xil ko'rinadi (javoblaringiz ham bir xil: <b>{ans}</b>).\n«{preview}»\n\nBu savol variantlarda necha marta ishlatilsin?",
+        "en": "♻️ Questions {nums} look identical (your answers match too: <b>{ans}</b>).\n\"{preview}\"\n\nHow many times should this question be used in the variants?",
+        "ru": "♻️ Вопросы {nums} выглядят одинаково (ваши ответы тоже совпадают: <b>{ans}</b>).\n«{preview}»\n\nСколько раз использовать этот вопрос в вариантах?",
+    },
+    "dup_differ_prompt": {
+        "uz": "⚠️ {nums}-savollar bir xil ko'rinadi, lekin javoblaringiz farq qiladi ({answers}) — demak ular boshqa-boshqa savollar bo'lishi mumkin.\n«{preview}»",
+        "en": "⚠️ Questions {nums} look identical, but your answers differ ({answers}) — they may be different questions.\n\"{preview}\"",
+        "ru": "⚠️ Вопросы {nums} выглядят одинаково, но ваши ответы различаются ({answers}) — возможно, это разные вопросы.\n«{preview}»",
+    },
+    "dup_once_done": {
+        "uz": "✂️ {kept}-savol qoldi, {dropped} olib tashlandi.",
+        "en": "✂️ Question {kept} kept, {dropped} removed.",
+        "ru": "✂️ Вопрос {kept} оставлен, {dropped} удалён.",
+    },
+    "dup_twice_done": {
+        "uz": "✅ Ikkala nusxa ham qoladi — savol variantlarda {k} marta chiqadi.",
+        "en": "✅ Both copies stay — the question appears {k} times in the variants.",
+        "ru": "✅ Обе копии остаются — вопрос появится {k} раза в вариантах.",
+    },
+    "dup_both_done": {
+        "uz": "✅ Ikkalasi ham alohida savol sifatida qoladi.",
+        "en": "✅ Both stay as separate questions.",
+        "ru": "✅ Оба остаются как отдельные вопросы.",
+    },
+    "dup_skipped": {
+        "uz": "ℹ️ Qolgan takrorlar bo'yicha hammasi saqlab qolindi.",
+        "en": "ℹ️ All remaining duplicates were kept.",
+        "ru": "ℹ️ Все оставшиеся дубликаты сохранены.",
     },
     "key_bad": {
         "uz": "❌ Bu javoblar mos kelmadi (savol yo'q yoki bunday varianti yo'q):\n{bad}\nQayta yuboring:",
@@ -132,11 +155,6 @@ T = {
         "uz": "⚠️ Sxemasi tiklanmagan savollar: {nums}\nBu savollarni faylda tekshirib ko'ring.",
         "en": "⚠️ Questions whose scheme could not be recovered: {nums}\nPlease check them in the file.",
         "ru": "⚠️ Вопросы с невосстановленной схемой: {nums}\nПроверьте их в файле.",
-    },
-    "dup_ack": {
-        "uz": "♻️ {dropped} = {kept} (nusxa), javob mos ✓",
-        "en": "♻️ {dropped} = {kept} (duplicate), answer recorded ✓",
-        "ru": "♻️ {dropped} = {kept} (дубликат), ответ учтён ✓",
     },
     "near_dup_info": {
         "uz": "❓ Shubhali takrorlar (bir xil variantlar, o'xshash matn) — tekshirib ko'ring: {groups}",
@@ -310,10 +328,6 @@ def _summary_message(meta: dict, quality: dict, lang: str) -> str:
     sec = meta["section"]
     lines = [t("sum_found", lang, found=meta["count"], max=meta["max"])]
 
-    for d in quality.get("dups", []):
-        if d[0] == sec:
-            lines.append(t("sum_dup_line", lang, kept=d[1], dropped=d[2]))
-
     if meta["gaps"]:
         lines.append(t(
             "sum_missing", lang,
@@ -365,41 +379,82 @@ def _section_suspicious(quality: dict, sec: int) -> list:
     return [s for s in quality.get("suspicious", []) if s[0] == sec]
 
 
-def _remap_removed_answers(
-    updates: dict[str, str],
-    removed_map: dict[int, int],
-    current_answers: dict,
-) -> tuple[dict[str, str], list[tuple[int, int, str, str]], list[tuple[int, int, str]]]:
-    """
-    Teachers enter keys from their printed source, which still contains
-    deduped numbers ("35-B" when Q35 was removed as a copy of Q15).
-    Map such entries onto the surviving question. If the surviving question
-    already has a DIFFERENT answer, the entry is NOT applied and a conflict
-    (dropped, kept, new_letter, old_letter) is reported — disagreeing answers
-    mean dedup may have collapsed two genuinely different questions.
+def _dup_answers_match(group: dict) -> bool:
+    """CHANGE 2: do the teacher's answers for a duplicate group agree?"""
+    vals = {v for v in group.get("answers", {}).values() if v and v != "-"}
+    return len(vals) <= 1
 
-    Returns (mapped, conflicts, acks) — acks are (dropped, kept, letter)
-    for registry entries that were accepted, so the teacher gets an explicit
-    "35 = 15 (nusxa), javob mos ✓" instead of silence or an error.
+
+def _dup_prompt(group: dict, lang: str) -> str:
+    nums = group["numbers"]
+    answers = group.get("answers", {})
+    nums_str = "- va ".join(str(n) for n in nums)
+    if _dup_answers_match(group):
+        ans = next(
+            (v for v in answers.values() if v and v != "-"), "—"
+        )
+        return t(
+            "dup_match_prompt", lang,
+            nums=nums_str, ans=ans, preview=group.get("preview", ""),
+        )
+    answers_str = " ≠ ".join(
+        f"{answers.get(str(n)) or '—'}" for n in nums
+    )
+    return t(
+        "dup_differ_prompt", lang,
+        nums=nums_str, answers=answers_str, preview=group.get("preview", ""),
+    )
+
+
+async def _maybe_start_dup_resolution(
+    message: Message, state: FSMContext, lang: str, project_id: str
+) -> bool:
     """
-    mapped: dict[str, str] = {}
-    conflicts: list[tuple[int, int, str, str]] = []
-    acks: list[tuple[int, int, str]] = []
-    for num_str, letter in updates.items():
-        n = int(num_str)
-        target = removed_map.get(n)
-        if target is None:
-            mapped[num_str] = letter
-            continue
-        if letter == "-":
-            continue  # skip marker for a removed number: nothing to skip
-        existing = mapped.get(str(target)) or current_answers.get(str(target))
-        if existing and existing != "-" and existing != letter:
-            conflicts.append((n, target, letter, existing))
-            continue
-        mapped[str(target)] = letter
-        acks.append((n, target, letter))
-    return mapped, conflicts, acks
+    CHANGE 2: after the answer key is complete, detect exact duplicates and
+    hand the decision to the teacher. Returns True if a resolution prompt
+    was sent (caller must NOT advance to the variant-count step).
+    """
+    data = await state.get_data()
+    answers = data.get("answers", {})
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(Question.project_id == uuid.UUID(project_id))
+        )
+        rows = res.scalars().all()
+
+    qdicts = [
+        {
+            "question_number": r.question_number,
+            "section": 1,
+            "question_text": r.question_text,
+            "options": {"A": r.option_a, "B": r.option_b,
+                        "C": r.option_c, "D": r.option_d},
+            "image_description": r.image_description,
+        }
+        for r in rows
+    ]
+    groups = find_exact_duplicates(qdicts)
+    if not groups:
+        return False
+
+    queue = [
+        {
+            "numbers": g["numbers"],
+            "preview": g["preview"],
+            "answers": {str(n): answers.get(str(n)) for n in g["numbers"]},
+        }
+        for g in groups
+    ]
+    await state.update_data(dup_queue=queue, dup_idx=0)
+    await state.set_state(UploadStates.waiting_for_dup_resolution)
+    await message.answer(
+        _dup_prompt(queue[0], lang),
+        parse_mode="HTML",
+        reply_markup=dup_resolution_keyboard(_dup_answers_match(queue[0]), lang),
+    )
+    return True
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -517,12 +572,37 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         await state.clear()
         return
 
-    # ── Attach images — precise crop using PyMuPDF rects ─────────────────────
-    # Pass pdf_bytes so the precise rect-detection path is used.
-    # For non-PDF files, pdf_bytes=None → fallback to equal-band crop.
-    # ── FIX 4: exact-duplicate removal (siblings kept, reported as info) ──────
-    all_questions, dup_pairs, sibling_groups = dedupe_questions(all_questions)
+    # ── CHANGE 1: multi-test files are politely refused ───────────────────────
+    # Confident detection (>= 2 sections, each >= 4 questions) → one refusal
+    # message, project failed cleanly, state back to waiting_for_file so the
+    # teacher can immediately send each test as its own file. A borderline
+    # split is treated as detection noise and collapsed to a single test.
+    sections = summarize_sections(all_questions)
+    if len(sections) > 1:
+        if sections_confident(sections):
+            ranges = " va ".join(f"1–{m['max']}" for m in sections)
+            async with async_session_factory() as session:
+                from sqlalchemy import select
+                res = await session.execute(
+                    select(Project).where(Project.id == uuid.UUID(project_id))
+                )
+                p = res.scalar_one()
+                p.status = ProjectStatus.FAILED
+                p.error_message = "multi-section file refused"
+                await session.commit()
+            await state.set_state(UploadStates.waiting_for_file)
+            await status_msg.edit_text(
+                t("multi_refused", lang, n=len(sections), ranges=ranges),
+                parse_mode="HTML",
+            )
+            logger.info(
+                "multi_section_refused",
+                project_id=project_id, sections=len(sections),
+            )
+            return
+        all_questions = collapse_sections(all_questions)
 
+    # ── Attach images — precise crop using PyMuPDF rects ─────────────────────
     _pdf_bytes_for_crop = content if file_type == "pdf" else None
     all_questions = await asyncio.to_thread(
         attach_images_to_questions,
@@ -598,8 +678,7 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
             ocr_by_sec[sec] = ocr_by_sec.get(sec, 0) + q["ocr_fixes"]
 
     quality = {
-        "dups": [list(d) for d in dup_pairs],
-        "siblings": [[s[0], list(s[1])] for s in sibling_groups],
+        "siblings": [[s[0], list(s[1])] for s in find_siblings(all_questions)],
         "scheme_failed": [list(f) for f in scheme_failed],
         "near_dups": [[g[0], list(g[1])] for g in near_dups],
         "suspicious": [list(s) for s in suspicious],
@@ -607,40 +686,11 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         "ocr_fixes": [[sec, n] for sec, n in sorted(ocr_by_sec.items())],
     }
 
-    # ── Multi-test documents: detect sections, teacher picks ONE ─────────────
-    # No merging, no renumbering — combining tests is a separate future
-    # feature (Multi-Source Builder). Questions are NOT saved to the DB
-    # until a section is chosen; the other sections are discarded.
-    # The dedup removal registry keeps deliberately-removed duplicates out
-    # of the "missing numbers" gap report.
-    removed_registry = {(d[0], d[2]) for d in dup_pairs}
-    sections = summarize_sections(all_questions, removed_registry)
+    # CHANGE 2: NOTHING is removed at extraction time. The pool is ALL
+    # extracted questions; duplicates are detected and resolved by the
+    # teacher AFTER the full answer key is entered.
+    sections = summarize_sections(all_questions)
 
-    if len(sections) > 1:
-        line_tpl = {
-            "uz": "• {i}-test: savollar 1–{max}{title}",
-            "en": "• Test {i}: questions 1–{max}{title}",
-            "ru": "• Тест {i}: вопросы 1–{max}{title}",
-        }.get(lang, "• Test {i}: questions 1–{max}{title}")
-        lines = []
-        for m in sections:
-            title = f" — {m['title']}" if m.get("title") else ""
-            lines.append(line_tpl.format(i=m["section"], max=m["max"], title=title))
-        await state.update_data(
-            project_id=project_id,
-            sections=sections,
-            pending_questions=all_questions,
-            quality=quality,
-        )
-        await state.set_state(UploadStates.waiting_for_section_choice)
-        await status_msg.edit_text(
-            t("sections_pick", lang, n=len(sections), lines="\n".join(lines)),
-            parse_mode="HTML",
-            reply_markup=section_choice_keyboard(sections, lang),
-        )
-        return
-
-    # ── Single test: persist and continue as before ───────────────────────────
     await _persist_questions(project_id, all_questions)
 
     detected: dict[str, str | None] = {
@@ -656,8 +706,8 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         project_id=project_id,
         question_count=len(all_questions),
         answers=detected,
-        quality=quality,  # dedup registry needed at answer-key entry (FIX 4)
-        # Numbering can exceed the question count (dedup/gaps): parse the
+        quality=quality,
+        # Numbering can exceed the question count (gaps): parse the
         # teacher's key against the real max number, not the count.
         key_max=sections[0]["max"],
     )
@@ -679,75 +729,6 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
             if _section_suspicious(quality, sections[0]["section"]) else None
         ),
     )
-
-
-@router.callback_query(UploadStates.waiting_for_section_choice, F.data.startswith("sections:"))
-async def handle_section_choice(
-    callback: CallbackQuery, state: FSMContext, db_user: User
-) -> None:
-    """Multi-test document: persist ONLY the chosen section, original
-    numbering untouched; the other sections are discarded."""
-    lang = db_user.language.value
-    try:
-        sec = int(callback.data.split(":", 1)[1])
-    except ValueError:
-        await callback.answer()
-        return
-
-    data = await state.get_data()
-    sections: list[dict] = data.get("sections", [])
-    pending: list[dict] = data.get("pending_questions") or []
-    project_id: str = data.get("project_id", "")
-
-    meta = next((m for m in sections if m["section"] == sec), None)
-    if meta is None or not pending or not project_id:
-        await callback.answer()
-        return
-
-    chosen = [q for q in pending if q.get("section", 1) == sec]
-    await _persist_questions(project_id, chosen)
-    logger.info(
-        "section_chosen",
-        project_id=project_id,
-        section=sec,
-        kept=len(chosen),
-        discarded=len(pending) - len(chosen),
-    )
-
-    detected: dict[str, str | None] = {
-        str(q.get("question_number", i + 1)): q.get("correct_answer")
-        for i, q in enumerate(chosen)
-    }
-    missing_nums = sorted(
-        [num for num, ans in detected.items() if not ans],
-        key=lambda x: int(x),
-    )
-    await state.update_data(
-        question_count=len(chosen),
-        answers=detected,
-        pending_questions=None,  # free the stash
-        key_max=meta["max"],
-    )
-    await state.set_state(UploadStates.waiting_for_answers)
-
-    n = len(chosen)
-    if missing_nums:
-        await callback.message.edit_text(
-            t("ans_missing", lang, n=n, missing=", ".join(missing_nums)),
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.edit_text(
-            t("ans_all", lang, n=n), parse_mode="HTML",
-        )
-    await callback.message.answer(
-        _summary_message(meta, data.get("quality") or {}, lang),
-        reply_markup=(
-            reextract_keyboard(lang)
-            if _section_suspicious(data.get("quality") or {}, sec) else None
-        ),
-    )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "reextract")
@@ -857,13 +838,9 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
             await message.answer(t("key_bad", lang, bad=text[:60]), parse_mode="HTML")
             return
 
-        # ── FIX 2: entries for dedup-removed numbers map to survivors ────────
-        removed_map = {
-            d[2]: d[1] for d in (data.get("quality") or {}).get("dups", [])
-        }
-        updates, dup_conflicts, dup_acks = _remap_removed_answers(
-            updates, removed_map, answers
-        )
+        # CHANGE 2: every original number is a real DB row at this point —
+        # no remapping, no duplicate special cases. Duplicates are resolved
+        # by the teacher AFTER the key completes.
 
         # ── FIX 3: partial save — validate per entry, apply every good one ────
         async with async_session_factory() as session:
@@ -912,17 +889,8 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
         answers.update(good)
         await state.update_data(answers=answers)
 
-        # ── One combined reply: acks, conflicts, per-line issues, remaining ──
+        # ── One combined reply: per-line issues + exact remaining numbers ────
         reply_parts: list[str] = []
-        if dup_acks:
-            reply_parts.append("\n".join(
-                t("dup_ack", lang, dropped=a[0], kept=a[1]) for a in dup_acks
-            ))
-        for dropped, kept_n, new_l, old_l in dup_conflicts:
-            reply_parts.append(t(
-                "dup_answer_conflict", lang, dropped=dropped, kept=kept_n,
-                new=new_l, old=old_l,
-            ))
         if bad_lines:
             reply_parts.append(t("key_bad", lang, bad="\n".join(bad_lines)))
 
@@ -938,10 +906,102 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
             ))
         if reply_parts:
             await message.answer("\n\n".join(reply_parts), parse_mode="HTML")
-        if still_missing or dup_conflicts or bad_lines:
+        if still_missing or bad_lines:
             return
 
+    # ── CHANGE 2: key complete → duplicates go to the teacher ────────────────
+    if await _maybe_start_dup_resolution(message, state, lang, project_id):
+        return
+
     await state.set_state(UploadStates.waiting_for_variant_count)
+    await message.answer(t("ask_count", lang))
+
+
+@router.callback_query(UploadStates.waiting_for_dup_resolution, F.data.startswith("dupres:"))
+async def handle_dup_resolution(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """One duplicate group per prompt; NOTHING is removed until a tap."""
+    lang = db_user.language.value
+    action = callback.data.split(":", 1)[1]  # once | twice | both
+
+    data = await state.get_data()
+    queue: list[dict] = data.get("dup_queue") or []
+    idx: int = data.get("dup_idx", 0)
+    project_id: str = data.get("project_id", "")
+    answers: dict = data.get("answers", {})
+
+    if idx >= len(queue) or not project_id:
+        await callback.answer()
+        return
+    group = queue[idx]
+
+    if action == "once":
+        keep = group["numbers"][0]
+        drop = group["numbers"][1:]
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            res = await session.execute(
+                select(Question).where(Question.project_id == uuid.UUID(project_id))
+            )
+            removed = 0
+            for r in res.scalars().all():
+                if r.question_number in drop:
+                    await session.delete(r)
+                    removed += 1
+            pres = await session.execute(
+                select(Project).where(Project.id == uuid.UUID(project_id))
+            )
+            p = pres.scalar_one()
+            p.question_count = max(0, p.question_count - removed)
+            await session.commit()
+        answers = {k: v for k, v in answers.items() if int(k) not in drop}
+        await state.update_data(
+            answers=answers,
+            question_count=data.get("question_count", 0) - len(drop),
+        )
+        logger.info(
+            "dup_resolved_once",
+            project_id=project_id, kept=keep, dropped=drop,
+        )
+        note = t("dup_once_done", lang, kept=keep,
+                 dropped=", ".join(str(d) for d in drop))
+    elif action == "twice":
+        logger.info("dup_resolved_twice", project_id=project_id,
+                    numbers=group["numbers"])
+        note = t("dup_twice_done", lang, k=len(group["numbers"]))
+    else:  # both — different questions, keep everything
+        logger.info("dup_resolved_both", project_id=project_id,
+                    numbers=group["numbers"])
+        note = t("dup_both_done", lang)
+
+    idx += 1
+    await state.update_data(dup_idx=idx)
+    if idx < len(queue):
+        await callback.message.edit_text(
+            note + "\n\n" + _dup_prompt(queue[idx], lang),
+            parse_mode="HTML",
+            reply_markup=dup_resolution_keyboard(
+                _dup_answers_match(queue[idx]), lang
+            ),
+        )
+    else:
+        await callback.message.edit_text(note, parse_mode="HTML")
+        await state.set_state(UploadStates.waiting_for_variant_count)
+        await callback.message.answer(t("ask_count", lang))
+    await callback.answer()
+
+
+@router.message(UploadStates.waiting_for_dup_resolution, F.text)
+async def handle_dup_skip(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    """Any text during resolution = skip: keep both for all remaining groups
+    (the safe default — nothing is ever removed without an explicit tap)."""
+    lang = db_user.language.value
+    logger.info("dup_resolution_skipped")
+    await state.set_state(UploadStates.waiting_for_variant_count)
+    await message.answer(t("dup_skipped", lang))
     await message.answer(t("ask_count", lang))
 
 

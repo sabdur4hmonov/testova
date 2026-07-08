@@ -23,26 +23,28 @@ def project_actions_keyboard(project_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def section_choice_keyboard(sections: list[dict], lang: str = "uz") -> InlineKeyboardMarkup:
-    """Multi-test document: the teacher picks ONE test; the rest is discarded."""
-    label = {
-        "uz": "{i}-test (savollar 1–{max})",
-        "en": "Test {i} (questions 1–{max})",
-        "ru": "Тест {i} (вопросы 1–{max})",
-    }.get(lang, "Test {i} (questions 1–{max})")
-    cancel = {
-        "uz": "❌ Bekor qilish",
-        "en": "❌ Cancel",
-        "ru": "❌ Отмена",
-    }.get(lang, "❌ Cancel")
-
+def dup_resolution_keyboard(match: bool, lang: str = "uz") -> InlineKeyboardMarkup:
+    """Teacher decides a duplicate group's fate — nothing is auto-removed.
+    match=True: answers agree → use once or twice.
+    match=False: answers differ → probably different questions."""
+    if match:
+        labels = {
+            "uz": [("1 marta", "dupres:once"), ("2 marta", "dupres:twice")],
+            "en": [("Use once", "dupres:once"), ("Use twice", "dupres:twice")],
+            "ru": [("1 раз", "dupres:once"), ("2 раза", "dupres:twice")],
+        }
+    else:
+        labels = {
+            "uz": [("Ikkalasi ham qolsin (boshqa savollar)", "dupres:both"),
+                   ("1 marta ishlatilsin", "dupres:once")],
+            "en": [("Keep both (different questions)", "dupres:both"),
+                   ("Use once", "dupres:once")],
+            "ru": [("Оставить оба (разные вопросы)", "dupres:both"),
+                   ("Использовать 1 раз", "dupres:once")],
+        }
     builder = InlineKeyboardBuilder()
-    for s in sections:
-        builder.button(
-            text=label.format(i=s["section"], max=s["max"]),
-            callback_data=f"sections:{s['section']}",
-        )
-    builder.button(text=cancel, callback_data="cancel")
+    for text, cb in labels.get(lang, labels["en"]):
+        builder.button(text=text, callback_data=cb)
     builder.adjust(1)
     return builder.as_markup()
 

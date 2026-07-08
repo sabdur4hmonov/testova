@@ -9,7 +9,8 @@ from app.services.ai_analyzer import (
     _has_scheme_content,
     _needs_scheme,
     clean_latex,
-    dedupe_questions,
+    find_exact_duplicates,
+    find_siblings,
     question_fingerprint,
 )
 from app.services.file_processor import (
@@ -17,7 +18,7 @@ from app.services.file_processor import (
     recrop_scheme_region,
 )
 from app.services import pdf_generator as pg
-from app.bot.handlers.upload import _remap_removed_answers, _summary_message
+from app.bot.handlers.upload import _summary_message
 
 
 # ── FIX 1: crop garbage detector ─────────────────────────────────────────────
@@ -115,7 +116,7 @@ def test_has_scheme_content_variants():
     assert not _has_scheme_content({"question_text": "no scheme here"})
 
 
-# ── FIX 4: de-duplication ────────────────────────────────────────────────────
+# ── CHANGE 2: duplicate DETECTION (nothing removed automatically) ────────────
 
 def _q(n, text, opts, desc=None, sec=1):
     return {
@@ -124,37 +125,78 @@ def _q(n, text, opts, desc=None, sec=1):
     }
 
 
-def test_exact_duplicates_dropped():
+def test_exact_duplicates_detected_not_removed():
     a = _q(12, "Bir xil savol", {"A": "x", "B": "y"})
     b = _q(47, "Bir xil savol", {"A": "x", "B": "y"})
-    kept, dups, sibs = dedupe_questions([a, b])
-    assert [q["question_number"] for q in kept] == [12]
-    assert dups == [(1, 12, 47)]
+    groups = find_exact_duplicates([a, b])
+    assert len(groups) == 1
+    assert groups[0]["numbers"] == [12, 47]
+    # detection is pure: the questions themselves are untouched
+    assert a["question_text"] and b["question_text"]
 
 
-def test_sibling_questions_kept_and_reported():
-    # KOH/NaOH/K2SiO3 case: same stem, different options → all kept
+def test_sibling_questions_not_in_duplicate_groups():
+    # KOH/NaOH/K2SiO3 case: same stem, different options → siblings info only
     a = _q(16, "Moddaning formulasi qaysi?", {"A": "KOH", "B": "HCl"})
     b = _q(17, "Moddaning formulasi qaysi?", {"A": "NaOH", "B": "HCl"})
     c = _q(18, "Moddaning formulasi qaysi?", {"A": "K2SiO3", "B": "HCl"})
-    kept, dups, sibs = dedupe_questions([a, b, c])
-    assert len(kept) == 3 and not dups
-    assert sibs == [(1, [16, 17, 18])]
+    assert find_exact_duplicates([a, b, c]) == []
+    assert find_siblings([a, b, c]) == [(1, [16, 17, 18])]
 
 
-def test_same_stem_different_scheme_key_kept():
+def test_same_stem_different_scheme_key_not_duplicates():
     a = _q(5, "X va Y ni toping", {"A": "1", "B": "2"}, desc="Scheme CuSO4")
     b = _q(9, "X va Y ni toping", {"A": "1", "B": "2"}, desc="Scheme Al4C3")
-    kept, dups, _ = dedupe_questions([a, b])
-    assert len(kept) == 2 and not dups
+    assert find_exact_duplicates([a, b]) == []
     assert question_fingerprint(a) != question_fingerprint(b)
 
 
-def test_cross_section_same_question_not_deduped():
+def test_cross_section_same_question_not_grouped():
     a = _q(1, "Savol", {"A": "x"}, sec=1)
     b = _q(1, "Savol", {"A": "x"}, sec=2)
-    kept, dups, _ = dedupe_questions([a, b])
-    assert len(kept) == 2 and not dups
+    assert find_exact_duplicates([a, b]) == []
+
+
+def test_collapse_sections_borderline_split():
+    from app.services.ai_analyzer import collapse_sections, sections_confident, summarize_sections
+    # Tiny second "section" (2 questions) = detection noise, not a real test
+    qs = [_q(n, f"savol {n}", {"A": "x"}) for n in (1, 2, 3, 4, 5)]
+    noise = [_q(1, "shovqin savol", {"B": "y"}, sec=2), _q(2, "yana", {"A": "z"}, sec=2)]
+    meta = summarize_sections(qs + noise)
+    assert len(meta) == 2
+    assert sections_confident(meta) is False  # borderline → no refusal
+    collapsed = collapse_sections(qs + noise)
+    assert all(q["section"] == 1 for q in collapsed)
+    # same-number occurrences merged fill-missing, first wins
+    assert len(collapsed) == 5
+    q1 = next(q for q in collapsed if q["question_number"] == 1)
+    assert q1["question_text"] == "savol 1"
+    assert q1["options"].get("B") == "y"  # missing option filled from noise
+
+
+def test_sections_confident_requires_real_sections():
+    from app.services.ai_analyzer import sections_confident
+    big = {"count": 52}
+    small = {"count": 2}
+    assert sections_confident([big, {"count": 39}]) is True   # refuse
+    assert sections_confident([big, small]) is False          # collapse
+    assert sections_confident([big]) is False                 # single test
+
+
+def test_fingerprint_keeps_meaning_symbols():
+    # Signs/ratios/bonds distinguish questions — the 2/11, 13/14 false-merge
+    # class: these must NEVER reach the duplicate prompt.
+    a = _q(2, "Zaryad +2 bo'lgan ion", {"A": "+2", "B": "-2"})
+    b = _q(11, "Zaryad -2 bo'lgan ion", {"A": "-2", "B": "+2"})
+    assert find_exact_duplicates([a, b]) == []
+
+    c = _q(13, "Nisbatlar 2:3 bo'lsin", {"A": "2:3", "B": "3:2"})
+    d = _q(14, "Nisbatlar 2/3 bo'lsin", {"A": "2/3", "B": "3/2"})
+    assert find_exact_duplicates([c, d]) == []
+
+    e = _q(20, "Bog' turi = bo'lgan", {"A": "x"})
+    f = _q(21, "Bog' turi ≡ bo'lgan", {"A": "x"})
+    assert find_exact_duplicates([e, f]) == []
 
 
 # ── FIX 5: PDF layout + tutgan repair ────────────────────────────────────────
@@ -228,50 +270,35 @@ def test_chain_in_stem_attaches_no_image():
     assert out[0]["image_path"] is None
 
 
-# ── Dedup ↔ reconciliation registry (Q35 false-missing bug) ──────────────────
+# ── Summary message (CHANGE 2: no duplicate talk before the key) ─────────────
 
-def test_summarize_excludes_deduped_numbers_from_gaps():
+def test_summarize_registry_param_still_supported():
     from app.services.ai_analyzer import summarize_sections
-    # 52 questions extracted, Q35 removed as duplicate of Q15 → NOT a gap.
     qs = [_q(n, f"savol {n}", {"A": "x", "B": "y"}) for n in range(1, 53) if n != 35]
     meta = summarize_sections(qs, removed={(1, 35)})
     assert meta[0]["gaps"] == []
-    # A genuinely missing number still reports.
-    qs2 = [q for q in qs if q["question_number"] != 40]
-    meta2 = summarize_sections(qs2, removed={(1, 35)})
-    assert meta2[0]["gaps"] == [40]
+    # Without a registry, 35 is a plain gap (nothing is pre-removed anymore)
+    meta2 = summarize_sections(qs)
+    assert meta2[0]["gaps"] == [35]
 
 
-def test_summary_message_order_and_content():
-    meta = {"section": 1, "title": None, "count": 51, "max": 52,
+def test_summary_message_mentions_no_duplicates():
+    meta = {"section": 1, "title": None, "count": 52, "max": 52,
             "gaps": [40], "open": []}
-    quality = {"dups": [[1, 15, 35]], "siblings": [], "scheme_failed": []}
+    quality = {"siblings": [], "scheme_failed": []}
     msg = _summary_message(meta, quality, "en")
-    assert "51 questions captured" in msg
-    assert "Question 35 is an exact copy of question 15" in msg
+    assert "52 questions captured" in msg
     assert "Missing question numbers: 40" in msg
-    # Order: total → duplicates → missing
-    assert msg.index("captured") < msg.index("exact copy") < msg.index("Missing")
-    # The deduped number is never in the missing list
-    assert "Missing question numbers: 35" not in msg
-
-
-def test_summary_message_no_missing_line_when_only_dups():
-    meta = {"section": 1, "title": None, "count": 51, "max": 52,
-            "gaps": [], "open": []}
-    quality = {"dups": [[1, 15, 35]], "siblings": [], "scheme_failed": []}
-    msg = _summary_message(meta, quality, "en")
-    assert "Missing" not in msg
-    assert "check" not in msg.lower()  # never "check the file" for removed Qs
+    assert "duplicate" not in msg.lower()
+    assert "copy" not in msg.lower()
 
 
 def test_summary_message_filters_other_sections():
     meta = {"section": 2, "title": None, "count": 39, "max": 39,
             "gaps": [], "open": []}
-    quality = {"dups": [[1, 15, 35]], "siblings": [[1, [16, 17]]],
-               "scheme_failed": [[1, 23]]}
+    quality = {"siblings": [[1, [16, 17]]], "scheme_failed": [[1, 23]]}
     msg = _summary_message(meta, quality, "en")
-    assert "35" not in msg and "16" not in msg and "23" not in msg
+    assert "16" not in msg and "23" not in msg
 
 
 # ── FIX 3: gap recovery respects the removal registry ────────────────────────
@@ -300,63 +327,6 @@ def test_gap_recovery_skips_excluded_numbers():
     assert calls == []
 
 
-def test_no_cycle_recovered_duplicate_removed_once():
-    # A recovered question that is an exact duplicate is removed by dedup in
-    # ONE pass, registry records it, and summarize reports no gap for it.
-    from app.services.ai_analyzer import summarize_sections
-    original = _q(15, "Takror savol", {"A": "x", "B": "y"})
-    recovered_dup = _q(35, "Takror savol", {"A": "x", "B": "y"})
-    others = [_q(n, f"savol {n}", {"A": "x"}) for n in (34, 36)]
-    kept, dups, _ = dedupe_questions([original, recovered_dup] + others)
-    assert dups == [(1, 15, 35)]
-    kept2, dups2, _ = dedupe_questions(kept)  # idempotent
-    assert kept2 == kept and not dups2
-    meta = summarize_sections(kept, removed={(d[0], d[2]) for d in dups})
-    assert 35 not in meta[0]["gaps"]
-
-
-# ── FIX 4: answer-key remap for removed numbers ──────────────────────────────
-
-def test_removed_number_answer_maps_to_survivor():
-    mapped, conflicts, acks = _remap_removed_answers(
-        {"35": "B"}, {35: 15}, current_answers={},
-    )
-    assert mapped == {"15": "B"} and not conflicts
-    assert acks == [(35, 15, "B")]  # FIX 2: explicit "35 = 15 ✓" ack
-
-
-def test_conflicting_answer_not_applied_and_reported():
-    mapped, conflicts, acks = _remap_removed_answers(
-        {"35": "B"}, {35: 15}, current_answers={"15": "A"},
-    )
-    assert mapped == {}
-    assert conflicts == [(35, 15, "B", "A")]
-    assert not acks
-
-
-def test_same_answer_for_both_numbers_is_fine():
-    mapped, conflicts, acks = _remap_removed_answers(
-        {"15": "A", "35": "A"}, {35: 15}, current_answers={},
-    )
-    assert mapped == {"15": "A"} and not conflicts
-    assert acks == [(35, 15, "A")]
-
-
-def test_both_numbers_in_one_message_conflict_detected():
-    mapped, conflicts, _ = _remap_removed_answers(
-        {"15": "A", "35": "B"}, {35: 15}, current_answers={},
-    )
-    assert mapped == {"15": "A"}
-    assert conflicts == [(35, 15, "B", "A")]
-
-
-def test_skip_marker_for_removed_number_is_noop():
-    mapped, conflicts, _ = _remap_removed_answers(
-        {"35": "-", "36": "C"}, {35: 15}, current_answers={},
-    )
-    assert mapped == {"36": "C"} and not conflicts
-
-
 # ── FIX 5: fingerprint normalization (evidence: Q12/Q36/Q49 triplet) ─────────
 
 def test_apostrophe_variants_are_exact_duplicates():
@@ -365,18 +335,16 @@ def test_apostrophe_variants_are_exact_duplicates():
            {"A": "1 ta", "B": "2 ta"})
     b = _q(36, "Kalsiy karbid tarkibidagi oʻzgarishlar sigma va pi",
            {"A": "1 ta", "B": "2 ta"})
-    kept, dups, _ = dedupe_questions([a, b])
-    assert len(kept) == 1
-    assert dups == [(1, 12, 36)]
+    groups = find_exact_duplicates([a, b])
+    assert len(groups) == 1 and groups[0]["numbers"] == [12, 36]
 
 
 def test_option_order_does_not_matter():
     # Q12 vs Q49 evidence: identical except option order
     a = _q(12, "Sigma va pi bog'lar soni?", {"A": "4", "B": "2", "C": "3", "D": "1"})
     b = _q(49, "Sigma va pi bog'lar soni?", {"A": "2", "B": "4", "C": "1", "D": "3"})
-    kept, dups, _ = dedupe_questions([a, b])
-    assert len(kept) == 1
-    assert dups == [(1, 12, 49)]
+    groups = find_exact_duplicates([a, b])
+    assert len(groups) == 1 and groups[0]["numbers"] == [12, 49]
 
 
 def test_nfkc_folds_superscripts():

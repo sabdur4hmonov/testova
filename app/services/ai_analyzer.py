@@ -453,7 +453,10 @@ _APOSTROPHE_RE = re.compile(r"['‘’ʻʼʹ′`´]")
 def _fp_norm(s: str | None) -> str:
     s = unicodedata.normalize("NFKC", s or "")  # ² → 2, ligatures, width folds
     s = _APOSTROPHE_RE.sub("", s.lower())
-    return re.sub(r'[^a-zа-яё0-9]', '', s)
+    # Meaning-bearing symbols SURVIVE normalization: "+2" vs "-2", "2:3" vs
+    # "2/3", "=" vs "≡" are different questions, not duplicates. Cosmetic
+    # punctuation (.,;?!()) is still stripped.
+    return re.sub(r'[^a-zа-яё0-9+\-:/%=<>→≡]', '', s)
 
 
 def _scheme_key(q: dict) -> str:
@@ -474,43 +477,85 @@ def question_fingerprint(q: dict) -> str:
     return f"{stem}::{opts}::{_fp_norm(_scheme_key(q))}"
 
 
-def dedupe_questions(
-    questions: list[dict],
-) -> tuple[list[dict], list[tuple[int, int]], list[list[int]]]:
+def find_exact_duplicates(questions: list[dict]) -> list[dict]:
     """
-    Remove EXACT duplicates only (identical fingerprint within a section):
-    keep the first, report (kept_number, dropped_number) pairs.
+    CHANGE 2: detection ONLY — nothing is removed here. Questions whose
+    fingerprints match exactly within a section form a group; the TEACHER
+    decides once/twice AFTER entering the full answer key.
 
-    Near-matches — same stem but different options or scheme (legitimate
-    sibling questions like KOH/NaOH variants) — are KEPT and reported as
-    sibling groups for the teacher's information only.
+    Returns [{"section": s, "numbers": [15, 35], "preview": "stem..."}].
     """
-    kept: list[dict] = []
-    seen_fp: dict[tuple[int, str], int] = {}    # (section, fingerprint) → number
-    stems: dict[tuple[int, str], list[int]] = {}  # (section, stem) → numbers
-    duplicates: list[tuple[int, int, int]] = []   # (section, kept_n, dropped_n)
-
+    by_fp: dict[tuple[int, str], list[dict]] = {}
     for q in questions:
-        sec = q.get("section", 1)
-        n = q.get("question_number", 0)
-        fp = question_fingerprint(q)
-        key = (sec, fp)
-        if key in seen_fp:
-            duplicates.append((sec, seen_fp[key], n))
-            logger.warning(
-                "duplicate_question_dropped",
-                section=sec, kept=seen_fp[key], dropped=n,
-            )
-            continue
-        seen_fp[key] = n
-        stems.setdefault((sec, _fp_norm(q.get("question_text"))), []).append(n)
-        kept.append(q)
+        by_fp.setdefault(
+            (q.get("section", 1), question_fingerprint(q)), []
+        ).append(q)
 
-    siblings = [
-        (sec, nums) for (sec, stem), nums in stems.items()
-        if stem and len(nums) > 1
-    ]
-    return kept, duplicates, siblings
+    groups: list[dict] = []
+    for (sec, fp), qs in by_fp.items():
+        if len(qs) < 2 or not fp.replace(":", ""):
+            continue
+        nums = sorted(q.get("question_number", 0) for q in qs)
+        groups.append({
+            "section": sec,
+            "numbers": nums,
+            "preview": (qs[0].get("question_text") or "")[:80],
+        })
+        logger.info("exact_duplicates_detected", section=sec, numbers=nums)
+    groups.sort(key=lambda g: g["numbers"])
+    return groups
+
+
+def find_siblings(questions: list[dict]) -> list[tuple[int, list[int]]]:
+    """Same stem but DIFFERENT content (options/scheme) — legitimate sibling
+    questions (KOH/NaOH variants). Info for the teacher only."""
+    stems: dict[tuple[int, str], list[dict]] = {}
+    for q in questions:
+        key = (q.get("section", 1), _fp_norm(q.get("question_text")))
+        if key[1]:
+            stems.setdefault(key, []).append(q)
+    out: list[tuple[int, list[int]]] = []
+    for (sec, _), qs in stems.items():
+        if len(qs) > 1 and len({question_fingerprint(q) for q in qs}) > 1:
+            out.append((sec, sorted(q.get("question_number", 0) for q in qs)))
+    return out
+
+
+def collapse_sections(questions: list[dict]) -> list[dict]:
+    """
+    CHANGE 1 borderline case: a LOW-CONFIDENCE section split is treated as
+    detection noise — everything folds back to one test (the literal
+    pre-section-detection behavior): section 1 for all, same-number
+    occurrences merged fill-missing-options, first occurrence wins.
+    """
+    merged: dict[int, dict] = {}
+    for q in questions:
+        q["section"] = 1
+        q["section_title"] = None
+        n = q.get("question_number", 0)
+        if n in merged:
+            prim = merged[n]
+            for letter, v in (q.get("options") or {}).items():
+                if v and not (prim.get("options") or {}).get(letter):
+                    prim.setdefault("options", {})[letter] = v
+            continue
+        merged[n] = q
+    out = sorted(merged.values(), key=lambda x: x.get("question_number", 0))
+    logger.info(
+        "sections_collapsed",
+        kept=len(out), merged_away=len(questions) - len(out),
+    )
+    return out
+
+
+def sections_confident(sections_meta: list[dict]) -> bool:
+    """CHANGE 1: refuse a multi-section file only on CONFIDENT detection —
+    at least two sections, each carrying >= 4 questions. A tiny "section"
+    is extraction noise, not a second test."""
+    return (
+        len(sections_meta) > 1
+        and all(m.get("count", 0) >= 4 for m in sections_meta)
+    )
 
 
 def find_near_duplicates(
@@ -1209,9 +1254,9 @@ class AIAnalyzer:
 
         excluded: {(section, number)} that must NEVER be re-requested — the
         dedup removal registry. NOTE the pipeline-order contract: this pass
-        runs BEFORE dedupe_questions (extract → recover → dedupe), so a
-        removed duplicate cannot re-enter within one upload; the parameter
-        is a guard for any future reordering.
+        runs at extraction time, BEFORE any teacher-driven duplicate
+        resolution, so an excluded number cannot re-enter within one upload;
+        the parameter is a guard for any future reordering.
         """
         excluded = excluded or set()
         by_sec: dict[int, list[dict]] = {}
