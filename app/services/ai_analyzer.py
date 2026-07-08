@@ -15,6 +15,7 @@ import google.generativeai as genai
 from PIL import Image
 
 from app.config import settings
+from app.services.ocr_corrections import apply_ocr_corrections
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -54,7 +55,8 @@ Format:
     "img_desc": null,
     "group": null,
     "group_context": null,
-    "section": null
+    "section": null,
+    "verbatim_doubt": false
   }
 ]
 
@@ -131,7 +133,15 @@ CRITICAL RULES:
     column completely top-to-bottom FIRST, then the RIGHT column top-to-bottom.
     NEVER interleave lines or questions across columns. Return questions in
     that reading order.
-16. RETURN ONLY THE JSON ARRAY - nothing else"""
+16. MULTIPLE REACTIONS: If a question contains SEVERAL reactions/equations,
+    transcribe ALL of them, each on its own line. Never keep only the first
+    one - a question asking about X is unanswerable without the reaction
+    that defines X.
+17. VERBATIM GUARANTEE: transcribe formulas and numbers character-for-character
+    exactly as printed. If something looks wrong, impossible or cut off,
+    COPY IT AS-IS and set "verbatim_doubt": true for that question.
+    NEVER repair, complete or normalize a formula.
+18. RETURN ONLY THE JSON ARRAY - nothing else"""
 
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
@@ -145,7 +155,10 @@ STRICT SYMBOL RULES for this pass:
 - preserve = (double bond) and ≡ (triple bond) symbols EXACTLY as printed
 - preserve superscripts/subscripts; isotopes as ^A_Z Symbol (e.g. ^56_26 Fe)
 - copy every formula character-by-character; never normalize or simplify
-- Roman numerals in parentheses like (II) must stay (II)"""
+- Roman numerals in parentheses like (II) must stay (II)
+- transcribe ALL reactions/equations a question contains, each on its own line
+- if something looks wrong or cut off, COPY IT AS-IS and set
+  "verbatim_doubt": true - NEVER repair or complete it"""
 
 # FIX 3(b): transcribe an unreadable/uncroppable scheme into a text chain.
 TRANSCRIBE_SCHEME_PROMPT = """Question {n} on this test page contains a scheme/diagram of transformations
@@ -157,8 +170,12 @@ Transcribe that scheme as PLAIN TEXT:
   "Yuqori yo'l: ..." (top path) and "Pastki yo'l: ..." (bottom path)
 - keep every formula/symbol EXACTLY as printed, as real Unicode
 
+If the figure is a TABLE: put each row VERBATIM into "chain", one line per
+row, formatted "1. <first cell>; <second cell>". Never merge or reorder
+cells, never describe the table in prose.
+
 Return ONLY JSON: {{"chain": "...", "desc": "..."}}
-- "chain": the transcribed text chain if you can read the scheme, else ""
+- "chain": the transcribed text chain (or verbatim table rows), else ""
 - "desc": one-sentence description that INCLUDES the actual printed
   compounds/reagents, else ""
 NEVER invent compounds or reagents that are not printed on the page."""
@@ -293,12 +310,32 @@ def clean_latex(text: str) -> str:
 
 
 def clean_question(q: dict) -> dict:
-    """Apply clean_latex to all text fields of a question dict."""
+    """Apply clean_latex + the OCR confusion dictionary to all text fields."""
     q["question_text"] = clean_latex(q.get("question_text", ""))
     opts = q.get("options", {})
     q["options"] = {k: clean_latex(v) for k, v in opts.items() if v}
     if q.get("image_description"):
         q["image_description"] = clean_latex(q["image_description"])
+
+    # ISSUE 5: whole-word OCR corrections, every replacement logged
+    all_repl: list[tuple[str, str, int]] = []
+    q["question_text"], r = apply_ocr_corrections(q["question_text"])
+    all_repl += r
+    fixed_opts = {}
+    for k, v in q["options"].items():
+        fixed_opts[k], r = apply_ocr_corrections(v)
+        all_repl += r
+    q["options"] = fixed_opts
+    if q.get("image_description"):
+        q["image_description"], r = apply_ocr_corrections(q["image_description"])
+        all_repl += r
+    if all_repl:
+        q["ocr_fixes"] = q.get("ocr_fixes", 0) + sum(n for _, _, n in all_repl)
+        logger.info(
+            "ocr_corrections_applied",
+            question=q.get("question_number"),
+            replacements=all_repl,
+        )
     return q
 
 
@@ -373,6 +410,22 @@ def _needs_scheme(q: dict) -> bool:
         return True
     stem = (q.get("question_text") or "").lower()
     return any(p in stem for p in SCHEME_TRIGGER_PHRASES)
+
+
+def _desc_redundant(stem: str | None, desc: str | None) -> bool:
+    """ISSUE 4(a): the stem carries the full chain ("→" present) and >=90%
+    of the description's formula/entity tokens already appear in the stem —
+    the [Rasm] box would only restate the chain."""
+    stem = stem or ""
+    if not desc or "→" not in stem:
+        return False
+    tokens = set(FORMULA_RE.findall(desc)) | set(
+        re.findall(r'\b[XYZ][₀-₉0-9]?\b', desc)
+    )
+    if not tokens:
+        return False
+    hit = sum(1 for t in tokens if t in stem)
+    return hit / len(tokens) >= 0.9
 
 
 def _has_scheme_content(q: dict) -> bool:
@@ -583,6 +636,187 @@ def flag_suspicious_questions(
     return flagged
 
 
+# ── Post-extraction stem cleaning (ISSUES 1, 4b, 4d) ─────────────────────────
+
+def _strip_own_number(q: dict) -> None:
+    """
+    ISSUE 1: strip a leading "N." / "N)" / "N ." token from the stem — ONLY
+    the question's own known number N. Generic digits are never touched, so
+    a legitimate list marker like "1)" inside a stem survives.
+    """
+    n = q.get("question_number")
+    if not n:
+        return
+    text = q.get("question_text") or ""
+    new = re.sub(rf'^\s*{n}\s*[.)]\s*', '', text, count=1)
+    if new != text:
+        q["question_text"] = new
+        logger.info("own_number_stripped", question=n)
+
+
+_UNKNOWN_NODE = r'[XYZ][₀-₉0-9]*'
+
+
+def canonicalize_chain_text(text: str | None) -> str | None:
+    """
+    ISSUE 4(b): one canonical arrow-reagent format. In a transformation CHAIN
+    (>= 2 arrows AND unknown nodes like X₁/X₂), a reagent that drifted to the
+    node's side ("→ X₁ + NaPO₃ → X₂") is moved into the following arrow
+    ("→ X₁ →(+NaPO₃) X₂"). A two-operand FIRST segment becomes
+    "SiS₂ →(H₂O) X₁". Gated on the chain signature so genuine
+    "A + B → C" equations are never rewritten.
+    """
+    if not text or text.count("→") < 2:
+        return text
+    if len(re.findall(rf'\b{_UNKNOWN_NODE}\b', text)) < 2:
+        return text
+
+    original = text
+
+    # Inner segments: "→ Xn + REAGENT → " ⇒ "→ Xn →(+REAGENT) ".
+    # The arrow before Xn may already carry its own reagent parens
+    # (from a previous rewrite step) — keep them.
+    inner = re.compile(
+        rf'→(\([^)]*\))?\s*({_UNKNOWN_NODE})\s*\+\s*([^→()]+?)\s*→'
+    )
+    prev = None
+    while prev != text:
+        prev = text
+        text = inner.sub(
+            lambda m: f"→{m.group(1) or ''} {m.group(2)} →(+{m.group(3).strip()}) ",
+            text, count=1,
+        )
+
+    # First segment: "START + REAGENT → " ⇒ "START →(REAGENT) "
+    # (single '+' only; START must not itself be an unknown node)
+    first = re.match(
+        rf'^\s*(?!(?:{_UNKNOWN_NODE})\b)([A-Z][A-Za-z0-9₀-₉()]*)\s*\+\s*([^→+()]+?)\s*→',
+        text,
+    )
+    if first:
+        text = (
+            f"{first.group(1)} →({first.group(2).strip()}) "
+            + text[first.end():].lstrip()
+        )
+
+    text = re.sub(r'  +', ' ', text).strip()
+    if text != original.strip():
+        # ascii(): arrows/subscripts crash structlog on cp1251 Windows
+        # consoles, and the raised UnicodeEncodeError would kill extraction.
+        logger.info(
+            "chain_canonicalized",
+            before=ascii(original[:60]), after=ascii(text[:60]),
+        )
+    return text
+
+
+def _strip_inline_options(q: dict) -> None:
+    """
+    ISSUE 4(d): options extracted AND still sitting inside the stem as an
+    inline "A) ... B) ... C) ..." block → truncate the stem at the block.
+    Safety: only when >= 2 of the extracted option texts actually appear in
+    the removed tail, so a stem legitimately discussing "A)" is untouched.
+    """
+    opts = {k: v for k, v in (q.get("options") or {}).items() if v}
+    if len(opts) < 3:
+        return
+    stem = q.get("question_text") or ""
+    m = re.search(r'\bA\)\s*', stem)
+    if not m:
+        return
+    tail = stem[m.start():]
+    if "B)" not in tail or "C)" not in tail:
+        return
+    tail_norm = _fp_norm(tail)
+    hits = sum(
+        1 for v in opts.values()
+        if _fp_norm(str(v))[:12] and _fp_norm(str(v))[:12] in tail_norm
+    )
+    if hits >= 2:
+        q["question_text"] = stem[:m.start()].rstrip()
+        logger.info("inline_options_stripped", question=q.get("question_number"))
+
+
+# ── Unanswerable-question detection (ISSUE 2) ────────────────────────────────
+
+_ASK_VERBS = ("toping", "aniqlang", "hisoblang", "qaysi")
+_UNKNOWN_TOKEN_RE = re.compile(r'\b([XYZ]|[ABD])([₀-₉0-9])?\b')
+
+
+def find_unanswerable(questions: list[dict]) -> list[tuple[int, int, list[str]]]:
+    """
+    A question that ASKS about an unknown (X, A, B, D...) is unanswerable if
+    that symbol never appears in any of its given reactions/chains — a
+    reaction was lost at extraction. Only judged when the stem contains
+    reaction syntax at all ("A vitamini ..." in a biology test never trips).
+    Returns (section, number, missing_symbols).
+    """
+    out: list[tuple[int, int, list[str]]] = []
+    for q in questions:
+        stem = q.get("question_text") or ""
+        if "→" not in stem and "=" not in stem:
+            continue
+        parts = re.split(r'[.?!;\n]', stem)
+        ask = next(
+            (p for p in reversed(parts)
+             if any(v in p.lower() for v in _ASK_VERBS)),
+            None,
+        )
+        if not ask:
+            continue
+        reactions = " ".join(
+            p for p in parts if ("→" in p or "=" in p) and p is not ask
+        )
+        if not reactions:
+            continue
+        missing = sorted({
+            m.group(0) for m in _UNKNOWN_TOKEN_RE.finditer(ask)
+            if not re.search(rf'\b{re.escape(m.group(0))}\b', reactions)
+        })
+        if missing:
+            out.append((q.get("section", 1), q.get("question_number", 0), missing))
+            logger.warning(
+                "unanswerable_question",
+                question=q.get("question_number"), missing=missing,
+            )
+    return out
+
+
+# ── Export-time lint (ISSUE 6) ───────────────────────────────────────────────
+
+def export_lint(questions: list[dict]) -> list[tuple[int, str]]:
+    """
+    Content-shape checks run right before variant generation. Returns
+    (question_number, violation) pairs — surfaced to the teacher and logged,
+    so a regression can never ship silently.
+    """
+    violations: list[tuple[int, str]] = []
+    for q in questions:
+        n = q.get("question_number", 0)
+        stem = q.get("question_text") or ""
+
+        if re.match(r'\s*\d+\s*[.)]\s', stem):
+            violations.append((n, "stem_starts_with_number"))
+
+        desc = q.get("image_description") or ""
+        if desc:
+            dt = set(re.findall(r'[^\W_]{3,}', desc.lower()))
+            st = set(re.findall(r'[^\W_]{3,}', stem.lower()))
+            if dt and len(dt & st) / len(dt) >= 0.7:
+                violations.append((n, "desc_echoes_stem"))
+
+        opts = {k: v for k, v in (q.get("options") or {}).items() if v}
+        if len(opts) >= 4 and re.search(r'\bA\)', stem) and re.search(r'\bB\)', stem):
+            violations.append((n, "options_inside_stem"))
+
+    for _sec, n, missing in find_unanswerable(questions):
+        violations.append((n, "unanswerable:" + ",".join(missing)))
+
+    if violations:
+        logger.warning("export_lint_violations", violations=violations)
+    return violations
+
+
 def _is_open_ended(q: dict) -> bool:
     """
     BUG FIX: Detect questions that genuinely have no answer options.
@@ -760,6 +994,13 @@ class AIAnalyzer:
         # options fetch instead of silently becoming open-ended.
         unique = await self._recover_missing_questions(unique, images)
         unique = await self._recover_missing_options(unique, images)
+
+        # ── Post-extraction stem cleaning (ISSUES 1, 4b, 4d) ─────────────────
+        for q in unique:
+            _strip_own_number(q)
+            _strip_inline_options(q)
+            q["question_text"] = canonicalize_chain_text(q.get("question_text"))
+
         unique.sort(key=lambda x: (x.get("section", 1), x.get("question_number", 0)))
         logger.info("extraction_done", total=len(unique), pages=len(images))
         return unique
@@ -799,6 +1040,16 @@ class AIAnalyzer:
                 logger.warning("scheme_pdf_sizes_failed", error=str(e))
 
         for q in questions:
+            # ISSUE 4(a): a description that merely restates a chain already
+            # present in the stem is dropped before any other decision.
+            if q.get("image_description") and _desc_redundant(
+                q.get("question_text"), q["image_description"]
+            ):
+                logger.info(
+                    "redundant_desc_dropped", question=q.get("question_number")
+                )
+                q["image_description"] = None
+
             if not _needs_scheme(q) or _has_scheme_content(q):
                 continue
             n = q.get("question_number", 0)
@@ -843,13 +1094,24 @@ class AIAnalyzer:
                     logger.warning("scheme_transcribe_failed", question=n, error=str(e))
                     data = {}
                 chain = clean_latex(str(data.get("chain") or "")).strip()
-                if "→" in chain and FORMULA_RE.search(chain):
+                # Accept a chain (has arrows) OR verbatim TABLE rows
+                # ("1. <cell>; <cell>" lines) — never prose (ISSUE 4c).
+                is_chain = "→" in chain
+                is_table = (
+                    len(re.findall(r'^\d+\.\s', chain, re.M)) >= 2
+                )
+                if (is_chain or is_table) and FORMULA_RE.search(chain):
+                    if is_chain:
+                        chain = canonicalize_chain_text(chain)
                     q["question_text"] = (
                         str(q.get("question_text") or "").rstrip() + "\n" + chain
                     )
                     q["has_image"] = False
                     q["image_description"] = None
-                    logger.info("scheme_recovered_by_transcription", question=n)
+                    logger.info(
+                        "scheme_recovered_by_transcription",
+                        question=n, kind="table" if is_table else "chain",
+                    )
                     continue
                 desc = clean_latex(str(data.get("desc") or "")).strip()
                 if desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
@@ -919,6 +1181,11 @@ class AIAnalyzer:
                             and str(item.get("question_text") or "").strip()
                             and len(opts) != 1):
                         item["options"] = opts
+                        _strip_own_number(item)
+                        _strip_inline_options(item)
+                        item["question_text"] = canonicalize_chain_text(
+                            item.get("question_text")
+                        )
                         fresh[n] = item
                         logger.info("question_reextracted", question=n)
         return fresh
@@ -1517,6 +1784,7 @@ class AIAnalyzer:
                 "image_path": None,
                 "is_open_ended": False,  # will be set in extract_all_questions
                 "is_fragment": is_fragment,
+                "verbatim_doubt": bool(q.get("verbatim_doubt")),
                 "section_title": sec_title,
                 "group_id": group_id,
                 "group_context": group_context,

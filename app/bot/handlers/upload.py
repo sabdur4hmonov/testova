@@ -26,7 +26,9 @@ from app.services import storage
 from app.services.ai_analyzer import (
     AIAnalyzer,
     dedupe_questions,
+    export_lint,
     find_near_duplicates,
+    find_unanswerable,
     flag_suspicious_questions,
     summarize_sections,
 )
@@ -36,6 +38,8 @@ from app.services.file_processor import (
     docx_to_images,
     image_to_pages,
     pdf_to_images,
+    restore_list_markers,
+    save_debug_crops,
     split_two_column_pages,
 )
 from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
@@ -158,6 +162,21 @@ T = {
         "uz": "ℹ️ Qayta o'qishdan yangi natija olinmadi.",
         "en": "ℹ️ Re-reading produced no new result.",
         "ru": "ℹ️ Повторное чтение не дало нового результата.",
+    },
+    "unanswerable_info": {
+        "uz": "⛔ Javob berib bo'lmaydigan savollar (reaksiyasi yo'qolgan): {nums}\nAsl fayl bilan solishtiring.",
+        "en": "⛔ Unanswerable questions (a reaction was lost): {nums}\nCompare with the source file.",
+        "ru": "⛔ Вопросы без ответа (потеряна реакция): {nums}\nСверьте с исходным файлом.",
+    },
+    "ocr_fixed_info": {
+        "uz": "🧹 OCR tuzatishlari qo'llandi: {n} ta",
+        "en": "🧹 OCR corrections applied: {n}",
+        "ru": "🧹 Применено OCR-исправлений: {n}",
+    },
+    "lint_warnings": {
+        "uz": "🧪 Eksport tekshiruvidan o'tmagan savollar:\n{items}",
+        "en": "🧪 Export checks flagged these questions:\n{items}",
+        "ru": "🧪 Экспорт-проверка отметила вопросы:\n{items}",
     },
     "skipped_note": {
         "uz": "ℹ️ O'tkazib yuborilgan savollar (baholanmaydi): {nums}",
@@ -330,6 +349,15 @@ def _summary_message(meta: dict, quality: dict, lang: str) -> str:
             "suspicious_info", lang,
             nums=", ".join(str(s[1]) for s in susp),
         ))
+    unans = [u for u in quality.get("unanswerable", []) if u[0] == sec]
+    if unans:
+        lines.append(t(
+            "unanswerable_info", lang,
+            nums=", ".join(f"{u[1]} ({u[2]})" for u in unans),
+        ))
+    ocr = next((o[1] for o in quality.get("ocr_fixes", []) if o[0] == sec), 0)
+    if ocr:
+        lines.append(t("ocr_fixed_info", lang, n=ocr))
     return "\n\n".join(lines)
 
 
@@ -509,15 +537,74 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     scheme_failed = await analyzer.ensure_scheme_content(
         all_questions, images, _pdf_bytes_for_crop, col_map, src_pages
     )
+    # ISSUE 1: restore a swallowed list marker ("1)") from the source words
+    if _pdf_bytes_for_crop:
+        await asyncio.to_thread(
+            restore_list_markers, all_questions, _pdf_bytes_for_crop, col_map
+        )
+
+    # ISSUE 2: a question asking about an unknown that appears in no given
+    # reaction lost a reaction — one automatic strict re-extraction attempt.
+    unanswerable = find_unanswerable(all_questions)
+    if unanswerable:
+        nums = [u[1] for u in unanswerable]
+        # replace only by unambiguous number (sections can reuse numbers)
+        counts: dict[int, int] = {}
+        for q in all_questions:
+            counts[q.get("question_number", 0)] = counts.get(q.get("question_number", 0), 0) + 1
+        try:
+            fresh = await analyzer.reextract_questions(nums, all_questions, images)
+        except Exception as e:
+            logger.warning("unanswerable_reextract_failed", error=str(e))
+            fresh = {}
+        for q in all_questions:
+            n = q.get("question_number")
+            item = fresh.get(n)
+            if item and n in nums and counts.get(n) == 1:
+                q["question_text"] = item.get("question_text") or q["question_text"]
+                if item.get("options"):
+                    q["options"] = item["options"]
+                logger.info("unanswerable_reextracted", question=n)
+        unanswerable = find_unanswerable(all_questions)
+
     # FIX 5(c) + FIX 7: suspected near-duplicates and corrupted-content flags
     near_dups = find_near_duplicates(all_questions)
     suspicious = flag_suspicious_questions(all_questions)
+    # ISSUE 3: Gemini's own verbatim doubts join the suspicious list
+    flagged_nums = {(s[0], s[1]) for s in suspicious}
+    for q in all_questions:
+        key = (q.get("section", 1), q.get("question_number", 0))
+        if q.get("verbatim_doubt") and key not in flagged_nums:
+            suspicious.append((key[0], key[1], "verbatim_doubt"))
+            flagged_nums.add(key)
+
+    # ISSUE 3: debug crops for flagged questions so a human can compare the
+    # transcription against the source (paths in logs, never in the PDF).
+    if suspicious and _pdf_bytes_for_crop:
+        await asyncio.to_thread(
+            save_debug_crops,
+            all_questions,
+            [s[1] for s in suspicious],
+            _pdf_bytes_for_crop,
+            col_map,
+            src_pages,
+        )
+
+    # ISSUE 5: per-section OCR-correction totals for the summary
+    ocr_by_sec: dict[int, int] = {}
+    for q in all_questions:
+        if q.get("ocr_fixes"):
+            sec = q.get("section", 1)
+            ocr_by_sec[sec] = ocr_by_sec.get(sec, 0) + q["ocr_fixes"]
+
     quality = {
         "dups": [list(d) for d in dup_pairs],
         "siblings": [[s[0], list(s[1])] for s in sibling_groups],
         "scheme_failed": [list(f) for f in scheme_failed],
         "near_dups": [[g[0], list(g[1])] for g in near_dups],
         "suspicious": [list(s) for s in suspicious],
+        "unanswerable": [[u[0], u[1], ",".join(u[2])] for u in unanswerable],
+        "ocr_fixes": [[sec, n] for sec, n in sorted(ocr_by_sec.items())],
     }
 
     # ── Multi-test documents: detect sections, teacher picks ONE ─────────────
@@ -931,6 +1018,14 @@ async def _generate_and_send(
         }
         for q in questions
     ]
+
+    # ISSUE 6: export-time content lint — violations shown, never silent.
+    lint = export_lint(raw_qs)
+    if lint:
+        await message.answer(t(
+            "lint_warnings", lang,
+            items="\n".join(f"• {n}: {v}" for n, v in lint),
+        ))
 
     # BUG FIX: validate BEFORE export — reject blank/broken questions and
     # tell the teacher exactly which ones were excluded, instead of

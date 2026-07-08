@@ -629,6 +629,125 @@ def _crop_echoes_stem(
     return overlap >= threshold
 
 
+def restore_list_markers(
+    questions: list[dict],
+    pdf_bytes: bytes,
+    col_map: dict[int, dict] | None,
+) -> None:
+    """
+    ISSUE 1 (second half): after the question's own number was stripped from
+    the stem, check the SOURCE words — if the token right after the number
+    word is a list marker like "1)" and the stem doesn't start with it,
+    restore it (the extractor sometimes swallows the marker together with
+    the number). Best-effort, PDF-only, every restore logged.
+    """
+    if not pdf_bytes:
+        return
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+        words_cache: dict[int, list] = {}
+
+        for q in questions:
+            page = q.get("page_number")
+            mapping = (col_map or {}).get(page) if page else None
+            if not mapping or mapping["src_page"] not in sizes:
+                continue
+            src = mapping["src_page"]
+            if src not in words_cache:
+                words_cache[src] = doc[src - 1].get_text("words")
+            pdf_w = sizes[src][0]
+            x0, x1 = mapping["x0"] * pdf_w, mapping["x1"] * pdf_w
+            col_words = [
+                w for w in words_cache[src] if x0 <= (w[0] + w[2]) / 2 <= x1
+            ]
+            n = q.get("question_number")
+            nw = next(
+                (w for w in col_words
+                 if re.match(rf'^{n}[.)](?!\d)', str(w[4]))),
+                None,
+            )
+            if nw is None:
+                continue
+            # first word to the right on the same line
+            line = sorted(
+                [w for w in col_words if abs(w[1] - nw[1]) < 3 and w[0] > nw[0]],
+                key=lambda w: w[0],
+            )
+            if not line:
+                continue
+            mm = re.match(r'^(\d+[.)])(?!\d)', str(line[0][4]))
+            if not mm:
+                continue
+            marker = mm.group(1)
+            stem = q.get("question_text") or ""
+            if not stem.lstrip().startswith(marker):
+                q["question_text"] = f"{marker} {stem}"
+                logger.info(
+                    "list_marker_restored",
+                    question=n, marker=marker,
+                )
+        doc.close()
+    except Exception as e:
+        logger.warning("restore_list_markers_failed", error=str(e))
+
+
+def save_debug_crops(
+    questions: list[dict],
+    numbers: list[int],
+    pdf_bytes: bytes | None,
+    col_map: dict[int, dict] | None,
+    src_pages: list[PageImage] | None,
+    limit: int = 10,
+) -> dict[int, str]:
+    """
+    ISSUE 3: for flagged/suspicious questions, save an UNfiltered crop of the
+    question's source band so a human can eyeball the transcription against
+    the original. Debug artifacts only — never attached to the PDF.
+    """
+    if not pdf_bytes or not src_pages:
+        return {}
+    src_lookup = {p.page_number: p.image for p in src_pages}
+    saved: dict[int, str] = {}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        sizes = {i + 1: (p.rect.width, p.rect.height) for i, p in enumerate(doc)}
+        doc.close()
+    except Exception:
+        return {}
+
+    for q in questions:
+        n = q.get("question_number")
+        if n not in numbers or len(saved) >= limit:
+            continue
+        page = q.get("page_number")
+        mapping = (col_map or {}).get(page) if page else None
+        if not mapping or mapping["src_page"] not in src_lookup \
+                or mapping["src_page"] not in sizes:
+            continue
+        src = mapping["src_page"]
+        pdf_w, pdf_h = sizes[src]
+        x_range = (mapping["x0"] * pdf_w, mapping["x1"] * pdf_w)
+        band = _question_y_band(pdf_bytes, src, page, n, questions, pdf_h, x_range)
+        if not band:
+            continue
+        rect = fitz.Rect(x_range[0], max(0, band[0] - 4), x_range[1], band[1] + 4)
+        try:
+            img = src_lookup[src]
+            sx, sy = img.size[0] / pdf_w, img.size[1] / pdf_h
+            crop = img.crop((
+                int(rect.x0 * sx), int(rect.y0 * sy),
+                int(rect.x1 * sx), int(rect.y1 * sy),
+            ))
+            path = _ensure_image_dir() / f"debug_q{n}_p{src}_{uuid.uuid4().hex[:6]}.png"
+            crop.save(str(path), format="PNG")
+            saved[n] = str(path)
+            logger.info("debug_crop_saved", question=n, path=str(path))
+        except Exception as e:
+            logger.warning("debug_crop_failed", question=n, error=str(e))
+    return saved
+
+
 def recrop_scheme_region(
     pdf_bytes: bytes,
     src_page: int,
