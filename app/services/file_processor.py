@@ -26,6 +26,10 @@ SUPPORTED_MIME_TYPES = {
 # Where cropped question images are saved
 IMAGE_SAVE_DIR = Path("temp_images")
 DPI = 200  # must match pdf_to_images DPI
+# Figure crops are re-rendered straight from the PDF at this DPI so they are
+# sharp in the generated variants (the 200-DPI page render was blurry).
+# pdf_generator sizes images assuming this density — keep them in sync.
+CROP_DPI = 400
 
 # ── BUG FIX: Max ratio of image area vs page area.
 # If an embedded image covers >60% of the page, it's a scanned/watermarked
@@ -818,6 +822,7 @@ def recrop_scheme_region(
         question_number=q_num,
         page_number=src_page,
         padding_px=12,
+        pdf_bytes=pdf_bytes,
     )
 
 
@@ -830,12 +835,47 @@ def crop_and_save_image(
     question_number: int,
     page_number: int,
     padding_px: int = 8,
+    pdf_bytes: bytes | None = None,
 ) -> str | None:
     """
-    Crop a region from the page PIL image using PDF coordinates.
-    Converts PDF points → pixel coordinates using the page render DPI.
-    Saves the crop and returns its file path.
+    Crop a figure region and save it as PNG, returning the file path.
+
+    When pdf_bytes is available the region is RE-RENDERED straight from the
+    PDF at CROP_DPI via get_pixmap(clip=...) — sharp output regardless of the
+    200-DPI page render. Falls back to cropping the PIL page render.
     """
+    if pdf_bytes is not None:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page = doc[page_number - 1]
+            pad_pt = padding_px * 72.0 / DPI
+            clip = fitz.Rect(
+                max(0, rect_pdf.x0 - pad_pt),
+                max(0, rect_pdf.y0 - pad_pt),
+                min(page.rect.x1, rect_pdf.x1 + pad_pt),
+                min(page.rect.y1, rect_pdf.y1 + pad_pt),
+            )
+            zoom = CROP_DPI / 72.0
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+            doc.close()
+            if pix.width < 40 or pix.height < 40:
+                logger.warning("crop_too_small", q=question_number, page=page_number)
+                return None
+            save_dir = _ensure_image_dir()
+            filename = f"q{question_number}_p{page_number}_{uuid.uuid4().hex[:8]}.png"
+            save_path = save_dir / filename
+            pix.save(str(save_path))
+            logger.info(
+                "crop_saved_hidpi", question=question_number, page=page_number,
+                size=f"{pix.width}x{pix.height}", path=str(save_path),
+            )
+            return str(save_path)
+        except Exception as e:
+            logger.warning(
+                "hidpi_crop_failed", question=question_number, error=str(e)
+            )
+            # fall through to the PIL path
+
     try:
         pdf_w, pdf_h = page_pdf_size
         img_w, img_h = page_image.size
@@ -993,6 +1033,7 @@ def attach_images_to_questions(
                             page_pdf_size=pdf_page_sizes[src_page],
                             question_number=q_num,
                             page_number=src_page,
+                            pdf_bytes=pdf_bytes,
                         )
                     # FIX 3(a): rejected/missing figure → geometric re-crop
                     # of the stem→options region (garbage-checked again).

@@ -194,68 +194,241 @@ def generate_variants(
 
     for variant_num in range(1, count + 1):
         rng = random.Random(base_rng.randint(0, 2 ** 32))
-
-        # Shuffle units (reading groups move as one block)
-        order = list(range(len(units)))
-        for _ in range(200):
-            rng.shuffle(order)
-            key = tuple(order)
-            if key not in seen_orders:
-                seen_orders.add(key)
-                break
-
-        shuffled_units = [units[i] for i in order]
-
-        option_mapping: dict[str, dict[str, str]] = {}
-        answer_key: dict[str, str | None] = {}
-        resolved: list[dict[str, Any]] = []
-        pos = 0
-
-        for unit in shuffled_units:
-            unit_questions = unit["questions"]
-
-            # For reading groups: keep internal order, only shuffle options
-            # For single questions: shuffle options (order already handled at unit level)
-            for q in unit_questions:
-                pos += 1
-                q_id = str(q.get("question_id", q.get("id", uuid.uuid4())))
-                shuffled_opts, new_correct = _shuffle_options(q, rng)
-
-                # Build original→new letter map
-                orig_opts = q.get("options", {})
-                fwd_map: dict[str, str] = {}
-                for new_k, text in shuffled_opts.items():
-                    for orig_k, orig_text in orig_opts.items():
-                        if text == orig_text:
-                            fwd_map[orig_k] = new_k
-                            break
-
-                option_mapping[q_id] = fwd_map
-                answer_key[str(pos)] = new_correct
-
-                resolved.append({
-                    **q,
-                    "position_in_variant": pos,
-                    "options": shuffled_opts,
-                    "correct_answer": new_correct,
-                    # Only the first question in a reading group carries context
-                    # so the PDF prints the passage once before the block.
-                    "group_context": unit["group_context"] if q is unit["questions"][0] else None,
-                })
-
-        variants.append({
-            "variant_number": variant_num,
-            "question_order": [
-                str(q.get("question_id", q.get("id", "")))
-                for unit in shuffled_units
-                for q in unit["questions"]
-            ],
-            "option_mapping": option_mapping,
-            "answer_key": answer_key,
-            "questions_data": resolved,
-        })
-
+        variants.append(_generate_one_variant(units, variant_num, rng, seen_orders))
         logger.debug("variant_generated", variant=variant_num, units=len(units))
 
     logger.info("variants_complete", total=len(variants))
+    return variants
+
+
+def _generate_one_variant(
+    units: list[dict[str, Any]],
+    variant_num: int,
+    rng: random.Random,
+    seen_orders: set[tuple],
+) -> dict[str, Any]:
+    """Build ONE variant from the given units (shared by the single-file flow
+    and the Multi-Source Builder — the loop body of generate_variants,
+    extracted unchanged)."""
+    # Shuffle units (reading groups move as one block)
+    order = list(range(len(units)))
+    for _ in range(200):
+        rng.shuffle(order)
+        key = tuple(order)
+        if key not in seen_orders:
+            seen_orders.add(key)
+            break
+
+    shuffled_units = [units[i] for i in order]
+
+    option_mapping: dict[str, dict[str, str]] = {}
+    answer_key: dict[str, str | None] = {}
+    resolved: list[dict[str, Any]] = []
+    pos = 0
+
+    for unit in shuffled_units:
+        unit_questions = unit["questions"]
+
+        # For reading groups: keep internal order, only shuffle options
+        # For single questions: shuffle options (order already handled at unit level)
+        for q in unit_questions:
+            pos += 1
+            q_id = str(q.get("question_id", q.get("id", uuid.uuid4())))
+            shuffled_opts, new_correct = _shuffle_options(q, rng)
+
+            # Build original→new letter map
+            orig_opts = q.get("options", {})
+            fwd_map: dict[str, str] = {}
+            for new_k, text in shuffled_opts.items():
+                for orig_k, orig_text in orig_opts.items():
+                    if text == orig_text:
+                        fwd_map[orig_k] = new_k
+                        break
+
+            option_mapping[q_id] = fwd_map
+            answer_key[str(pos)] = new_correct
+
+            resolved.append({
+                **q,
+                "position_in_variant": pos,
+                "options": shuffled_opts,
+                "correct_answer": new_correct,
+                # Only the first question in a reading group carries context
+                # so the PDF prints the passage once before the block.
+                "group_context": unit["group_context"] if q is unit["questions"][0] else None,
+            })
+
+    return {
+        "variant_number": variant_num,
+        "question_order": [
+            str(q.get("question_id", q.get("id", "")))
+            for unit in shuffled_units
+            for q in unit["questions"]
+        ],
+        "option_mapping": option_mapping,
+        "answer_key": answer_key,
+        "questions_data": resolved,
+    }
+
+
+# ── Multi-Source Builder: pool assembly & selection ─────────────────────────────
+
+def assemble_pool(
+    questions_by_source: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[list], list[list]]:
+    """
+    Merge per-file question lists into one pool. Every question is tagged
+    with source_index; keys travel on the question dicts themselves (loaded
+    from each file's own DB rows), so original-numbering collisions between
+    files cannot touch answers (P6 — pool identity is the question_id UUID).
+
+    Cross-file EXACT duplicates are collapsed (keep the first-seen copy,
+    both sources credited — P4); siblings are kept and reported.
+
+    Returns (pool, collapsed_pairs, sibling_groups) where collapsed_pairs is
+    [[kept_source, kept_number, dup_source, dup_number], ...] (1-based
+    source indexes) and sibling_groups is [[source, number], ...] lists.
+    """
+    from app.services.ai_analyzer import question_fingerprint
+
+    pool: list[dict[str, Any]] = []
+    seen_fp: dict[str, dict] = {}
+    collapsed: list[list] = []
+
+    for src_idx, questions in enumerate(questions_by_source, start=1):
+        for q in questions:
+            q = {**q, "source_index": src_idx, "section": 1}
+            fp = question_fingerprint(q)
+            kept = seen_fp.get(fp)
+            if kept is not None and fp.replace(":", ""):
+                kept.setdefault("source_indexes", [kept["source_index"]])
+                if src_idx not in kept["source_indexes"]:
+                    kept["source_indexes"].append(src_idx)
+                collapsed.append([
+                    kept["source_index"], kept.get("question_number", 0),
+                    src_idx, q.get("question_number", 0),
+                ])
+                logger.info(
+                    "pool_duplicate_collapsed",
+                    kept=(kept["source_index"], kept.get("question_number")),
+                    dropped=(src_idx, q.get("question_number")),
+                )
+                continue
+            seen_fp[fp] = q
+            pool.append(q)
+
+    # Siblings across the pool (same stem, different content) — info only
+    from app.services.ai_analyzer import find_siblings
+    siblings = [
+        [src_num for src_num in nums]
+        for _sec, nums in find_siblings(pool)
+    ]
+    return pool, collapsed, siblings
+
+
+def predicted_reuse(pool_size: int, n_variants: int, m_per_variant: int) -> int:
+    """P8: upper bound on how many times a single question will be reused."""
+    if pool_size <= 0:
+        return 0
+    import math
+    return math.ceil((n_variants * m_per_variant) / pool_size)
+
+
+def select_for_variants(
+    questions: list[dict[str, Any]],
+    n_variants: int,
+    m_per_variant: int,
+    seed: int | None = None,
+) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
+    """
+    Choose M questions for each of N variants from the pool.
+
+    Rules:
+    - group questions are atomic units; the whole group is taken and its
+      size counts toward M (a unit that would overshoot M is skipped)
+    - least-used units first, random among ties → reuse is minimized and
+      spread evenly when the pool is smaller than N×M
+    - no duplicate content within one variant (unit identity + fingerprint)
+
+    Returns (selections, stats) where stats carries max_reuse, reused unit
+    previews and any per-variant shortfalls (M unreachable exactly).
+    """
+    from app.services.ai_analyzer import question_fingerprint
+
+    units = _build_units(questions)
+    if not units:
+        raise ValueError("Cannot select from an empty pool")
+    unit_fps = [
+        {question_fingerprint(q) for q in u["questions"]} for u in units
+    ]
+    usage = [0] * len(units)
+    rng = random.Random(seed)
+
+    selections: list[list[dict[str, Any]]] = []
+    shortfalls: list[tuple[int, int]] = []  # (variant_number, got)
+
+    for v in range(1, n_variants + 1):
+        remaining = m_per_variant
+        chosen_idx: list[int] = []
+        chosen_fps: set[str] = set()
+
+        candidates = sorted(range(len(units)), key=lambda i: (usage[i], rng.random()))
+        for i in candidates:
+            size = len(units[i]["questions"])
+            if size > remaining:
+                continue
+            if chosen_fps & unit_fps[i]:
+                continue  # identical content already in this variant
+            chosen_idx.append(i)
+            chosen_fps |= unit_fps[i]
+            usage[i] += 1
+            remaining -= size
+            if remaining == 0:
+                break
+
+        if remaining > 0:
+            shortfalls.append((v, m_per_variant - remaining))
+            logger.warning(
+                "variant_selection_shortfall",
+                variant=v, wanted=m_per_variant, got=m_per_variant - remaining,
+            )
+        selections.append([
+            q for i in chosen_idx for q in units[i]["questions"]
+        ])
+
+    reused = [
+        units[i]["questions"][0].get("question_number", 0)
+        for i in range(len(units)) if usage[i] > 1
+    ]
+    stats = {
+        "max_reuse": max(usage) if usage else 0,
+        "reused_count": len(reused),
+        "reused_numbers": sorted(reused)[:20],
+        "shortfalls": shortfalls,
+    }
+    return selections, stats
+
+
+def generate_pool_variants(
+    selections: list[list[dict[str, Any]]],
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """Build one variant per pre-selected question list, through the SAME
+    machinery as the single-file flow (validation + _generate_one_variant)."""
+    base_rng = random.Random(seed)
+    seen_orders: set[tuple] = set()
+    variants: list[dict[str, Any]] = []
+    for i, selection in enumerate(selections, start=1):
+        valid, rejected = validate_questions(selection)
+        if rejected:
+            logger.warning(
+                "pool_variant_rejects", variant=i,
+                rejected=[r["question_number"] for r in rejected],
+            )
+        if not valid:
+            raise ValueError(f"Variant {i}: no valid questions selected")
+        units = _build_units(valid)
+        rng = random.Random(base_rng.randint(0, 2 ** 32))
+        variants.append(_generate_one_variant(units, i, rng, seen_orders))
+    logger.info("pool_variants_complete", total=len(variants))
     return variants

@@ -25,26 +25,17 @@ from app.services import storage
 from app.services import storage
 from app.services.ai_analyzer import (
     AIAnalyzer,
-    collapse_sections,
     export_lint,
     find_exact_duplicates,
-    find_near_duplicates,
-    find_siblings,
-    find_unanswerable,
-    flag_suspicious_questions,
-    sections_confident,
-    summarize_sections,
 )
 from app.services.file_processor import (
-    attach_images_to_questions,
     detect_file_type,
     docx_to_images,
     image_to_pages,
     pdf_to_images,
-    restore_list_markers,
-    save_debug_crops,
     split_two_column_pages,
 )
+from app.services.pipeline import PipelineResult, process_file
 from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
 from app.services.variant_generator import generate_variants, validate_questions
 from app.utils.logging import get_logger
@@ -276,47 +267,6 @@ def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
     return result
 
 
-async def _persist_questions(project_id: str, questions: list[dict]) -> None:
-    """Save extracted questions and mark the project completed."""
-    async with async_session_factory() as session:
-        for rq in questions:
-            opts = rq.get("options", {})
-            if opts.get("E"):
-                # BUG FIX (#9): the questions table only has option_a..option_d
-                # columns, so a 5th option cannot be persisted. Don't lose it
-                # silently — full E support needs an option_e column/migration.
-                logger.warning(
-                    "option_e_dropped_at_persistence",
-                    project_id=project_id,
-                    question=rq.get("question_number"),
-                )
-            session.add(Question(
-                project_id=uuid.UUID(project_id),
-                question_number=rq.get("question_number", 0),
-                question_text=rq.get("question_text", ""),
-                option_a=opts.get("A"),
-                option_b=opts.get("B"),
-                option_c=opts.get("C"),
-                option_d=opts.get("D"),
-                correct_answer=rq.get("correct_answer"),
-                has_image=rq.get("has_image", False),
-                image_path=rq.get("image_path"),
-                image_description=rq.get("image_description"),
-                group_id=rq.get("group_id"),
-                group_context=rq.get("group_context"),
-                page_number=rq.get("page_number"),
-            ))
-
-        from sqlalchemy import select
-        res = await session.execute(
-            select(Project).where(Project.id == uuid.UUID(project_id))
-        )
-        p = res.scalar_one()
-        p.status = ProjectStatus.COMPLETED
-        p.question_count = len(questions)
-        await session.commit()
-
-
 def _summary_message(meta: dict, quality: dict, lang: str) -> str:
     """
     ONE combined post-extraction summary for a section, in this order:
@@ -377,6 +327,111 @@ def _summary_message(meta: dict, quality: dict, lang: str) -> str:
 
 def _section_suspicious(quality: dict, sec: int) -> list:
     return [s for s in quality.get("suspicious", []) if s[0] == sec]
+
+
+async def run_pipeline_with_heartbeat(
+    status_msg, content: bytes, file_type: str, project_id: str
+) -> PipelineResult:
+    """Run the shared extraction pipeline while keeping the status message
+    alive. Used by BOTH the single-file flow and the Multi-Source Builder."""
+    stop_hb = asyncio.Event()
+
+    async def _heartbeat() -> None:
+        icons = ["⏳", "🔍", "📖", "🤖"]
+        i = 0
+        while not stop_hb.is_set():
+            try:
+                await status_msg.edit_text(f"{icons[i % len(icons)]} Tahlil qilinmoqda...")
+            except Exception:
+                pass
+            i += 1
+            await asyncio.sleep(8)
+
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        return await process_file(content, file_type, project_id)
+    finally:
+        stop_hb.set()
+        hb_task.cancel()
+
+
+async def apply_key_text(
+    project_id: str,
+    text: str,
+    key_max: int,
+    answers: dict,
+    lang: str,
+) -> tuple[list[str], bool, dict]:
+    """
+    Shared answer-key entry core (single-file flow AND Multi-Source Builder):
+    parse → per-entry validation → PARTIAL save (every good line applies) →
+    completeness by the project's own question numbers.
+
+    Returns (reply_parts, complete, updated_answers).
+    """
+    updates = _parse_answer_input(text, key_max)
+    if not updates:
+        return [t("key_bad", lang, bad=text[:60])], False, answers
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(Question.project_id == uuid.UUID(project_id))
+        )
+        rows = res.scalars().all()
+
+        letters_by_num: dict[int, set[str]] = {
+            r.question_number: {
+                L for L, v in zip(
+                    "ABCD", (r.option_a, r.option_b, r.option_c, r.option_d)
+                ) if v and str(v).strip()
+            }
+            for r in rows
+        }
+
+        good: dict[str, str] = {}
+        bad_lines: list[str] = []
+        for num_str, letter in updates.items():
+            avail = letters_by_num.get(int(num_str))
+            if avail is None:
+                bad_lines.append(_key_reason(
+                    "no_question", lang, n=num_str,
+                    L="" if letter == "-" else letter,
+                ))
+            elif letter == "-":
+                good[num_str] = "-"  # explicit skip for an existing question
+            elif not avail:
+                bad_lines.append(_key_reason("open", lang, n=num_str, L=letter))
+            elif letter not in avail:
+                bad_lines.append(_key_reason(
+                    "bad_letter", lang, n=num_str, L=letter,
+                    avail=", ".join(sorted(avail)),
+                ))
+            else:
+                good[num_str] = letter
+
+        for r in rows:
+            val = good.get(str(r.question_number))
+            if val and val != "-":
+                r.correct_answer = val
+        await session.commit()
+
+    answers = {**answers, **good}
+
+    reply_parts: list[str] = []
+    if bad_lines:
+        reply_parts.append(t("key_bad", lang, bad="\n".join(bad_lines)))
+
+    still_missing = [
+        str(n) for n, avail in sorted(letters_by_num.items())
+        if avail and not answers.get(str(n))
+    ]
+    if still_missing:
+        reply_parts.append(t(
+            "key_incomplete", lang, missing=", ".join(still_missing),
+        ))
+    complete = not still_missing and not bad_lines
+    return reply_parts, complete, answers
 
 
 def _dup_answers_match(group: dict) -> bool:
@@ -515,218 +570,48 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         session.add(project)
         await session.commit()
 
-    # ── Convert to page images ────────────────────────────────────────────────
-    if file_type == "pdf":
-        raw_pages = await asyncio.to_thread(pdf_to_images, content)
-    elif file_type == "docx":
-        raw_pages, _ = await asyncio.to_thread(docx_to_images, content)
-        if not raw_pages:
-            await status_msg.edit_text(t("no_q", lang))
-            await state.clear()
-            return
-    else:
-        raw_pages = await asyncio.to_thread(image_to_pages, content)
+    # ── The pipeline (services/pipeline.py) does everything else ──────────────
+    result = await run_pipeline_with_heartbeat(status_msg, content, file_type, project_id)
 
-    src_pages = raw_pages[:MAX_PAGES]
-
-    # ── Two-column pages → single-column halves in reading order ─────────────
-    # Gemini never sees a two-column layout: interleaving becomes impossible
-    # and figure-region geometry stays within the correct column. Single-
-    # column pages pass through unchanged.
-    page_images, col_map = await asyncio.to_thread(split_two_column_pages, src_pages)
-    images = [p.image for p in page_images]
-
-    # ── Extract via Gemini Vision ─────────────────────────────────────────────
-    analyzer = AIAnalyzer()
-    stop_hb  = asyncio.Event()
-
-    async def _heartbeat() -> None:
-        icons = ["⏳", "🔍", "📖", "🤖"]
-        i = 0
-        while not stop_hb.is_set():
-            try:
-                await status_msg.edit_text(f"{icons[i % len(icons)]} Tahlil qilinmoqda...")
-            except Exception:
-                pass
-            i += 1
-            await asyncio.sleep(8)
-
-    hb_task = asyncio.create_task(_heartbeat())
-    try:
-        all_questions = await analyzer.extract_all_questions(images=images)
-    finally:
-        stop_hb.set()
-        hb_task.cancel()
-
-    if not all_questions:
-        async with async_session_factory() as session:
-            from sqlalchemy import select
-            from app.models.project import Project as PModel
-            res = await session.execute(
-                select(PModel).where(PModel.id == uuid.UUID(project_id))
-            )
-            p = res.scalar_one()
-            p.status = ProjectStatus.FAILED
-            await session.commit()
+    if result.status == "no_questions":
         await status_msg.edit_text(t("no_q", lang))
         await state.clear()
         return
 
-    # ── CHANGE 1: multi-test files are politely refused ───────────────────────
-    # Confident detection (>= 2 sections, each >= 4 questions) → one refusal
-    # message, project failed cleanly, state back to waiting_for_file so the
-    # teacher can immediately send each test as its own file. A borderline
-    # split is treated as detection noise and collapsed to a single test.
-    sections = summarize_sections(all_questions)
-    if len(sections) > 1:
-        if sections_confident(sections):
-            ranges = " va ".join(f"1–{m['max']}" for m in sections)
-            async with async_session_factory() as session:
-                from sqlalchemy import select
-                res = await session.execute(
-                    select(Project).where(Project.id == uuid.UUID(project_id))
-                )
-                p = res.scalar_one()
-                p.status = ProjectStatus.FAILED
-                p.error_message = "multi-section file refused"
-                await session.commit()
-            await state.set_state(UploadStates.waiting_for_file)
-            await status_msg.edit_text(
-                t("multi_refused", lang, n=len(sections), ranges=ranges),
-                parse_mode="HTML",
-            )
-            logger.info(
-                "multi_section_refused",
-                project_id=project_id, sections=len(sections),
-            )
-            return
-        all_questions = collapse_sections(all_questions)
-
-    # ── Attach images — precise crop using PyMuPDF rects ─────────────────────
-    _pdf_bytes_for_crop = content if file_type == "pdf" else None
-    all_questions = await asyncio.to_thread(
-        attach_images_to_questions,
-        all_questions,
-        page_images,
-        _pdf_bytes_for_crop,
-        col_map,
-        src_pages,
-    )
-
-    # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
-    scheme_failed = await analyzer.ensure_scheme_content(
-        all_questions, images, _pdf_bytes_for_crop, col_map, src_pages
-    )
-    # ISSUE 1: restore a swallowed list marker ("1)") from the source words
-    if _pdf_bytes_for_crop:
-        await asyncio.to_thread(
-            restore_list_markers, all_questions, _pdf_bytes_for_crop, col_map
+    if result.status == "refused_multi_section":
+        await state.set_state(UploadStates.waiting_for_file)
+        await status_msg.edit_text(
+            t("multi_refused", lang, n=result.refused_n, ranges=result.refused_ranges),
+            parse_mode="HTML",
         )
-
-    # ISSUE 2: a question asking about an unknown that appears in no given
-    # reaction lost a reaction — one automatic strict re-extraction attempt.
-    unanswerable = find_unanswerable(all_questions)
-    if unanswerable:
-        nums = [u[1] for u in unanswerable]
-        # replace only by unambiguous number (sections can reuse numbers)
-        counts: dict[int, int] = {}
-        for q in all_questions:
-            counts[q.get("question_number", 0)] = counts.get(q.get("question_number", 0), 0) + 1
-        try:
-            fresh = await analyzer.reextract_questions(nums, all_questions, images)
-        except Exception as e:
-            logger.warning("unanswerable_reextract_failed", error=str(e))
-            fresh = {}
-        for q in all_questions:
-            n = q.get("question_number")
-            item = fresh.get(n)
-            if item and n in nums and counts.get(n) == 1:
-                q["question_text"] = item.get("question_text") or q["question_text"]
-                if item.get("options"):
-                    q["options"] = item["options"]
-                logger.info("unanswerable_reextracted", question=n)
-        unanswerable = find_unanswerable(all_questions)
-
-    # FIX 5(c) + FIX 7: suspected near-duplicates and corrupted-content flags
-    near_dups = find_near_duplicates(all_questions)
-    suspicious = flag_suspicious_questions(all_questions)
-    # ISSUE 3: Gemini's own verbatim doubts join the suspicious list
-    flagged_nums = {(s[0], s[1]) for s in suspicious}
-    for q in all_questions:
-        key = (q.get("section", 1), q.get("question_number", 0))
-        if q.get("verbatim_doubt") and key not in flagged_nums:
-            suspicious.append((key[0], key[1], "verbatim_doubt"))
-            flagged_nums.add(key)
-
-    # ISSUE 3: debug crops for flagged questions so a human can compare the
-    # transcription against the source (paths in logs, never in the PDF).
-    if suspicious and _pdf_bytes_for_crop:
-        await asyncio.to_thread(
-            save_debug_crops,
-            all_questions,
-            [s[1] for s in suspicious],
-            _pdf_bytes_for_crop,
-            col_map,
-            src_pages,
-        )
-
-    # ISSUE 5: per-section OCR-correction totals for the summary
-    ocr_by_sec: dict[int, int] = {}
-    for q in all_questions:
-        if q.get("ocr_fixes"):
-            sec = q.get("section", 1)
-            ocr_by_sec[sec] = ocr_by_sec.get(sec, 0) + q["ocr_fixes"]
-
-    quality = {
-        "siblings": [[s[0], list(s[1])] for s in find_siblings(all_questions)],
-        "scheme_failed": [list(f) for f in scheme_failed],
-        "near_dups": [[g[0], list(g[1])] for g in near_dups],
-        "suspicious": [list(s) for s in suspicious],
-        "unanswerable": [[u[0], u[1], ",".join(u[2])] for u in unanswerable],
-        "ocr_fixes": [[sec, n] for sec, n in sorted(ocr_by_sec.items())],
-    }
-
-    # CHANGE 2: NOTHING is removed at extraction time. The pool is ALL
-    # extracted questions; duplicates are detected and resolved by the
-    # teacher AFTER the full answer key is entered.
-    sections = summarize_sections(all_questions)
-
-    await _persist_questions(project_id, all_questions)
-
-    detected: dict[str, str | None] = {
-        str(q.get("question_number", i + 1)): q.get("correct_answer")
-        for i, q in enumerate(all_questions)
-    }
-    missing_nums = sorted(
-        [num for num, ans in detected.items() if not ans],
-        key=lambda x: int(x),
-    )
+        return
 
     await state.update_data(
         project_id=project_id,
-        question_count=len(all_questions),
-        answers=detected,
-        quality=quality,
+        question_count=len(result.questions),
+        answers=result.detected,
+        quality=result.quality,
         # Numbering can exceed the question count (gaps): parse the
         # teacher's key against the real max number, not the count.
-        key_max=sections[0]["max"],
+        key_max=result.key_max,
     )
     await state.set_state(UploadStates.waiting_for_answers)
 
-    n = len(all_questions)
-    if missing_nums:
+    n = len(result.questions)
+    if result.missing_nums:
         await status_msg.edit_text(
-            t("ans_missing", lang, n=n, missing=", ".join(missing_nums)),
+            t("ans_missing", lang, n=n, missing=", ".join(result.missing_nums)),
             parse_mode="HTML",
         )
     else:
         await status_msg.edit_text(t("ans_all", lang, n=n), parse_mode="HTML")
 
     await message.answer(
-        _summary_message(sections[0], quality, lang),
+        _summary_message(result.sections[0], result.quality, lang),
         reply_markup=(
             reextract_keyboard(lang)
-            if _section_suspicious(quality, sections[0]["section"]) else None
+            if _section_suspicious(result.quality, result.sections[0]["section"])
+            else None
         ),
     )
 
@@ -832,81 +717,17 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
     skip = text in ("-", "—", "skip", "o'tkazib", "otkazib", "пропустить")
 
     if not skip and text:
-        key_max = data.get("key_max") or question_count
-        updates = _parse_answer_input(text, key_max)
-        if not updates:
-            await message.answer(t("key_bad", lang, bad=text[:60]), parse_mode="HTML")
-            return
-
         # CHANGE 2: every original number is a real DB row at this point —
         # no remapping, no duplicate special cases. Duplicates are resolved
         # by the teacher AFTER the key completes.
-
-        # ── FIX 3: partial save — validate per entry, apply every good one ────
-        async with async_session_factory() as session:
-            from sqlalchemy import select
-            res = await session.execute(
-                select(Question).where(Question.project_id == uuid.UUID(project_id))
-            )
-            rows = res.scalars().all()
-
-            letters_by_num: dict[int, set[str]] = {
-                r.question_number: {
-                    L for L, v in zip(
-                        "ABCD", (r.option_a, r.option_b, r.option_c, r.option_d)
-                    ) if v and str(v).strip()
-                }
-                for r in rows
-            }
-
-            good: dict[str, str] = {}
-            bad_lines: list[str] = []
-            for num_str, letter in updates.items():
-                avail = letters_by_num.get(int(num_str))
-                if avail is None:
-                    bad_lines.append(_key_reason(
-                        "no_question", lang, n=num_str,
-                        L="" if letter == "-" else letter,
-                    ))
-                elif letter == "-":
-                    good[num_str] = "-"  # explicit skip for an existing question
-                elif not avail:
-                    bad_lines.append(_key_reason("open", lang, n=num_str, L=letter))
-                elif letter not in avail:
-                    bad_lines.append(_key_reason(
-                        "bad_letter", lang, n=num_str, L=letter,
-                        avail=", ".join(sorted(avail)),
-                    ))
-                else:
-                    good[num_str] = letter
-
-            for r in rows:
-                val = good.get(str(r.question_number))
-                if val and val != "-":
-                    r.correct_answer = val
-            await session.commit()
-
-        answers.update(good)
+        key_max = data.get("key_max") or question_count
+        reply_parts, complete, answers = await apply_key_text(
+            project_id, text, key_max, answers, lang
+        )
         await state.update_data(answers=answers)
-
-        # ── One combined reply: per-line issues + exact remaining numbers ────
-        reply_parts: list[str] = []
-        if bad_lines:
-            reply_parts.append(t("key_bad", lang, bad="\n".join(bad_lines)))
-
-        # Completeness: EXACT remaining numbers, never a count (skips count
-        # as answered; they're excluded from grading and listed later).
-        still_missing = [
-            str(n) for n, avail in sorted(letters_by_num.items())
-            if avail and not answers.get(str(n))
-        ]
-        if still_missing:
-            reply_parts.append(t(
-                "key_incomplete", lang, missing=", ".join(still_missing),
-            ))
         if reply_parts:
             await message.answer("\n\n".join(reply_parts), parse_mode="HTML")
-        if still_missing or bad_lines:
+        if not complete:
             return
 
     # ── CHANGE 2: key complete → duplicates go to the teacher ────────────────

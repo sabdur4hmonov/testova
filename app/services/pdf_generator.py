@@ -202,6 +202,7 @@ def _load_image_rl(image_path: str, max_width: float = 10 * cm) -> RLImage | Non
     """
     img_bytes = _load_image_bytes(image_path)
     if not img_bytes:
+        logger.warning("variant_image_missing", path=image_path)
         return None
     try:
         buf = io.BytesIO(img_bytes)
@@ -210,8 +211,13 @@ def _load_image_rl(image_path: str, max_width: float = 10 * cm) -> RLImage | Non
         # BUG FIX: keep buf alive — attach it to the object so GC won't collect it
         rl_img._buf_ref = buf
 
+        # DPI-aware sizing: crops are rendered at CROP_DPI, so their true
+        # physical size is pixels/CROP_DPI inches. Cap at the column width,
+        # NEVER upscale a small crop past its natural print size.
+        from app.services.file_processor import CROP_DPI
+        natural_w_pt = rl_img.imageWidth * 72.0 / CROP_DPI
         aspect = rl_img.imageHeight / rl_img.imageWidth
-        rl_img.drawWidth  = min(max_width, rl_img.imageWidth)
+        rl_img.drawWidth  = min(max_width, natural_w_pt)
         rl_img.drawHeight = rl_img.drawWidth * aspect
 
         # Cap height so it never overflows a page
@@ -313,7 +319,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 img_desc = q.get("image_description")
 
                 if img_path:
-                    img_flow = _load_image_rl(img_path, max_width=available_w * 0.85)
+                    img_flow = _load_image_rl(img_path, max_width=available_w * 0.80)
                     if img_flow:
                         story.append(Spacer(1, 2 * mm))
                         # BUG FIX: added left/right padding so image doesn't
