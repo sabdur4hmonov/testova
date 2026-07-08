@@ -423,16 +423,24 @@ def select_for_variants(
     return selections, stats
 
 
-def generate_pool_variants(
+def pool_variant_builder(
     selections: list[list[dict[str, Any]]],
     seed: int | None = None,
-) -> list[dict[str, Any]]:
-    """Build one variant per pre-selected question list, through the SAME
-    machinery as the single-file flow (validation + _generate_one_variant)."""
+):
+    """
+    Return (total, build_one) where build_one(i) constructs the i-th variant
+    (1-based) from its pre-selected question list, through the SAME machinery
+    as the single-file flow (validation + _generate_one_variant).
+
+    The builder is a pure, fast, SYNC closure holding the shared rng/seen_orders
+    state — callers drive the loop so they can add per-variant progress and a
+    per-variant timeout (generation must never hang silently).
+    """
     base_rng = random.Random(seed)
     seen_orders: set[tuple] = set()
-    variants: list[dict[str, Any]] = []
-    for i, selection in enumerate(selections, start=1):
+
+    def build_one(i: int) -> dict[str, Any]:
+        selection = selections[i - 1]
         valid, rejected = validate_questions(selection)
         if rejected:
             logger.warning(
@@ -443,6 +451,17 @@ def generate_pool_variants(
             raise ValueError(f"Variant {i}: no valid questions selected")
         units = _build_units(valid)
         rng = random.Random(base_rng.randint(0, 2 ** 32))
-        variants.append(_generate_one_variant(units, i, rng, seen_orders))
+        return _generate_one_variant(units, i, rng, seen_orders)
+
+    return len(selections), build_one
+
+
+def generate_pool_variants(
+    selections: list[list[dict[str, Any]]],
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """Build all variants at once (used by tests and any synchronous caller)."""
+    total, build_one = pool_variant_builder(selections, seed)
+    variants = [build_one(i) for i in range(1, total + 1)]
     logger.info("pool_variants_complete", total=len(variants))
     return variants

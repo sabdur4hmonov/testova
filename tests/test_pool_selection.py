@@ -8,9 +8,11 @@ from app.models.builder import default_expiry, is_expired
 from app.services.variant_generator import (
     assemble_pool,
     generate_pool_variants,
+    pool_variant_builder,
     predicted_reuse,
     select_for_variants,
 )
+from app.services.ai_analyzer import question_fingerprint
 
 
 def _q(n, text=None, opts=None, qid=None, gid=None, ctx=None, correct="A"):
@@ -118,6 +120,49 @@ def test_generate_pool_variants_round_trip():
         assert len(v["answer_key"]) == 8
         result = check_answers(dict(v["answer_key"]), v["answer_key"])
         assert result.score_percent == 100.0
+
+
+# ── Generation must be fast + safe, even under forced reuse ──────────────────
+
+def test_full_generation_fast_and_no_dup_under_reuse():
+    import time
+    # 60 questions: some with images, some in reading groups
+    pool = []
+    for n in range(1, 55):
+        q = _q(n)
+        if n % 7 == 0:
+            q["has_image"] = True
+            q["image_path"] = f"temp_images/q{n}.png"  # may not exist — must not hang
+        pool.append(q)
+    # two 3-question groups
+    for gid, base in (("g1", 55), ("g2", 58)):
+        for k in range(3):
+            pool.append(_q(base + k, gid=gid, ctx="Matn" if k == 0 else None))
+    assert len(pool) == 60
+
+    # 10 × 30 = 300 needed from 60 → every question reused ~5×
+    t0 = time.monotonic()
+    selections, stats = select_for_variants(pool, 10, 30, seed=1)
+    total, build_one = pool_variant_builder(selections)
+    variants = [build_one(i) for i in range(1, total + 1)]
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 5.0, f"generation took {elapsed:.1f}s — too slow"
+    assert len(variants) == 10
+    assert stats["max_reuse"] >= 4  # reuse genuinely required
+
+    # No duplicate question CONTENT within any single variant
+    for v in variants:
+        fps = [question_fingerprint(q) for q in v["questions_data"]]
+        assert len(fps) == len(set(fps)), f"variant {v['variant_number']} has a dup"
+
+
+def test_pool_variant_builder_matches_batch():
+    selections, _ = select_for_variants(_pool(20), 3, 8, seed=9)
+    total, build_one = pool_variant_builder(selections, seed=9)
+    driven = [build_one(i) for i in range(1, total + 1)]
+    batch = generate_pool_variants(selections, seed=9)
+    assert [v["answer_key"] for v in driven] == [v["answer_key"] for v in batch]
 
 
 # ── P8 math ───────────────────────────────────────────────────────────────────

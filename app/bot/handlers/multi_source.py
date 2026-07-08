@@ -53,7 +53,7 @@ from app.services.file_processor import detect_file_type
 from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
 from app.services.variant_generator import (
     assemble_pool,
-    generate_pool_variants,
+    pool_variant_builder,
     predicted_reuse,
     select_for_variants,
 )
@@ -139,6 +139,16 @@ BT = {
         "uz": "⚠️ Bank {pool} ta savol, kerak {need} ta ({n}×{m}) — savollar takrorlanadi.\nHar bir savol o'rtacha {avg:.1f}, eng ko'pi {mx} marta ishlatiladi. Davom etamizmi?",
         "en": "⚠️ Pool has {pool} questions but {need} are needed ({n}×{m}) — questions will repeat.\nAverage use {avg:.1f}, maximum {mx} per question. Proceed?",
         "ru": "⚠️ В банке {pool} вопросов, а нужно {need} ({n}×{m}) — вопросы будут повторяться.\nВ среднем {avg:.1f}, максимум {mx} раза на вопрос. Продолжить?",
+    },
+    "gen_progress": {
+        "uz": "📄 {i}/{n}-variant tayyorlanmoqda...",
+        "en": "📄 Preparing variant {i}/{n}...",
+        "ru": "📄 Готовлю вариант {i}/{n}...",
+    },
+    "gen_error": {
+        "uz": "❌ Variantlarni yaratishda xatolik yuz berdi. Qayta urinib ko'ring — sessiyangiz saqlanib qoldi.",
+        "en": "❌ Something went wrong generating the variants. Please try again — your session is intact.",
+        "ru": "❌ Ошибка при создании вариантов. Попробуйте ещё раз — сессия сохранена.",
     },
     "generated": {
         "uz": "✅ Tayyor! {n} ta variant ({m} tadan savol).{reuse_note}",
@@ -668,6 +678,11 @@ async def handle_reuse_edit(callback: CallbackQuery, state: FSMContext, db_user:
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
+PER_VARIANT_TIMEOUT = 30    # seconds — one variant is pure shuffle, must be instant
+PDF_BUILD_TIMEOUT = 120     # seconds — the whole PDF render
+OVERALL_TIMEOUT = 300       # seconds — absolute wall for the whole sequence
+
+
 async def _generate_from_pool(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
     data = await state.get_data()
@@ -676,14 +691,64 @@ async def _generate_from_pool(message: Message, state: FSMContext, db_user: User
     m = data.get("m_per_variant", 1)
 
     status = await message.answer(ut("generating", lang, n=n))
+    try:
+        await asyncio.wait_for(
+            _do_generate(message, state, db_user, session_id, n, m, status, lang),
+            timeout=OVERALL_TIMEOUT,
+        )
+    except Exception as e:
+        # Generation is pure local computation — any hang/error surfaces here
+        # as an explicit message; the session is preserved so the teacher can
+        # retry. NEVER leave the teacher staring at infinite silence.
+        logger.error(
+            "builder_generation_failed",
+            session_id=session_id, n=n, m=m,
+            error=str(e), error_type=type(e).__name__,
+        )
+        try:
+            await status.edit_text(bt("gen_error", lang))
+        except Exception:
+            await message.answer(bt("gen_error", lang))
+        await state.set_state(BuilderStates.waiting_for_variant_count)
+        await message.answer(bt("ask_variants", lang, max=MAX_VARIANTS))
 
+
+async def _do_generate(
+    message: Message, state: FSMContext, db_user: User,
+    session_id: str, n: int, m: int, status, lang: str,
+) -> None:
     pool, _collapsed, _siblings, _sources = await _load_pool(session_id)
-    selections, stats = select_for_variants(pool, n, m)
-    variants = await asyncio.to_thread(generate_pool_variants, selections)
+
+    # Selection is pure CPU — run OFF the event loop so it can never block the
+    # whole bot, and bound it so a pathological pool can't spin forever.
+    selections, stats = await asyncio.wait_for(
+        asyncio.to_thread(select_for_variants, pool, n, m),
+        timeout=PER_VARIANT_TIMEOUT,
+    )
+
+    # Build variants ONE AT A TIME with per-variant progress + timeout, so a
+    # hang is pinned to the exact variant instead of vanishing into silence.
+    total, build_one = pool_variant_builder(selections)
+    variants = []
+    for i in range(1, total + 1):
+        variants.append(await asyncio.wait_for(
+            asyncio.to_thread(build_one, i), timeout=PER_VARIANT_TIMEOUT
+        ))
+        if i == 1 or i == total or i % 3 == 0:
+            try:
+                await status.edit_text(bt("gen_progress", lang, i=i, n=total))
+            except Exception:
+                pass
 
     exam_title = "Ko'p manbali test"
-    variants_pdf = await asyncio.to_thread(build_variants_pdf, variants, exam_title)
-    key_pdf = await asyncio.to_thread(build_answer_key_pdf, variants, exam_title)
+    variants_pdf = await asyncio.wait_for(
+        asyncio.to_thread(build_variants_pdf, variants, exam_title),
+        timeout=PDF_BUILD_TIMEOUT,
+    )
+    key_pdf = await asyncio.wait_for(
+        asyncio.to_thread(build_answer_key_pdf, variants, exam_title),
+        timeout=PDF_BUILD_TIMEOUT,
+    )
 
     # Pool project owns the variants → the existing checking flow can grade
     # them like any other project.
