@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from app.bot.keyboards.inline import (
     builder_fail_keyboard,
     builder_next_keyboard,
     builder_resume_keyboard,
+    builder_retry_keyboard,
     builder_reuse_keyboard,
     builder_save_keyboard,
 )
@@ -146,9 +148,14 @@ BT = {
         "ru": "📄 Готовлю вариант {i}/{n}...",
     },
     "gen_error": {
-        "uz": "❌ Variantlarni yaratishda xatolik yuz berdi. Qayta urinib ko'ring — sessiyangiz saqlanib qoldi.",
-        "en": "❌ Something went wrong generating the variants. Please try again — your session is intact.",
-        "ru": "❌ Ошибка при создании вариантов. Попробуйте ещё раз — сессия сохранена.",
+        "uz": "❌ Variantlarni yaratishda xatolik yuz berdi (#{code}). Sessiyangiz saqlanib qoldi.",
+        "en": "❌ Something went wrong generating the variants (#{code}). Your session is intact.",
+        "ru": "❌ Ошибка при создании вариантов (#{code}). Сессия сохранена.",
+    },
+    "img_missing_warn": {
+        "uz": "⚠️ Ba'zi savollarning rasm fayli topilmadi ({nums}) — ular rasmsiz chiqarildi.",
+        "en": "⚠️ Some questions' image files were missing ({nums}) — rendered without images.",
+        "ru": "⚠️ Файлы изображений некоторых вопросов не найдены ({nums}) — вставлены без изображений.",
     },
     "generated": {
         "uz": "✅ Tayyor! {n} ta variant ({m} tadan savol).{reuse_note}",
@@ -683,6 +690,19 @@ PDF_BUILD_TIMEOUT = 120     # seconds — the whole PDF render
 OVERALL_TIMEOUT = 300       # seconds — absolute wall for the whole sequence
 
 
+def _image_exists(image_path: str) -> bool:
+    """True if a pooled question's image file is still on disk (direct path
+    or storage key). Mirrors pdf_generator._load_image_bytes lookup order."""
+    if not image_path:
+        return False
+    if Path(image_path).exists():
+        return True
+    try:
+        return storage.get_local_path(image_path).exists()
+    except Exception:
+        return False
+
+
 async def _generate_from_pool(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
     data = await state.get_data()
@@ -697,20 +717,28 @@ async def _generate_from_pool(message: Message, state: FSMContext, db_user: User
             timeout=OVERALL_TIMEOUT,
         )
     except Exception as e:
-        # Generation is pure local computation — any hang/error surfaces here
-        # as an explicit message; the session is preserved so the teacher can
-        # retry. NEVER leave the teacher staring at infinite silence.
+        # Surface EVERY failure: full traceback to the log under a short code,
+        # the code in the teacher message, and [Qayta urinish]/[Parametrlarni
+        # o'zgartirish] with n/m preserved in the session. Never infinite
+        # silence, never a swallowed traceback.
+        code = "GEN-" + uuid.uuid4().hex[:4].upper()
         logger.error(
             "builder_generation_failed",
-            session_id=session_id, n=n, m=m,
+            code=code, session_id=session_id, n=n, m=m,
             error=str(e), error_type=type(e).__name__,
+            traceback=traceback.format_exc(),
         )
+        # n_variants/m_per_variant stay in FSM so "Qayta urinish" reuses them.
         try:
-            await status.edit_text(bt("gen_error", lang))
+            await status.edit_text(
+                bt("gen_error", lang, code=code),
+                reply_markup=builder_retry_keyboard(lang),
+            )
         except Exception:
-            await message.answer(bt("gen_error", lang))
-        await state.set_state(BuilderStates.waiting_for_variant_count)
-        await message.answer(bt("ask_variants", lang, max=MAX_VARIANTS))
+            await message.answer(
+                bt("gen_error", lang, code=code),
+                reply_markup=builder_retry_keyboard(lang),
+            )
 
 
 async def _do_generate(
@@ -740,6 +768,25 @@ async def _do_generate(
             except Exception:
                 pass
 
+    # Image lifetime check: a pooled question's temp crop may have been
+    # cleaned since extraction. Warn (with numbers) and render without the
+    # image — build_variants_pdf already falls back to the description box,
+    # so this never crashes.
+    missing_imgs = sorted({
+        q.get("question_number")
+        for v in variants for q in v["questions_data"]
+        if q.get("has_image") and q.get("image_path") and not _image_exists(q["image_path"])
+    })
+    if missing_imgs:
+        logger.warning("pool_images_missing", numbers=missing_imgs)
+        try:
+            await message.answer(bt(
+                "img_missing_warn", lang,
+                nums=", ".join(str(x) for x in missing_imgs),
+            ))
+        except Exception:
+            pass
+
     exam_title = "Ko'p manbali test"
     variants_pdf = await asyncio.wait_for(
         asyncio.to_thread(build_variants_pdf, variants, exam_title),
@@ -754,13 +801,20 @@ async def _do_generate(
     # them like any other project.
     pool_project_id = uuid.uuid4()
     async with async_session_factory() as session:
-        session.add(Project(
+        project = Project(
             id=pool_project_id,
             user_id=db_user.id,
             name=f"📚 Bank ({len(pool)} savol)",
             status=ProjectStatus.COMPLETED,
             question_count=len(pool),
-        ))
+        )
+        session.add(project)
+        # PRIMARY FIX: flush so the projects row physically exists BEFORE the
+        # builder_sessions.pool_project_id UPDATE (and variants.project_id
+        # inserts) reference it. The session is autoflush=False and there was
+        # no ORM relationship on pool_project_id, so the unit-of-work emitted
+        # the UPDATE before the INSERT → ForeignKeyViolationError.
+        await session.flush()
         for v in variants:
             session.add(Variant(
                 project_id=pool_project_id,
@@ -774,6 +828,7 @@ async def _do_generate(
             select(BuilderSession).where(BuilderSession.id == uuid.UUID(session_id))
         )
         bs = res.scalar_one()
+        bs.pool_project = project  # via relationship → UOW ordering stays
         bs.pool_project_id = pool_project_id
         bs.status = BuilderStatus.FINISHED
         await session.commit()
@@ -803,6 +858,27 @@ async def _do_generate(
         session_id=session_id, variants=n, per_variant=m,
         pool=len(pool), max_reuse=stats["max_reuse"],
     )
+
+
+# ── Generation retry (params preserved in the session) ───────────────────────
+
+@router.callback_query(F.data == "bld:retry")
+async def handle_gen_retry(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    """Re-run generation with the SAME n/m still in the FSM."""
+    data = await state.get_data()
+    if not data.get("builder_session_id") or not data.get("n_variants"):
+        await callback.answer()
+        return
+    await callback.answer()
+    await _generate_from_pool(callback.message, state, db_user)
+
+
+@router.callback_query(F.data == "bld:regen_params")
+async def handle_gen_regen_params(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    await state.set_state(BuilderStates.waiting_for_variant_count)
+    await callback.message.edit_text(bt("ask_variants", lang, max=MAX_VARIANTS))
+    await callback.answer()
 
 
 # ── Save / delete ─────────────────────────────────────────────────────────────

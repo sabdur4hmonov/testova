@@ -79,6 +79,20 @@ def builder_reuse_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     return _two_button_kb(labels.get(lang, labels["en"]))
 
 
+def builder_retry_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Generation failed: retry with the SAME params or change them — the
+    session and its counts are preserved either way."""
+    labels = {
+        "uz": [("🔄 Qayta urinish", "bld:retry"),
+               ("✏️ Parametrlarni o'zgartirish", "bld:regen_params")],
+        "en": [("🔄 Retry", "bld:retry"),
+               ("✏️ Change parameters", "bld:regen_params")],
+        "ru": [("🔄 Повторить", "bld:retry"),
+               ("✏️ Изменить параметры", "bld:regen_params")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
 def builder_save_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     labels = {
         "uz": [("💾 Saqlash", "bld:save"), ("🗑 Sessiyani o'chirish", "bld:delete")],

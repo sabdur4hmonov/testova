@@ -58,6 +58,12 @@ class BuilderSession(Base):
     sources: Mapped[list["BuilderSource"]] = relationship(
         back_populates="session", cascade="all, delete-orphan", lazy="select"
     )
+    # Relationship on the pool_project_id FK so the unit-of-work orders the
+    # Project INSERT before this row's UPDATE even if the explicit flush in
+    # _do_generate is ever removed (belt-and-braces for the FK-ordering bug).
+    pool_project: Mapped["Project | None"] = relationship(  # type: ignore[name-defined]
+        "Project", foreign_keys=[pool_project_id], lazy="select"
+    )
 
     def __repr__(self) -> str:
         return f"<BuilderSession {self.id} user={self.user_id} {self.status}>"
