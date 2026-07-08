@@ -4,6 +4,7 @@ from app.models.question import Question
 from app.models.variant import Variant
 from app.models.submission import Submission
 from app.models.subscription import Subscription
+from app.models.builder import BuilderSession, BuilderSource, BuilderStatus
 
 __all__ = [
     "User",
@@ -15,4 +16,7 @@ __all__ = [
     "Variant",
     "Submission",
     "Subscription",
+    "BuilderSession",
+    "BuilderSource",
+    "BuilderStatus",
 ]

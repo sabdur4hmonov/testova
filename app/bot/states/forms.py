@@ -14,5 +14,16 @@ class CheckingStates(StatesGroup):
     waiting_for_variant_number = State()
 
 
+class BuilderStates(StatesGroup):
+    """Multi-Source Test Builder."""
+    waiting_for_file = State()
+    waiting_for_answers = State()
+    waiting_for_next_action = State()
+    waiting_for_variant_count = State()
+    waiting_for_question_count = State()
+    waiting_for_reuse_confirm = State()
+    waiting_for_save_choice = State()
+
+
 class SettingsStates(StatesGroup):
     waiting_for_language = State()

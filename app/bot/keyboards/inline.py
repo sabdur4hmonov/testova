@@ -23,6 +23,71 @@ def project_actions_keyboard(project_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def _two_button_kb(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for text, cb in pairs:
+        builder.button(text=text, callback_data=cb)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def builder_next_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("✅ Yana test qo'shish", "bld:add"), ("🏁 Yakunlash", "bld:finish")],
+        "en": [("✅ Add another test", "bld:add"), ("🏁 Finish", "bld:finish")],
+        "ru": [("✅ Добавить ещё тест", "bld:add"), ("🏁 Завершить", "bld:finish")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def builder_resume_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("▶️ Davom etish", "bld:resume"), ("🗑 Bekor qilish", "bld:cancel")],
+        "en": [("▶️ Continue", "bld:resume"), ("🗑 Cancel session", "bld:cancel")],
+        "ru": [("▶️ Продолжить", "bld:resume"), ("🗑 Отменить", "bld:cancel")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def builder_dup_file_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("➕ Baribir qo'shish", "bld:dupfile_add"),
+               ("⏭ O'tkazib yuborish", "bld:dupfile_skip")],
+        "en": [("➕ Add anyway", "bld:dupfile_add"),
+               ("⏭ Skip this file", "bld:dupfile_skip")],
+        "ru": [("➕ Всё равно добавить", "bld:dupfile_add"),
+               ("⏭ Пропустить", "bld:dupfile_skip")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def builder_fail_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("🔁 Qayta yuborish", "bld:add"), ("➡️ Davom etish", "bld:after_fail")],
+        "en": [("🔁 Resend the file", "bld:add"), ("➡️ Continue", "bld:after_fail")],
+        "ru": [("🔁 Отправить снова", "bld:add"), ("➡️ Продолжить", "bld:after_fail")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def builder_reuse_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("✅ Davom etish", "bld:reuse_ok"), ("✏️ O'zgartirish", "bld:reuse_edit")],
+        "en": [("✅ Proceed", "bld:reuse_ok"), ("✏️ Change numbers", "bld:reuse_edit")],
+        "ru": [("✅ Продолжить", "bld:reuse_ok"), ("✏️ Изменить", "bld:reuse_edit")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def builder_save_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    labels = {
+        "uz": [("💾 Saqlash", "bld:save"), ("🗑 Sessiyani o'chirish", "bld:delete")],
+        "en": [("💾 Save the pool", "bld:save"), ("🗑 Delete session", "bld:delete")],
+        "ru": [("💾 Сохранить", "bld:save"), ("🗑 Удалить сессию", "bld:delete")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
 def dup_resolution_keyboard(match: bool, lang: str = "uz") -> InlineKeyboardMarkup:
     """Teacher decides a duplicate group's fate — nothing is auto-removed.
     match=True: answers agree → use once or twice.

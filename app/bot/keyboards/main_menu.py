@@ -5,6 +5,7 @@ def main_menu(lang: str = "uz") -> ReplyKeyboardMarkup:
     labels = {
         "uz": {
             "upload": "📤 Variant yaratish",
+            "multi": "📚 Ko'p manbadan test yaratish",
             "check": "✅ Test tekshirish",
             "projects": "📂 Mening loyihalarim",
             "pricing": "💎 Tariflar",
@@ -13,6 +14,7 @@ def main_menu(lang: str = "uz") -> ReplyKeyboardMarkup:
         },
         "en": {
             "upload": "📤 Create Variants",
+            "multi": "📚 Multi-source test builder",
             "check": "✅ Check Test",
             "projects": "📂 My Projects",
             "pricing": "💎 Pricing",
@@ -21,6 +23,7 @@ def main_menu(lang: str = "uz") -> ReplyKeyboardMarkup:
         },
         "ru": {
             "upload": "📤 Создать варианты",
+            "multi": "📚 Тест из нескольких источников",
             "check": "✅ Проверить тест",
             "projects": "📂 Мои проекты",
             "pricing": "💎 Тарифы",
@@ -32,6 +35,7 @@ def main_menu(lang: str = "uz") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=labels["upload"]), KeyboardButton(text=labels["check"])],
+            [KeyboardButton(text=labels["multi"])],
             [KeyboardButton(text=labels["projects"]), KeyboardButton(text=labels["pricing"])],
             [KeyboardButton(text=labels["language"]), KeyboardButton(text=labels["support"])],
         ],
@@ -43,6 +47,7 @@ def main_menu(lang: str = "uz") -> ReplyKeyboardMarkup:
 MAIN_MENU_TEXTS = {
     "uz": {
         "upload": "📤 Variant yaratish",
+        "multi": "📚 Ko'p manbadan test yaratish",
         "check": "✅ Test tekshirish",
         "projects": "📂 Mening loyihalarim",
         "pricing": "💎 Tariflar",
@@ -51,6 +56,7 @@ MAIN_MENU_TEXTS = {
     },
     "en": {
         "upload": "📤 Create Variants",
+        "multi": "📚 Multi-source test builder",
         "check": "✅ Check Test",
         "projects": "📂 My Projects",
         "pricing": "💎 Pricing",
@@ -59,6 +65,7 @@ MAIN_MENU_TEXTS = {
     },
     "ru": {
         "upload": "📤 Создать варианты",
+        "multi": "📚 Тест из нескольких источников",
         "check": "✅ Проверить тест",
         "projects": "📂 Мои проекты",
         "pricing": "💎 Тарифы",

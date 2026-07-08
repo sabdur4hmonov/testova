@@ -6,7 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from app.bot.handlers import checking, projects, settings, start, upload
+from app.bot.handlers import checking, multi_source, projects, settings, start, upload
 from app.bot.middlewares.auth import AuthMiddleware
 from app.bot.middlewares.throttling import ThrottlingMiddleware
 from app.config import settings as app_settings
@@ -45,6 +45,7 @@ def create_dispatcher() -> Dispatcher:
 
     # ── Routers ───────────────────────────────────────────────────────────────
     dp.include_router(start.router)
+    dp.include_router(multi_source.router)
     dp.include_router(upload.router)
     dp.include_router(checking.router)
     dp.include_router(projects.router)

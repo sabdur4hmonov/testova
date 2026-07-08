@@ -368,32 +368,46 @@ def select_for_variants(
     shortfalls: list[tuple[int, int]] = []  # (variant_number, got)
 
     for v in range(1, n_variants + 1):
-        remaining = m_per_variant
-        chosen_idx: list[int] = []
-        chosen_fps: set[str] = set()
-
-        candidates = sorted(range(len(units)), key=lambda i: (usage[i], rng.random()))
-        for i in candidates:
-            size = len(units[i]["questions"])
-            if size > remaining:
-                continue
-            if chosen_fps & unit_fps[i]:
-                continue  # identical content already in this variant
-            chosen_idx.append(i)
-            chosen_fps |= unit_fps[i]
-            usage[i] += 1
-            remaining -= size
+        # Greedy least-used-first can strand itself on group-size arithmetic
+        # (all singles taken, remaining slot smaller than the group) — retry
+        # with fresh tie-randomization and keep the best attempt; usage is
+        # committed only for the accepted attempt.
+        best_idx: list[int] = []
+        best_got = -1
+        for _attempt in range(6):
+            remaining = m_per_variant
+            chosen_idx: list[int] = []
+            chosen_fps: set[str] = set()
+            candidates = sorted(
+                range(len(units)), key=lambda i: (usage[i], rng.random())
+            )
+            for i in candidates:
+                size = len(units[i]["questions"])
+                if size > remaining:
+                    continue
+                if chosen_fps & unit_fps[i]:
+                    continue  # identical content already in this variant
+                chosen_idx.append(i)
+                chosen_fps |= unit_fps[i]
+                remaining -= size
+                if remaining == 0:
+                    break
+            got = m_per_variant - remaining
+            if got > best_got:
+                best_got, best_idx = got, chosen_idx
             if remaining == 0:
                 break
 
-        if remaining > 0:
-            shortfalls.append((v, m_per_variant - remaining))
+        for i in best_idx:
+            usage[i] += 1
+        if best_got < m_per_variant:
+            shortfalls.append((v, best_got))
             logger.warning(
                 "variant_selection_shortfall",
-                variant=v, wanted=m_per_variant, got=m_per_variant - remaining,
+                variant=v, wanted=m_per_variant, got=best_got,
             )
         selections.append([
-            q for i in chosen_idx for q in units[i]["questions"]
+            q for i in best_idx for q in units[i]["questions"]
         ])
 
     reused = [
