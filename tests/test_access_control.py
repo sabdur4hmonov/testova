@@ -72,6 +72,51 @@ def test_blocked_text_has_admin_username():
     assert "⛔" in txt and f"@{settings.ADMIN_USERNAME}" in txt
 
 
+# ── Middleware gating decision (pure) ────────────────────────────────────────
+
+from app.bot.middlewares.access import (  # noqa: E402
+    UPLOAD_LABELS, MULTI_LABELS, CHECK_LABELS, gate_denied,
+)
+
+UPLOAD = next(iter(UPLOAD_LABELS))
+MULTI = next(iter(MULTI_LABELS))
+CHECK = next(iter(CHECK_LABELS))
+
+
+def test_gate_upload_blocked_without_access():
+    assert gate_denied(_user(uses_left=0), UPLOAD, False) is True
+    assert gate_denied(_user(uses_left=1), UPLOAD, False) is False
+
+
+def test_gate_check_ignores_uses():
+    # out of uses but within date → checking allowed
+    assert gate_denied(_user(uses_left=0), CHECK, False) is False
+    assert gate_denied(_user(uses_left=0, access_until=PAST), CHECK, False) is True
+
+
+def test_gate_admin_bypasses_everything():
+    admin = _user(is_admin=True, is_blocked=True, uses_left=0, access_until=PAST)
+    assert gate_denied(admin, UPLOAD, False) is False
+    assert gate_denied(admin, MULTI, False) is False
+    assert gate_denied(admin, CHECK, False) is False
+
+
+def test_gate_non_entry_text_never_denied():
+    assert gate_denied(_user(uses_left=0, access_until=PAST), "/myaccess", False) is False
+    assert gate_denied(_user(uses_left=0, access_until=PAST), "random text", False) is False
+
+
+def test_10_uses_zero_active_session_multi_resume_only():
+    # (10) uses_left=0, valid date, an ACTIVE charged session:
+    #   - multi button works ONLY because a session is active (resume)
+    #   - single upload is still blocked
+    #   - a NEW builder session (no active one) is also blocked
+    u = _user(uses_left=0, access_until=FUTURE)   # date valid, out of uses
+    assert gate_denied(u, MULTI, has_active_session=True) is False   # resume OK
+    assert gate_denied(u, MULTI, has_active_session=False) is True   # new session blocked
+    assert gate_denied(u, UPLOAD, has_active_session=True) is True   # single upload blocked
+
+
 # ── Real-DB atomicity (local NullPool engine; skips if unavailable) ──────────
 # NullPool opens/closes a connection per use so nothing caches across the
 # per-test event loop. Skips cleanly if Postgres is down OR migration 003

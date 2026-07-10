@@ -21,8 +21,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import storage
-from app.services import storage
+from app.services import access, storage
 from app.services.ai_analyzer import (
     AIAnalyzer,
     export_lint,
@@ -614,6 +613,14 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
             else None
         ),
     )
+
+    # ── Access: ONE use per successful single-file upload (success only) ──────
+    if not access.is_unlimited(db_user):
+        async with async_session_factory() as s:
+            remaining = await access.decrement_use(s, db_user.id)
+        note = access.remaining_note(remaining, unlimited=False)
+        if note:
+            await message.answer(note.strip())
 
 
 @router.callback_query(F.data == "reextract")

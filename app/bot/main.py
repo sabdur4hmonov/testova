@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.bot.handlers import checking, multi_source, projects, settings, start, upload
+from app.bot.middlewares.access import AccessMiddleware
 from app.bot.middlewares.auth import AuthMiddleware
 from app.bot.middlewares.throttling import ThrottlingMiddleware
 from app.config import settings as app_settings
@@ -38,10 +39,12 @@ def create_dispatcher() -> Dispatcher:
     storage = _make_storage()
     dp = Dispatcher(storage=storage)
 
-    # ── Middlewares ───────────────────────────────────────────────────────────
+    # ── Middlewares (outer → inner) ───────────────────────────────────────────
     dp.message.middleware(ThrottlingMiddleware(rate_limit=0.5))
-    dp.message.middleware(AuthMiddleware())
+    dp.message.middleware(AuthMiddleware())      # creates db_user
+    dp.message.middleware(AccessMiddleware())    # gates using db_user
     dp.callback_query.middleware(AuthMiddleware())
+    dp.callback_query.middleware(AccessMiddleware())
 
     # ── Routers ───────────────────────────────────────────────────────────────
     dp.include_router(start.router)

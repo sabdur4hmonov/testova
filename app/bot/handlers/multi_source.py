@@ -50,7 +50,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import storage
+from app.services import access, storage
 from app.services.file_processor import detect_file_type
 from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
 from app.services.variant_generator import (
@@ -489,6 +489,15 @@ async def _process_builder_file(
         ))
         await session.commit()
 
+    # ── Access: ONE use for the WHOLE session, charged on the first source's
+    #    successful extraction. Idempotent — later sources are free. ───────────
+    remaining = None
+    if not access.is_unlimited(db_user):
+        async with async_session_factory() as session:
+            remaining = await access.charge_session_use(
+                session, uuid.UUID(session_id), db_user.id
+            )
+
     await state.update_data(
         project_id=project_id,
         answers=result.detected,
@@ -502,6 +511,11 @@ async def _process_builder_file(
         parse_mode="HTML",
     )
     await message.answer(_summary_message(result.sections[0], result.quality, lang))
+    # remaining is not None only on the call that actually charged (1st source)
+    if remaining is not None:
+        note = access.remaining_note(remaining, unlimited=False)
+        if note:
+            await message.answer(note.strip())
 
 
 # ── Per-file answer key (P6: bound to THIS file only) ─────────────────────────
