@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 50
     ADMIN_IDS: list[int] = Field(default_factory=list)
 
+    # ── Access control ────────────────────────────────────────────────────────
+    TRIAL_DAYS: int = 30          # free trial window applied on first /start
+    TRIAL_USES: int = 1           # free full cycles for a fresh user
+    ADMIN_USERNAME: str = "admin"  # shown in the blocked message (no leading @)
+
     # ── Subscription limits ───────────────────────────────────────────────────
     FREE_DAILY_PROJECTS: int = 3
     PRO_DAILY_PROJECTS: int = 50

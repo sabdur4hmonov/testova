@@ -48,6 +48,9 @@ class BuilderSession(Base):
         UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Access: True once the ONE use for this whole session has been charged
+    # (on first successful source extraction). Adding more sources is free.
+    use_charged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

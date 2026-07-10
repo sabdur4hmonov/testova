@@ -5,6 +5,7 @@ from app.models.variant import Variant
 from app.models.submission import Submission
 from app.models.subscription import Subscription
 from app.models.builder import BuilderSession, BuilderSource, BuilderStatus
+from app.models.admin_log import AdminLog
 
 __all__ = [
     "User",
@@ -19,4 +20,5 @@ __all__ = [
     "BuilderSession",
     "BuilderSource",
     "BuilderStatus",
+    "AdminLog",
 ]

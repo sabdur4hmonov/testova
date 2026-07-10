@@ -31,14 +31,25 @@ async def get_or_create_user(
     user = result.scalar_one_or_none()
 
     if user is None:
+        from app.services.access import apply_trial
         user = User(
             telegram_id=telegram_id,
             username=username,
             full_name=full_name,
+            is_admin=telegram_id in settings.ADMIN_IDS,
         )
+        apply_trial(user)  # fresh user → TRIAL_DAYS + TRIAL_USES
         session.add(user)
         await session.flush()
-        logger.info("user_created", telegram_id=telegram_id)
+        logger.info(
+            "user_created", telegram_id=telegram_id,
+            is_admin=user.is_admin, uses_left=user.uses_left,
+        )
+    elif telegram_id in settings.ADMIN_IDS and not user.is_admin:
+        # Promote pre-existing admins (created before the ADMIN_IDS entry).
+        user.is_admin = True
+        await session.flush()
+        logger.info("user_promoted_admin", telegram_id=telegram_id)
 
     return user
 

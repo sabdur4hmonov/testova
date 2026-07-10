@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, Integer, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,7 +44,19 @@ class User(Base):
     monthly_projects_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_projects: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_reset_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    is_banned: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_banned: Mapped[bool] = mapped_column(default=False, nullable=False)  # legacy
+
+    # ── Access control ─────────────────────────────────────────────────────────
+    # NULL on a dimension = unlimited on that dimension. Existing rows migrate
+    # to NULL/NULL (unlimited) so nobody is locked out on deploy.
+    access_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    uses_left: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
