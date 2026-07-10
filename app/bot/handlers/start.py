@@ -1,9 +1,12 @@
+from datetime import datetime, timezone
+
 from aiogram import Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from app.bot.keyboards.main_menu import main_menu
 from app.models.user import User
+from app.services import access
 
 router = Router(name="start")
 
@@ -87,3 +90,23 @@ async def cmd_help(message: Message, db_user: User) -> None:
         ),
     }
     await message.answer(texts.get(lang, texts["uz"]), parse_mode="HTML")
+
+
+def _myaccess_text(user: User) -> str:
+    """Access summary for /myaccess (always reachable, never gated)."""
+    if user.is_admin:
+        return "♾ Sizda cheklovsiz kirish (admin)."
+    now = datetime.now(timezone.utc)
+    if user.is_blocked or (user.access_until is not None and user.access_until <= now):
+        return access.blocked_text()
+
+    days = "cheksiz" if user.access_until is None else f"{max(0, (user.access_until - now).days)} kun"
+    uses = "cheksiz" if user.uses_left is None else f"{user.uses_left} ta"
+    if user.access_until is None and user.uses_left is None:
+        return "♾ Sizda cheklovsiz kirish."
+    return f"📊 Sizda {days} va {uses} ishlatish qoldi."
+
+
+@router.message(Command("myaccess"))
+async def cmd_myaccess(message: Message, db_user: User) -> None:
+    await message.answer(_myaccess_text(db_user), parse_mode="HTML")

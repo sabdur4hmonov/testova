@@ -196,3 +196,248 @@ async def test_unlimited_user_never_decrements():
             await s.execute(delete(User).where(User.id == uid))
             await s.commit()
         await engine.dispose()
+
+
+async def test_2_multi_source_three_files_one_charge():
+    # (2) whole builder session = ONE decrement, on the first source only
+    from sqlalchemy import delete
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.builder import BuilderSession
+    engine = await _local_engine()
+    if engine is None:
+        pytest.skip("Postgres/migration-003 not available")
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    uid = await _mk_user(sm, 3)
+    async with sm() as s:
+        bs = BuilderSession(user_id=uid)
+        s.add(bs)
+        await s.commit()
+        sid = bs.id
+    try:
+        results = []
+        for _ in range(3):  # three source files added to the SAME session
+            async with sm() as s:
+                results.append(await access.charge_session_use(s, sid, uid))
+        assert results[0] == 2          # first source charged: 3 -> 2
+        assert results[1] is None       # later sources free
+        assert results[2] is None
+        assert await _get_uses(sm, uid) == 2
+    finally:
+        async with sm() as s:
+            await s.execute(delete(BuilderSession).where(BuilderSession.id == sid))
+            await s.execute(delete(User).where(User.id == uid))
+            await s.commit()
+        await engine.dispose()
+
+
+# ── (3) failed extraction never decrements ───────────────────────────────────
+
+class _FakeStatus:
+    async def edit_text(self, *a, **k):
+        pass
+
+
+class _FakeMsg2:
+    async def answer(self, *a, **k):
+        return _FakeStatus()
+
+
+class _FakeState2:
+    async def set_state(self, *a, **k):
+        pass
+    async def update_data(self, **k):
+        pass
+
+
+async def test_3_failed_extraction_no_charge(monkeypatch):
+    from app.bot.handlers import multi_source as ms
+    from app.services.pipeline import PipelineResult
+
+    charged = {"n": 0}
+
+    async def fake_pipeline(status, content, file_type, project_id):
+        return PipelineResult(status="no_questions")
+
+    async def fake_charge(*a, **k):
+        charged["n"] += 1
+        return 0
+
+    async def fake_save(*a, **k):
+        return "key"
+
+    async def fake_counts(sid):
+        return 0, 0
+
+    async def fake_status(pid, *a, **k):
+        pass
+
+    monkeypatch.setattr(ms, "run_pipeline_with_heartbeat", fake_pipeline)
+    monkeypatch.setattr(ms.access, "charge_session_use", fake_charge)
+    monkeypatch.setattr(ms.storage, "save_file", fake_save)
+    monkeypatch.setattr(ms, "_session_counts", fake_counts)
+    # skip the real Project INSERT (needs the projects row we don't care about)
+    import app.services.pipeline as pl
+    monkeypatch.setattr(pl, "_set_project_status", fake_status)
+
+    class _U:
+        id = uuid.uuid4()
+        is_admin = False
+        uses_left = 1
+        language = type("L", (), {"value": "uz"})()
+
+    # monkeypatch the Project-creation session to a no-op context manager
+    class _NoOpSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def add(self, *a):
+            pass
+        async def commit(self):
+            pass
+    monkeypatch.setattr(ms, "async_session_factory", lambda: _NoOpSession())
+
+    await ms._process_builder_file(
+        _FakeMsg2(), _FakeState2(), _U(), b"x", "f.pdf", str(uuid.uuid4()), 1
+    )
+    assert charged["n"] == 0     # failed extraction → no use charged
+
+
+# ── (7) non-admin /grant refused, no DB change ───────────────────────────────
+
+async def test_7_non_admin_grant_refused(monkeypatch):
+    from app.bot.handlers import admin
+    from aiogram.filters import CommandObject
+
+    called = {"db": False}
+
+    def boom(*a, **k):
+        called["db"] = True
+        raise AssertionError("DB must not be touched")
+
+    monkeypatch.setattr(admin, "async_session_factory", boom)
+
+    answers = []
+
+    class _M:
+        async def answer(self, text, **k):
+            answers.append(text)
+
+    non_admin = _user(is_admin=False)
+    non_admin.telegram_id = 999
+    await admin.cmd_grant(_M(), CommandObject(command="grant", args="123 30"), non_admin)
+    assert called["db"] is False
+    assert any("admin" in a.lower() for a in answers)
+
+
+# ── (8) grant → revoke → unblock lifecycle (real handlers, local engine) ──────
+
+async def test_8_grant_revoke_unblock_lifecycle(monkeypatch):
+    from sqlalchemy import delete, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from aiogram.filters import CommandObject
+    from app.bot.handlers import admin
+    from app.models.admin_log import AdminLog
+
+    engine = await _local_engine()
+    if engine is None:
+        pytest.skip("Postgres/migration-003 not available")
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(admin, "async_session_factory", sm)
+
+    tg = int(uuid.uuid4().int % 10**11)
+    admin_user = _user(is_admin=True)
+    admin_user.telegram_id = 1
+
+    class _M:
+        async def answer(self, *a, **k):
+            pass
+
+    try:
+        # grant 30 days, 5 uses, note
+        await admin.cmd_grant(_M(), CommandObject(command="grant", args=f"{tg} 30 5 Ali maktab"), admin_user)
+        async with sm() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
+            assert u.uses_left == 5 and u.note == "Ali maktab"
+            assert access.has_access(u) is True
+
+        # revoke → blocked, no access
+        await admin.cmd_revoke(_M(), CommandObject(command="revoke", args=str(tg)), admin_user)
+        async with sm() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
+            assert u.is_blocked is True and access.has_access(u) is False
+
+        # unblock → access restored
+        await admin.cmd_unblock(_M(), CommandObject(command="unblock", args=str(tg)), admin_user)
+        async with sm() as s:
+            u = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
+            assert u.is_blocked is False and access.has_access(u) is True
+
+        # all three actions logged
+        async with sm() as s:
+            logs = (await s.execute(select(AdminLog).where(AdminLog.target == tg))).scalars().all()
+            assert {l.action for l in logs} == {"grant", "revoke", "unblock"}
+    finally:
+        async with sm() as s:
+            await s.execute(delete(AdminLog).where(AdminLog.target == tg))
+            await s.execute(delete(User).where(User.telegram_id == tg))
+            await s.commit()
+        await engine.dispose()
+
+
+# ── /myaccess text ───────────────────────────────────────────────────────────
+
+def test_1_fresh_user_full_cycle_then_blocked():
+    # (1) fresh user → trial → one full cycle (upload+check) → uses 0 →
+    #     next upload blocked, but checking still works within the window
+    u = _user(is_admin=False, access_until=None, uses_left=None)
+    access.apply_trial(u)
+    assert u.uses_left == 1
+    assert access.has_access(u) is True             # may start the one upload
+    assert access.can_check(u) is True
+
+    u.uses_left = 0                                 # the upload consumed the use
+    assert access.can_check(u) is True              # completion: checking still ok
+    assert gate_denied(u, UPLOAD, False) is True    # a NEW upload is blocked
+    assert gate_denied(u, MULTI, False) is True     # a NEW builder session blocked
+
+
+def test_myaccess_text_variants():
+    from app.bot.handlers.start import _myaccess_text
+    assert "cheklovsiz" in _myaccess_text(_user(is_admin=True)).lower()
+    assert "qoldi" in _myaccess_text(_user(uses_left=3, access_until=FUTURE))
+    assert "⛔" in _myaccess_text(_user(access_until=PAST))
+    assert "⛔" in _myaccess_text(_user(is_blocked=True))
+
+
+async def test_9_middleware_passes_multisource_flow(monkeypatch):
+    # (9) with the middleware active, an access user's multi-source flow is
+    #     never wrongly blocked: callbacks, mid-flow messages and the entry
+    #     button all reach the handler.
+    from aiogram.types import CallbackQuery, Message
+    from app.bot.middlewares import access as accmw
+
+    monkeypatch.setattr(accmw, "_has_active_session", lambda uid: _false())
+
+    mw = accmw.AccessMiddleware()
+    reached = []
+
+    async def handler(event, data):
+        reached.append(event)
+        return "ok"
+
+    user = _user(uses_left=1)  # has access
+
+    events = [
+        CallbackQuery.model_construct(data="bld:add"),          # mid-flow callback
+        Message.model_construct(text="1A 2B 3C"),               # answer-key message
+        Message.model_construct(text=MULTI),                    # entry button
+        Message.model_construct(text=UPLOAD),                   # entry button
+    ]
+    for ev in events:
+        await mw(handler, ev, {"db_user": user})
+    assert len(reached) == 4  # nothing wrongly blocked
+
+
+async def _false():
+    return False

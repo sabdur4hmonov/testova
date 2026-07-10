@@ -6,7 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from app.bot.handlers import checking, multi_source, projects, settings, start, upload
+from app.bot.handlers import admin, checking, multi_source, projects, settings, start, upload
 from app.bot.middlewares.access import AccessMiddleware
 from app.bot.middlewares.auth import AuthMiddleware
 from app.bot.middlewares.throttling import ThrottlingMiddleware
@@ -47,6 +47,7 @@ def create_dispatcher() -> Dispatcher:
     dp.callback_query.middleware(AccessMiddleware())
 
     # ── Routers ───────────────────────────────────────────────────────────────
+    dp.include_router(admin.router)   # admin commands take priority
     dp.include_router(start.router)
     dp.include_router(multi_source.router)
     dp.include_router(upload.router)
