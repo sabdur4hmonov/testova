@@ -69,10 +69,34 @@ CRITICAL RULES:
 6. For answer options: if options ARE on this page, copy them exactly
 7. If answer options are NOT visible on this page (cut off), leave A/B/C/D as empty string ""
 8. Do NOT invent or guess missing options - leave them as ""
-9. Do NOT use LaTeX or $ symbols. Write math in plain text:
+9. Do NOT use LaTeX or $ symbols. Use ONE consistent plain-text notation for
+   ALL formulas (never mix styles inside a document):
    - Fractions: write as (a)/(b) example: (1)/(2)
-   - Powers: write as x^2 or x^n
-   - Square root: write as sqrt(x)
+   - Mixed numbers (a whole number next to a fraction, e.g. 3½): write as
+     "3 1/2" WITH A SPACE between the whole part and the fraction. NEVER write
+     it as 3(1)/(2) — that reads as 3·(1/2)=1.5 and changes the value. So
+     3½ = "3 1/2", 2¾ = "2 3/4".
+   - Powers: write as x^2, 2^21, x^n. Keep the WHOLE exponent: "2^21" means 2
+     to the power 21 — never drop or split its digits.
+   - Subscripts (a small LOWERED index on a variable): write base_index with an
+     underscore. x with subscript 1 → x_1, x with subscript 2 → x_2, a_n, S_k.
+     ALWAYS use the underscore — NEVER glue as "x1"/"x2" (that reads as the
+     number x1). Worked example: the two roots of an equation are "x_1" and
+     "x_2", e.g. "x_1 + x_2 = 5" and "4x_1 + 3x_2 = 3 1/2".
+   - Repeating (periodic) decimals in the Uzbek "a,(b)" notation, e.g. 4,(2)
+     = 4.222..., 0,(45) = 0.4545...: copy them EXACTLY as "4,(2)". This is a
+     DECIMAL, NOT a power — never turn "4,(2)" into "4^(2)", "4^2" or "4²".
+   - Square root: ALWAYS write as sqrt(...) in ASCII. Never use the "√"
+     character. Put the ENTIRE expression under the radical bar inside ONE
+     sqrt(...): if the bar covers "2sqrt(x) - sqrt(3x)", write
+     sqrt(2sqrt(x) - sqrt(3x)) - NEVER let a term like "- sqrt(3x)" escape it.
+   - nth root (cube, fourth, ...): write as root(n, expression), e.g. the
+     fourth root of x → root(4, x); the cube root of (a+b) → root(3, a+b).
+     The small index n is NOT an exponent: NEVER turn a fourth root into "x^4"
+     or "2^(4...)". The index is the first argument of root(...) and the
+     ENTIRE radicand stays inside its parentheses. Example: the fourth root of
+     "x·(7 + 4sqrt(3))" is root(4, x*(7 + 4sqrt(3))) - the (7 + 4sqrt(3))
+     factor stays INSIDE the root, never beside it.
    - π symbol: write as π (the actual symbol)
    - Infinity: write as ∞
    - Set/math symbols: preserve as REAL Unicode characters exactly as printed:
@@ -617,6 +641,12 @@ _BROKEN_ISOTOPE_RES = (
 )
 # Known OCR confusions ("(II)" read as "fill", ...). Extensible.
 _OCR_CONFUSION_TOKENS = ("fill",)
+# BUG 1: a root INDEX collapsed onto its base as an exponent — Gemini turns
+# ⁴√(...) into "2^(4√x)" or "2^4√...", i.e. a "√" that has drifted inside a
+# superscript/^(...) group. A legitimate power never contains a radical, so a
+# "√" appearing right after "^" (optionally through a "(" ) is a mangled
+# nested radical. Flag only — the formula is never auto-rewritten.
+_RADICAL_IN_EXPONENT_RE = re.compile(r'\^\(?\s*[^\s()]*√')
 
 
 def flag_suspicious_questions(
@@ -667,6 +697,11 @@ def flag_suspicious_questions(
 
         if any(rx.search(full) for rx in _BROKEN_ISOTOPE_RES):
             reasons.append("broken_isotope")
+
+        # BUG 1: a fourth/nth-root index mashed into an exponent, with the
+        # radical sign dragged inside the power (e.g. "2^(4√x)").
+        if _RADICAL_IN_EXPONENT_RE.search(full):
+            reasons.append("mangled_radical")
 
         if reasons:
             flagged.append((
@@ -817,6 +852,11 @@ def find_unanswerable(questions: list[dict]) -> list[tuple[int, int, list[str]]]
         missing = sorted({
             m.group(0) for m in _UNKNOWN_TOKEN_RE.finditer(ask)
             if not re.search(rf'\b{re.escape(m.group(0))}\b', reactions)
+            # FALSE-POSITIVE GUARD: a symbol the stem itself DEFINES is a given,
+            # not a lost unknown — e.g. a set/variable "A = {1;2;3}", "B = {x|..}"
+            # (a set-theory question) or "y = f(x)". A lost chemistry unknown
+            # ("X ni toping") has no such "X =" definition, so it still trips.
+            and not re.search(rf'\b{re.escape(m.group(0))}\b\s*[=:∈]', stem)
         })
         if missing:
             out.append((q.get("section", 1), q.get("question_number", 0), missing))
@@ -1164,10 +1204,16 @@ class AIAnalyzer:
                     logger.info("scheme_recovered_by_description", question=n)
                     continue
 
-            # (d) unrecoverable: never print a contentless description
-            if q.get("image_description") and (
-                _USELESS_DESC_RE.search(q["image_description"])
-                or not FORMULA_RE.search(q["image_description"])
+            # (d) unrecoverable: drop ONLY a truly contentless description
+            # ("cut off", "not readable"). BUG 2: previously we also nulled
+            # any description lacking a CHEMICAL formula, which deleted the
+            # perfectly good text of non-chemistry figures — number lines,
+            # geometry diagrams, graphs — leaving has_image=True with nothing
+            # to render (a blank, unsolvable question). A content-bearing
+            # description is the designed fallback; keep it so the PDF shows
+            # the [Rasm] box instead of empty space.
+            if q.get("image_description") and _USELESS_DESC_RE.search(
+                q["image_description"]
             ):
                 q["image_description"] = None
             failed.append((q.get("section", 1), n))

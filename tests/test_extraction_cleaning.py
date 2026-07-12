@@ -89,6 +89,23 @@ def test_no_reaction_syntax_never_flagged():
     assert find_unanswerable([q]) == []
 
 
+def test_set_theory_definitions_not_flagged():
+    # FALSE POSITIVE: A and B are DEFINED sets, not lost unknowns. The ";"
+    # inside {1; 2; 3; 4} used to split the stem and hide B's definition.
+    q = _q(29, "A = {1; 2; 3; 4}, B = {x | x = 2n − 1, n ∈ A} boʻlsa, "
+               "A ∩ B toʻplamni aniqlang.")
+    assert find_unanswerable([q]) == []
+
+
+def test_math_option_question_not_flagged():
+    # a question whose OPTIONS are pure math (rendered as images) must never be
+    # flagged — find_unanswerable reads the stem only, and radical options are
+    # answerable
+    q = _q(8, "Katetlari x va y = 2x boʻlgan uchburchak gipotenuzasini toping.",
+           opts={"A": "sqrt(19)", "B": "sqrt(17)", "C": "3", "D": "4"})
+    assert find_unanswerable([q]) == []
+
+
 # ── ISSUE 4(a): redundant description ────────────────────────────────────────
 
 def test_redundant_desc_detected():
