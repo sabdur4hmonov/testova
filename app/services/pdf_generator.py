@@ -19,12 +19,21 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 from app.services import storage
+from app.services.math_render import render_to_markup
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 PAGE_WIDTH, PAGE_HEIGHT = A4
 MARGIN = 2.0 * cm
+# BUG (extra-digit): a wider bottom band than the other margins keeps the body
+# frame clear of the page-number footer. Previously body (bottom 2.0cm) and the
+# footer digit (top ~1.4cm) sat only ~0.6cm apart, so a PDF text extractor
+# folded the centered page number onto the last option's line ("21" + "3" =
+# "213"). The exam looked fine; only extraction glued them. This is purely
+# geometry — NO stripping of trailing digits (that would eat answers like 148).
+BOTTOM_MARGIN = 2.5 * cm
+FOOTER_Y = 1.0 * cm
 
 
 def _esc(text):
@@ -35,6 +44,15 @@ def _esc(text):
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
     return text
+
+
+# NOTE: a render-time math "normalization" pass was tried and REVERTED. A
+# cosmetic regex over already-ambiguous ASCII kept changing meaning: it
+# half-converted multi-digit exponents ("2^21" → "2²1"), and it dressed up an
+# extraction corruption (a repeating decimal Gemini had already misread as
+# "4^(2)") into a convincing-looking "4²". Principle: a cosmetic pass must
+# NEVER change mathematical meaning — so notation is now made consistent at
+# EXTRACTION time (VISION_PROMPT) and rendered VERBATIM here.
 
 
 # ── Font setup ───────────────────────────────────────────────────────────────
@@ -109,8 +127,12 @@ STYLES = {
         fontSize=10, fontName=_FONT_BOLD, spaceBefore=8, spaceAfter=2,
     ),
     "option": ParagraphStyle(
+        # spaceBefore is generous so a TALL typeset-math image (nested radical,
+        # stacked fraction) on one option cannot bleed up into the option above
+        # it — autoLeading sizes a line to its own image but not to a following
+        # line's ascent, so the gap is reserved here.
         "option", parent=_base["Normal"],
-        fontSize=10, fontName=_FONT, spaceBefore=1, spaceAfter=1, leftIndent=12,
+        fontSize=10, fontName=_FONT, spaceBefore=5, spaceAfter=2, leftIndent=12,
     ),
     "context": ParagraphStyle(
         "context", parent=_base["Normal"],
@@ -139,6 +161,12 @@ STYLES = {
         fontSize=11, fontName=_FONT, spaceBefore=3, spaceAfter=3,
     ),
 }
+
+# Lines that carry typeset-math <img> fragments (stacked fractions, radicals)
+# are TALLER than a normal text line. autoLeading="max" grows each line to fit
+# its content, so a fraction never overlaps the line above/below it.
+for _mstyle in ("question", "option", "context", "img_desc"):
+    STYLES[_mstyle].autoLeading = "max"
 
 
 # ── Image loader — handles BOTH storage keys AND direct file paths ────────────
@@ -239,7 +267,7 @@ def _page_footer(canvas, doc) -> None:
     canvas.saveState()
     canvas.setFont(_FONT, 9)
     canvas.setFillColor(colors.HexColor("#555555"))
-    canvas.drawCentredString(PAGE_WIDTH / 2, 1.1 * cm, str(canvas.getPageNumber()))
+    canvas.drawCentredString(PAGE_WIDTH / 2, FOOTER_Y, str(canvas.getPageNumber()))
     canvas.restoreState()
 
 
@@ -271,7 +299,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=MARGIN, bottomMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=BOTTOM_MARGIN,
     )
     story = []
 
@@ -289,7 +317,8 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
 
         for q in questions:
             pos       = q.get("position_in_variant", q.get("question_number", "?"))
-            q_text    = _esc(q.get("question_text", ""))
+            # Typeset math (parse→render); prose stays verbatim, bail-safe.
+            q_text    = render_to_markup(q.get("question_text", ""))
             options   = q.get("options", {})
             group_ctx = q.get("group_context")
             is_open   = q.get("is_open_ended", False)
@@ -297,7 +326,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
             # Group context box
             if group_ctx:
                 story.append(Spacer(1, 3 * mm))
-                para = Paragraph(_esc(group_ctx).replace("\n", "<br/>"), STYLES["context"])
+                para = Paragraph(render_to_markup(group_ctx).replace("\n", "<br/>"), STYLES["context"])
                 tbl = Table([[para]], colWidths=[available_w])
                 tbl.setStyle(TableStyle([
                     ("BOX",           (0, 0), (-1, -1), 0.75, colors.HexColor("#1a237e")),
@@ -365,7 +394,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                     opt_text = options.get(letter)
                     if opt_text:
                         story.append(Paragraph(
-                            f"{letter}) {_esc(opt_text)}", STYLES["option"]
+                            f"{letter}) {render_to_markup(opt_text)}", STYLES["option"]
                         ))
 
             story.append(Spacer(1, 3 * mm))
@@ -413,7 +442,7 @@ def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> byte
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=MARGIN, bottomMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=BOTTOM_MARGIN,
     )
     story = []
 
