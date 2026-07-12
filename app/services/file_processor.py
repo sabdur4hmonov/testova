@@ -519,6 +519,52 @@ def _find_image_rect_in_band(
     return None
 
 
+def _expand_with_labels(
+    union: fitz.Rect,
+    words: list,
+    x_range: tuple[float, float] | None,
+    band: tuple[float, float],
+) -> fitz.Rect:
+    """
+    Grow a vector-figure rect to include the figure's OWN text labels — the
+    numbers/letters printed directly above/below the strokes (e.g. a number
+    line's "9,5 birlik", "B", "-3", "0", "2,5", "A"). Without this we'd crop a
+    bare axis with no numbers, which is useless.
+
+    Only text spans within (near) the figure's x-range and within a small
+    vertical window above/below it are pulled in. Option markers ("A)".."E)")
+    and question numbers are excluded, and the window never reaches into the
+    options block below.
+    """
+    y_top, y_bottom = band
+    x0, x1 = x_range if x_range else (union.x0, union.x1)
+    xlo, xhi = x0 - 12, x1 + 12
+    margin = max(union.height * 1.6, 18.0)
+    win_top = max(y_top, union.y0 - margin)
+    win_bot = min(y_bottom, union.y1 + margin)
+
+    # never expand into the options block: stop just above the first option
+    # marker sitting below the figure
+    opt_below = [
+        w[1] for w in words
+        if _OPTION_MARKER_RE.match(str(w[4]).strip()) and (w[1] + w[3]) / 2 > union.y1
+    ]
+    if opt_below:
+        win_bot = min(win_bot, min(opt_below) - 2)
+
+    fig = fitz.Rect(union)
+    for w in words:
+        wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+        token = str(w[4]).strip()
+        cx, cy = (wx0 + wx1) / 2, (wy0 + wy1) / 2
+        if not (xlo <= cx <= xhi) or not (win_top <= cy <= win_bot):
+            continue
+        if _OPTION_MARKER_RE.match(token) or _QNUM_WORD_RE.match(token):
+            continue
+        fig |= fitz.Rect(wx0, wy0, wx1, wy1)
+    return fig
+
+
 def _find_drawing_figure_rect(
     pdf_bytes: bytes,
     src_page: int,
@@ -527,20 +573,29 @@ def _find_drawing_figure_rect(
 ) -> fitz.Rect | None:
     """
     Vector diagram detection: union of drawing bboxes (lines, curves, shapes)
-    inside the question's band and column. Size guards reject stray rules or
-    underlines — if nothing figure-like is found, the caller attaches NOTHING
-    rather than a garbage region.
+    inside the question's band and column, then EXPANDED to include the
+    figure's own text labels. Accepts wide-and-flat figures (number lines,
+    rulers, timelines, bracket diagrams); rejects only tiny specks and
+    hairline rules. If nothing figure-like is found the caller attaches
+    NOTHING rather than a garbage region.
     """
     y_top, y_bottom = band
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        drawings = doc[src_page - 1].get_drawings()
+        page = doc[src_page - 1]
+        drawings = page.get_drawings()
+        words = page.get_text("words")
         doc.close()
     except Exception as e:
         logger.warning("get_drawings_failed", page=src_page, error=str(e))
         return None
 
-    union: fitz.Rect | None = None
+    # Accumulate the bounding box by explicit min/max — fitz's `|` treats a
+    # zero-area rect (a thin horizontal axis is height 0 in vector terms) as
+    # "empty" and drops it, which would collapse a number line to nothing.
+    x0 = y0 = float("inf")
+    x1 = y1 = float("-inf")
+    found = False
     for d in drawings:
         r = d.get("rect")
         if r is None:
@@ -548,16 +603,27 @@ def _find_drawing_figure_rect(
         cy = (r.y0 + r.y1) / 2
         if not (y_top <= cy < y_bottom) or not _rect_in_xrange(r, x_range):
             continue
-        union = fitz.Rect(r) if union is None else union | r
+        x0, y0 = min(x0, r.x0), min(y0, r.y0)
+        x1, y1 = max(x1, r.x1), max(y1, r.y1)
+        found = True
 
-    if union is None:
+    if not found:
         return None
-    # Must look like a figure: not a hairline rule, not spilling past the band
-    if union.width < 40 or union.height < 25:
+    union = fitz.Rect(x0, y0, x1, y1)
+    # ASPECT/AREA-aware acceptance: a number line/ruler/timeline is legitimately
+    # WIDE and FLAT. Reject only genuine non-figures:
+    if union.width < 40:                       # too narrow to be a figure
         return None
-    if union.height > (y_bottom - y_top) * 1.05:
+    if union.height < 5:                       # a hairline rule / underline
         return None
-    return union
+    if union.width * union.height < 200:       # a tiny speck
+        return None
+    if union.height > (y_bottom - y_top) * 1.05:  # spills the whole band
+        return None
+
+    fig = _expand_with_labels(union, words, x_range, band)
+    # small padding so the topmost/bottommost labels aren't clipped
+    return fitz.Rect(fig.x0 - 4, fig.y0 - 4, fig.x1 + 4, fig.y1 + 4)
 
 
 # ── Crop sanity check (FIX 1: garbage detector) ──────────────────────────────
