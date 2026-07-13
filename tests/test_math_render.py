@@ -6,6 +6,8 @@ a couple of smoke tests exercise the real matplotlib → PNG → PDF path.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.services import math_render as M
@@ -190,6 +192,78 @@ def test_bugb_variable_products_math_words_prose():
 
 def test_bugb_division_glyph():
     assert "\\div" in _latex("(1)/(2) ÷ (3)/(4)")
+
+
+# ── BUG B/C: boundary punctuation stays with prose, spacing preserved ────────
+
+def test_boundary_punct_peeled_to_prose():
+    for s in [
+        "Ifodani soddalashtiring: (5(a - b))/(3(a^2 + b^2))",
+        "Hisoblang: ((1)/(2)).",
+        "bo'lsa, (3)/(7)",
+    ]:
+        maths = [p[1] for is_math, p in M._iter_segments(s) if is_math]
+        assert maths, s
+        for src in maths:
+            # a math run never starts/ends with sentence punctuation
+            assert src[0] not in ":.,;" and src[-1] not in ":.,;", (s, src)
+
+
+def test_boundary_colon_in_prose_markup():
+    mk = M.render_to_markup("Ifodani soddalashtiring: (5(a - b))/(3(a^2 + b^2))")
+    # the colon and its space render as text before the image, not inside it
+    assert "soddalashtiring: " in mk
+    assert mk.count("<img") == 1
+
+
+def test_interior_division_and_ratio_and_decimal_untouched():
+    # interior ":" (fraction division) stays in the one math run
+    maths = [p for is_math, p in M._iter_segments("(a)/(b) : (c)/(d)") if is_math]
+    assert len(maths) == 1 and ":" in maths[0][0].latex()
+    # a bare ratio / decimal is non-structural -> verbatim prose, never split
+    assert M.render_to_markup("2:3") == "2:3"
+    assert M.render_to_markup("2,5") == "2,5"
+
+
+# ── REGRESSION 1: dashes are a minus, not a prose boundary ───────────────────
+
+def test_endash_stays_in_math_run():
+    for s in ["f(x) = x^2 – x + 1", "tg^2 α – 2 tg α + ctg α"]:  # U+2013 en-dash
+        maths = [p[1] for is_math, p in M._iter_segments(s) if is_math]
+        assert maths == [s], f"en-dash split the run: {s!r} -> {maths!r}"
+
+
+def test_all_dashes_are_minus_operators():
+    for dash in ("-", "−", "–", "—"):  # hyphen, minus, en-, em-dash
+        assert M.parse(f"x^2 {dash} 1").latex() == "{x}^{2} - 1"
+
+
+def test_peel_set_is_sentence_punctuation_only():
+    # the edge-peel must NEVER include arithmetic operators
+    assert M._EDGE_PUNCT == {":", ".", ",", ";"}
+    for op in ("-", "−", "–", "+", "*", "="):
+        assert op not in M._EDGE_PUNCT
+
+
+# ── REGRESSION 2 (meaning): coefficient never flush against a root index ─────
+
+def test_coefficient_gets_explicit_cdot_before_indexed_root():
+    tex = _latex("2 root(4, x * (7 + 4sqrt(3))) * sqrt(2sqrt(x) - sqrt(3x)) = x")
+    assert "\\cdot" in tex.split("\\sqrt[4]")[0].rstrip()[-6:], "no explicit mult"
+    # a digit must NEVER sit directly before the root index
+    assert not re.search(r"[0-9]\\sqrt\[", tex)
+
+
+def test_no_cdot_after_operator_before_root():
+    assert _latex("4 + root(3, x)") == "4 + \\sqrt[3]{x}"
+    assert _latex("= root(3, x)") == "= \\sqrt[3]{x}"
+    # an existing '*' is not doubled
+    assert _latex("2 * root(3, x)").count("\\cdot") == 1
+
+
+def test_plain_sqrt_not_guarded():
+    # a bare sqrt (no index) can't collide, so no forced \cdot
+    assert _latex("2 sqrt(3)") == "2 \\sqrt{3}"
 
 
 # ── total bail-out safety ────────────────────────────────────────────────────

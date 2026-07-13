@@ -80,7 +80,24 @@ class Seq(Node):
         return any(i.structural for i in self.items)
 
     def latex(self) -> str:
-        return "".join(i.latex() for i in self.items)
+        parts: list[str] = []
+        prev_sig = ""  # last non-whitespace fragment rendered
+        for item in self.items:
+            s = item.latex()
+            # MEANING GUARD (T-108 Bug #1): an indexed root drawn right after a
+            # coefficient (2 ⁴√…) reads as an exponent (2^4). If this Root
+            # follows a value (prev ends in a digit / ")" / "}", i.e. NOT an
+            # operator) with only whitespace between, force an explicit \cdot.
+            if (isinstance(item, Root)
+                    and prev_sig and prev_sig.rstrip()[-1:] in "0123456789)}]"):
+                if parts and parts[-1].strip() == "":
+                    parts[-1] = " \\cdot "
+                else:
+                    parts.append(" \\cdot ")
+            parts.append(s)
+            if s.strip():
+                prev_sig = s
+        return "".join(parts)
 
 
 class Text(Node):
@@ -188,7 +205,11 @@ _NAMED = {
 
 # operators / symbols allowed INSIDE a structural run → LaTeX.
 _SYMS = {
-    "+": "+", "-": "-", "−": "-", "*": "\\cdot ", "·": "\\cdot ", "⋅": "\\cdot ",
+    # hyphen, true minus (U+2212), en-dash (U+2013), em-dash (U+2014): all are
+    # a binary minus in this math context — keep them INSIDE the run, never a
+    # prose boundary that would cut "x^2 – x + 1" after the power.
+    "+": "+", "-": "-", "−": "-", "–": "-", "—": "-",
+    "*": "\\cdot ", "·": "\\cdot ", "⋅": "\\cdot ",
     "÷": "\\div ",
     "=": "=", "<": "<", ">": ">", "≤": "\\leq ", "≥": "\\geq ", "≠": "\\neq ",
     "≈": "\\approx ", "±": "\\pm ", "∞": "\\infty ", "°": "^{\\circ}",
@@ -453,13 +474,27 @@ _MATH_KINDS = {
 }
 
 
+# Sentence punctuation that borders prose: a leading/trailing ":" "." "," ";"
+# on a math run is really the surrounding sentence's punctuation, not part of
+# the formula. Peeling it back to the prose side keeps it out of the mathtext
+# image (which would otherwise typeset it with wrong spacing — "x : y", ",x").
+# Interior punctuation (ratio 2:3, fraction-division "a/b : c/d", the comma in
+# the decimal "2,5" which lives inside one num token) is untouched.
+_EDGE_PUNCT = {":", ".", ",", ";"}
+
+
+def _is_edge(t: _Tok) -> bool:
+    return t.kind == "sp" or (t.kind in ("sym", "comma") and t.val in _EDGE_PUNCT)
+
+
 def _emit_run(cur: list[_Tok], segments: list[tuple[str, object]]) -> None:
-    """Flush a buffer of math+space tokens. Edge spaces become prose so we
-    never imageify padding; the middle becomes a math run to be parsed."""
+    """Flush a buffer of math+space tokens. Edge spaces AND boundary sentence
+    punctuation become prose so we never imageify them; the middle becomes a
+    math run to be parsed."""
     a, b = 0, len(cur)
-    while a < b and cur[a].kind == "sp":
+    while a < b and _is_edge(cur[a]):
         a += 1
-    while b > a and cur[b - 1].kind == "sp":
+    while b > a and _is_edge(cur[b - 1]):
         b -= 1
     if a > 0:
         segments.append(("prose", "".join(t.val for t in cur[:a])))
