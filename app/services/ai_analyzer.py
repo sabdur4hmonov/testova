@@ -4,6 +4,8 @@ AI question extractor — Gemini Vision, 1 page per call, parallel.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import io
 import json
 import re
@@ -87,9 +89,15 @@ CRITICAL RULES:
      = 4.222..., 0,(45) = 0.4545...: copy them EXACTLY as "4,(2)". This is a
      DECIMAL, NOT a power — never turn "4,(2)" into "4^(2)", "4^2" or "4²".
    - Square root: ALWAYS write as sqrt(...) in ASCII. Never use the "√"
-     character. Put the ENTIRE expression under the radical bar inside ONE
-     sqrt(...): if the bar covers "2sqrt(x) - sqrt(3x)", write
-     sqrt(2sqrt(x) - sqrt(3x)) - NEVER let a term like "- sqrt(3x)" escape it.
+     character. The radicand is EXACTLY what sits UNDER the bar — no more, no
+     less. This works in BOTH directions:
+     * a term that IS under the bar must not escape it: if the bar covers
+       "2sqrt(x) - sqrt(3x)", write sqrt(2sqrt(x) - sqrt(3x)) - NEVER let a
+       term like "- sqrt(3x)" fall outside the sqrt.
+     * a term that is OUTSIDE the bar must NOT be pulled inside it: "4√3 + 2"
+       means 4·√3 plus 2 — the "+ 2" is a SEPARATE TERM, outside the radical.
+       Write it as 4sqrt(3) + 2 — NEVER as 4sqrt(3 + 2), and NEVER as
+       4sqrt(sqrt(3) + 2).
    - nth root (cube, fourth, ...): write as root(n, expression), e.g. the
      fourth root of x → root(4, x); the cube root of (a+b) → root(3, a+b).
      The small index n is NOT an exponent: NEVER turn a fourth root into "x^4"
@@ -165,7 +173,11 @@ CRITICAL RULES:
     exactly as printed. If something looks wrong, impossible or cut off,
     COPY IT AS-IS and set "verbatim_doubt": true for that question.
     NEVER repair, complete or normalize a formula.
-18. RETURN ONLY THE JSON ARRAY - nothing else"""
+18. IMAGE KEYWORDS: the Uzbek words "rasmda", "rasmga", "jadvalda",
+    "diagrammada", "grafikda", "shakl", "ko'rsatilgan", "tasvirlangan",
+    "sxemada" mean the question refers to a picture/table/diagram/graph — when
+    the stem contains any of them, set img=true.
+19. RETURN ONLY THE JSON ARRAY - nothing else"""
 
 ANSWER_SHEET_PROMPT = """Bu o'quvchining javob varaqasi. Test {total} ta savol.
 Har savol uchun belgilangan javobni o'qi (A/B/C/D), bo'sh bo'lsa null.
@@ -333,6 +345,24 @@ def clean_latex(text: str) -> str:
     return text.strip()
 
 
+# Uzbek words that signal a question refers to a visual (picture/table/graph).
+# Safety net: if Gemini missed img=true but the stem uses one of these, force
+# has_image=True so the figure pipeline runs.
+_IMAGE_KEYWORDS = (
+    "rasmda", "rasmga", "jadvalda", "diagrammada", "grafikda",
+    "shakl", "ko'rsatilgan", "koʻrsatilgan", "tasvirlangan", "sxemada",
+)
+
+
+def _force_image_from_keywords(q: dict) -> None:
+    if q.get("has_image"):
+        return
+    stem = (q.get("question_text") or "").lower()
+    if any(k in stem for k in _IMAGE_KEYWORDS):
+        q["has_image"] = True
+        logger.info("image_keyword_forced", question=q.get("question_number"))
+
+
 def clean_question(q: dict) -> dict:
     """Apply clean_latex + the OCR confusion dictionary to all text fields."""
     q["question_text"] = clean_latex(q.get("question_text", ""))
@@ -360,6 +390,7 @@ def clean_question(q: dict) -> dict:
             question=q.get("question_number"),
             replacements=all_repl,
         )
+    _force_image_from_keywords(q)
     return q
 
 
@@ -914,10 +945,23 @@ def _is_open_ended(q: dict) -> bool:
     return len(filled) == 0
 
 
+def _white_ratio(img: Image.Image) -> float:
+    """Fraction of near-white pixels (0..1). On any error returns 0 so a page
+    is NEVER skipped by mistake."""
+    try:
+        hist = img.convert("L").histogram()
+        total = sum(hist) or 1
+        return sum(hist[248:256]) / total
+    except Exception:
+        return 0.0
+
+
 class AIAnalyzer:
     def __init__(self) -> None:
         self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
         self._sem = asyncio.Semaphore(MAX_CONCURRENT)
+        # cost cache: md5(page image bytes) → extracted questions (this session)
+        self._page_cache: dict[str, list[dict]] = {}
 
     # ── Gemini call ─────────────────────────────────────────────────────────────
 
@@ -974,10 +1018,33 @@ class AIAnalyzer:
 
     # ── Per-page extraction ─────────────────────────────────────────────────────
 
-    async def _extract_page(self, page_num: int, img: Image.Image) -> list[dict]:
+    async def _extract_page(
+        self, page_num: int, img: Image.Image, info: dict | None = None,
+    ) -> list[dict]:
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="PNG")
         img_bytes = buf.getvalue()
+
+        # ── Cost cache: an identical page (same bytes) was already read ───────
+        key = hashlib.md5(img_bytes).hexdigest()
+        if key in self._page_cache:
+            logger.info("page_cache_hit", page=page_num)
+            dup = copy.deepcopy(self._page_cache[key])
+            for q in dup:
+                q["page_number"] = page_num
+            return dup
+
+        # ── Cost skip: a blank or header-only page with NO figure ────────────
+        # SAFETY: never skip a page that carries a figure/table (has_visual) —
+        # a text-light figure page (e.g. the number line) must still be read.
+        if info is not None and not info.get("has_visual"):
+            if info.get("text_len", 999) < 100 or _white_ratio(img) > 0.90:
+                logger.info(
+                    "page_skipped", page=page_num,
+                    text_len=info.get("text_len"),
+                )
+                self._page_cache[key] = []
+                return []
 
         for attempt in range(settings.GEMINI_MAX_RETRIES):
             try:
@@ -1035,6 +1102,8 @@ class AIAnalyzer:
                     logger.info("page_ok", page=page_num, found=len(questions))
                 else:
                     logger.warning("page_empty", page=page_num, raw_preview=raw[:300])
+                # cache the successful result for duplicate pages this session
+                self._page_cache[key] = copy.deepcopy(questions)
                 return questions
             except asyncio.TimeoutError:
                 logger.warning("page_timeout", page=page_num, attempt=attempt + 1)
@@ -1049,6 +1118,7 @@ class AIAnalyzer:
     async def extract_all_questions(
         self,
         images: list[Image.Image],
+        page_infos: list[dict] | None = None,
         **_kw,
     ) -> list[dict[str, Any]]:
         if not images:
@@ -1058,7 +1128,13 @@ class AIAnalyzer:
         # asyncio.gather preserves result ORDER (index matches task index),
         # so results[0] = page 1, results[1] = page 2, etc.
         # We use return_exceptions=True to not crash on one bad page.
-        tasks = [self._extract_page(i + 1, img) for i, img in enumerate(images)]
+        tasks = [
+            self._extract_page(
+                i + 1, img,
+                page_infos[i] if page_infos and i < len(page_infos) else None,
+            )
+            for i, img in enumerate(images)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # BUG FIX: Collect questions PAGE BY PAGE in order.
