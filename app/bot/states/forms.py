@@ -3,6 +3,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 class UploadStates(StatesGroup):
     waiting_for_file = State()
+    waiting_for_format = State()  # choose Oddiy / Ixcham before extraction
     waiting_for_answers = State()
     waiting_for_dup_resolution = State()
     waiting_for_variant_count = State()

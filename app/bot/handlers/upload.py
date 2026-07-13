@@ -12,7 +12,9 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from app.bot.keyboards.inline import dup_resolution_keyboard, reextract_keyboard
+from app.bot.keyboards.inline import (
+    dup_resolution_keyboard, format_choice_keyboard, reextract_keyboard,
+)
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
 from app.config import settings
@@ -35,7 +37,9 @@ from app.services.file_processor import (
     split_two_column_pages,
 )
 from app.services.pipeline import PipelineResult, process_file
-from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
+from app.services.pdf_generator import (
+    build_answer_key_pdf, build_variants_pdf, build_variants_pdf_compact,
+)
 from app.services.variant_generator import generate_variants, validate_questions
 from app.utils.logging import get_logger
 
@@ -543,13 +547,11 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         await message.answer(t("bad_format", lang))
         return
 
-    # ── Download ──────────────────────────────────────────────────────────────
-    status_msg = await message.answer(t("analyzing", lang))
+    # ── Download & save; then ask the FORMAT before any (paid) extraction ─────
     tg_file = await bot.get_file(file_id)
     raw = await bot.download_file(tg_file.file_path)
     content = raw.read()
 
-    # ── Save & create project ─────────────────────────────────────────────────
     project_id = str(uuid.uuid4())
     file_key = await storage.save_file(
         content, folder=f"projects/{project_id}/original", filename=filename
@@ -569,7 +571,59 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         session.add(project)
         await session.commit()
 
-    # ── The pipeline (services/pipeline.py) does everything else ──────────────
+    # Ask Oddiy/Ixcham FIRST — extraction runs only after the choice, so the
+    # chosen layout costs a single Gemini run (no regeneration).
+    await state.update_data(
+        project_id=project_id, file_type=file_type, file_key=file_key,
+    )
+    await state.set_state(UploadStates.waiting_for_format)
+    await message.answer(
+        "Variantlarni qanday formatda olmoqchisiz?",
+        reply_markup=format_choice_keyboard(),
+    )
+
+
+@router.callback_query(UploadStates.waiting_for_format, F.data.startswith("fmt:"))
+async def handle_format_choice(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """The teacher picked Oddiy/Ixcham; NOW run extraction (one Gemini pass)."""
+    lang = db_user.language.value
+    fmt = "compact" if callback.data == "fmt:compact" else "standard"
+    data = await state.get_data()
+    project_id: str = data.get("project_id", "")
+    file_type: str = data.get("file_type", "")
+    file_key: str = data.get("file_key", "")
+    if not project_id or not file_key:
+        await callback.answer()
+        return
+
+    await callback.answer()
+    await state.update_data(pdf_format=fmt)
+    try:
+        content = await storage.read_file(file_key)
+    except Exception as e:
+        logger.error("format_reload_failed", project_id=project_id, error=str(e))
+        await callback.message.answer(t("no_q", lang))
+        await state.clear()
+        return
+    await _run_extraction(
+        callback.message, state, db_user, content, file_type, project_id, lang
+    )
+
+
+async def _run_extraction(
+    message: Message,
+    state: FSMContext,
+    db_user: User,
+    content: bytes,
+    file_type: str,
+    project_id: str,
+    lang: str,
+) -> None:
+    """Run the pipeline and drive the post-extraction prompts. Shared entry
+    used after the format choice."""
+    status_msg = await message.answer(t("analyzing", lang))
     result = await run_pipeline_with_heartbeat(status_msg, content, file_type, project_id)
 
     if result.status == "no_questions":
@@ -957,7 +1011,14 @@ async def _generate_and_send(
 
     variants     = await asyncio.to_thread(generate_variants, raw_qs, count)
     exam_title   = (db_user.full_name or "Test") + " — Test"
-    variants_pdf = await asyncio.to_thread(build_variants_pdf, variants, exam_title)
+    # compact (2-column) only when the teacher chose it before extraction;
+    # the answer key is ALWAYS single-column.
+    _build = (
+        build_variants_pdf_compact
+        if data_pre.get("pdf_format") == "compact"
+        else build_variants_pdf
+    )
+    variants_pdf = await asyncio.to_thread(_build, variants, exam_title)
     key_pdf      = await asyncio.to_thread(build_answer_key_pdf, variants, exam_title)
 
     async with async_session_factory() as session:

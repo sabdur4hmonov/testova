@@ -2,6 +2,19 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
+def format_choice_keyboard() -> InlineKeyboardMarkup:
+    """Asked BEFORE extraction so the chosen layout costs only one Gemini run."""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="📄 Oddiy — har variant alohida bet", callback_data="fmt:standard"
+    )
+    builder.button(
+        text="📋 Ixcham — 2 ustunli, qog'oz tejaydi", callback_data="fmt:compact"
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def variant_count_keyboard(project_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for count in [5, 10, 20, 30]:
