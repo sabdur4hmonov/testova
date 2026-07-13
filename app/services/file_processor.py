@@ -623,7 +623,19 @@ def _find_drawing_figure_rect(
 
     fig = _expand_with_labels(union, words, x_range, band)
     # small padding so the topmost/bottommost labels aren't clipped
-    return fitz.Rect(fig.x0 - 4, fig.y0 - 4, fig.x1 + 4, fig.y1 + 4)
+    top = fig.y0 - 4
+    # BUG: the top padding could dip into the stem line just above the figure,
+    # baking a garbled "toping." sliver into the crop. Clamp the TOP (only) to
+    # stay below the nearest text line above the figure. Bottom/sides keep their
+    # padding so the number-line labels (9,5 birlik / B / A ...) are never lost.
+    xa, xb = x_range if x_range else (fig.x0, fig.x1)
+    above = [
+        w[3] for w in words
+        if w[3] <= fig.y0 and xa - 12 <= (w[0] + w[2]) / 2 <= xb + 12
+    ]
+    if above:
+        top = max(top, max(above) + 1)
+    return fitz.Rect(fig.x0 - 4, top, fig.x1 + 4, fig.y1 + 4)
 
 
 # ── Crop sanity check (FIX 1: garbage detector) ──────────────────────────────
@@ -908,6 +920,7 @@ def crop_and_save_image(
     page_number: int,
     padding_px: int = 8,
     pdf_bytes: bytes | None = None,
+    top_limit_pt: float | None = None,
 ) -> str | None:
     """
     Crop a figure region and save it as PNG, returning the file path.
@@ -915,15 +928,23 @@ def crop_and_save_image(
     When pdf_bytes is available the region is RE-RENDERED straight from the
     PDF at CROP_DPI via get_pixmap(clip=...) — sharp output regardless of the
     200-DPI page render. Falls back to cropping the PIL page render.
+
+    top_limit_pt: if set, the crop's TOP edge is never padded ABOVE this y
+    (PDF points). Used for a figure clamped just under a stem line, so the
+    symmetric padding can't pull the stem's descenders back into the crop.
+    Bottom and sides keep their padding.
     """
     if pdf_bytes is not None:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             page = doc[page_number - 1]
             pad_pt = padding_px * 72.0 / DPI
+            top = max(0.0, rect_pdf.y0 - pad_pt)
+            if top_limit_pt is not None:
+                top = max(top, top_limit_pt)
             clip = fitz.Rect(
                 max(0, rect_pdf.x0 - pad_pt),
-                max(0, rect_pdf.y0 - pad_pt),
+                top,
                 min(page.rect.x1, rect_pdf.x1 + pad_pt),
                 min(page.rect.y1, rect_pdf.y1 + pad_pt),
             )
@@ -957,6 +978,8 @@ def crop_and_save_image(
 
         left   = max(0, int(rect_pdf.x0 * scale_x) - padding_px)
         top    = max(0, int(rect_pdf.y0 * scale_y) - padding_px)
+        if top_limit_pt is not None:
+            top = max(top, int(top_limit_pt * scale_y))
         right  = min(img_w, int(rect_pdf.x1 * scale_x) + padding_px)
         bottom = min(img_h, int(rect_pdf.y1 * scale_y) + padding_px)
 
@@ -1077,10 +1100,12 @@ def attach_images_to_questions(
                         pdf_bytes, src_page, band, x_range
                     )
                     # Strategy 2: vector-drawing cluster (drawn diagrams)
+                    from_drawing = False
                     if rect is None:
                         rect = _find_drawing_figure_rect(
                             pdf_bytes, src_page, band, x_range
                         )
+                        from_drawing = rect is not None
                     # FIX 1: garbage detector — reject crops containing other
                     # questions' numbers/options or covering too much page.
                     if rect is not None:
@@ -1106,6 +1131,9 @@ def attach_images_to_questions(
                             question_number=q_num,
                             page_number=src_page,
                             pdf_bytes=pdf_bytes,
+                            # a drawing figure is clamped just under the stem;
+                            # don't let padding pull the stem back in
+                            top_limit_pt=rect.y0 if from_drawing else None,
                         )
                     # FIX 3(a): rejected/missing figure → geometric re-crop
                     # of the stem→options region (garbage-checked again).
