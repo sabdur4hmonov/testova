@@ -12,8 +12,9 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm, mm
 from reportlab.platypus import (
-    HRFlowable, Image as RLImage, PageBreak, Paragraph,
-    SimpleDocTemplate, Spacer, Table, TableStyle,
+    BaseDocTemplate, Frame, HRFlowable, Image as RLImage, KeepTogether,
+    PageBreak, PageTemplate, Paragraph, SimpleDocTemplate, Spacer, Table,
+    TableStyle,
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -435,6 +436,282 @@ def _append_img_desc(story: list, img_desc: str | None, available_w: float) -> N
     story.append(Spacer(1, 2 * mm))
     story.append(desc_tbl)
     story.append(Spacer(1, 2 * mm))
+
+
+# ── Compact 2-column variants PDF ─────────────────────────────────────────────
+
+# Rescale an inline math <img> only when it is WIDER than the narrow column —
+# proportionally, never cropped, never dropped to ASCII. Layout-only: operates
+# on the generated markup, never on math source (math_render.py is untouched).
+_IMG_TAG_RE = _re.compile(r'<img\b[^>]*?/>')
+
+
+def _fit_imgs(markup: str, max_w: float) -> str:
+    def _rescale(m: "_re.Match") -> str:
+        tag = m.group(0)
+        wm = _re.search(r'width="([\d.]+)"', tag)
+        if not wm:
+            return tag
+        w = float(wm.group(1))
+        if w <= max_w:
+            return tag
+        f = max_w / w
+        tag = _re.sub(r'width="[\d.]+"', f'width="{max_w:.2f}"', tag)
+        tag = _re.sub(
+            r'height="([\d.]+)"',
+            lambda hm: f'height="{float(hm.group(1)) * f:.2f}"', tag,
+        )
+        tag = _re.sub(
+            r'valign="(-?[\d.]+)"',
+            lambda vm: f'valign="{float(vm.group(1)) * f:.2f}"', tag,
+        )
+        return tag
+
+    return _IMG_TAG_RE.sub(_rescale, markup)
+
+
+_FILLIN_ROWS_COMPACT = [
+    ("Test nomi:", 18), ("Ism familiya:", 15), ("Guruh:", 20), ("Ball:", 8),
+]
+
+
+def _img_flowable(tag: str, max_w: float) -> RLImage | None:
+    """Build a standalone left-aligned Image flowable from an <img …/> tag,
+    so a TALL math image gets its own line with correct height (a tall inline
+    image confuses ReportLab's autoLeading and the next line draws onto it)."""
+    sm = _re.search(r'src="([^"]+)"', tag)
+    wm = _re.search(r'width="([\d.]+)"', tag)
+    hm = _re.search(r'height="([\d.]+)"', tag)
+    if not (sm and wm and hm):
+        return None
+    w, h = float(wm.group(1)), float(hm.group(1))
+    if w > max_w:  # never overflow the column
+        h *= max_w / w
+        w = max_w
+    try:
+        img = RLImage(sm.group(1), width=w, height=h)
+        img.hAlign = "LEFT"
+        img.spaceBefore = 1.5
+        img.spaceAfter = 1.5
+        return img
+    except Exception:
+        return None
+
+
+def _prefix_w(prefix: str, style: ParagraphStyle) -> float:
+    try:
+        return pdfmetrics.stringWidth(prefix, style.fontName, style.fontSize) + 3
+    except Exception:
+        return len(prefix) * style.fontSize * 0.6
+
+
+def _prefix_img_row(prefix: str, img: RLImage, style: ParagraphStyle,
+                    total_w: float) -> Table:
+    """Keep a lone prefix ('10.' / 'A)') on the SAME line as the tall image it
+    leads (never orphaned above it)."""
+    pstyle = ParagraphStyle("_pfx", parent=style, leftIndent=0)
+    pw = _prefix_w(prefix, style)
+    t = Table([[Paragraph(prefix, pstyle), img]], colWidths=[pw, total_w - pw])
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
+
+
+def _compact_flowables(markup: str, style: ParagraphStyle, max_w: float,
+                       total_w: float, prefix: str = "", space: float = 1.5) -> list:
+    """Render one stem/option as flowables. TALL math images (stacked
+    fractions, radicals) are promoted to their own Image flowable so they can
+    never overlap the following line; short inline math (x², √19) stays inline.
+    A lone leading prefix is paired with the first promoted image. `space` is
+    the vertical padding around a promoted image (options need more so stacked
+    fractions don't crush together)."""
+    flow: list = []
+    buf = prefix
+    prefix_pending = bool(prefix)
+    last = 0
+
+    def flush():
+        nonlocal buf
+        s = buf.strip()
+        # keep any real content; drop a fragment that is ONLY sentence
+        # punctuation + whitespace (an orphaned trailing "."). Operators and
+        # operands ("= x", "≤ x − 5", "> 3") always survive.
+        if s and s.strip(".,;: "):
+            flow.append(Paragraph(buf, style))
+        buf = ""
+
+    for m in _IMG_TAG_RE.finditer(markup):
+        buf += markup[last:m.start()]
+        last = m.end()
+        tag = m.group(0)
+        hm = _re.search(r'height="([\d.]+)"', tag)
+        tall = hm and float(hm.group(1)) > style.fontSize * 1.6
+        if not tall:
+            buf += tag  # short image stays inline
+            continue
+        img = _img_flowable(tag, max_w)
+        if img is None:
+            buf += tag  # couldn't load → keep inline (bail-safe)
+            continue
+        if prefix_pending and buf.strip() == prefix.strip():
+            # nothing but the prefix so far → keep them on one line
+            row = _prefix_img_row(prefix, img, style, total_w)
+            row.spaceBefore = row.spaceAfter = space
+            flow.append(row)
+            buf = ""
+            prefix_pending = False
+        else:
+            flush()
+            prefix_pending = False
+            img.spaceBefore = img.spaceAfter = space
+            flow.append(img)
+    buf += markup[last:]
+    flush()
+    return flow or [Paragraph(prefix + markup, style)]
+
+
+def _compact_page(canvas, doc) -> None:
+    """Footer + a thin light-gray rule down the gutter (compact layout only)."""
+    _page_footer(canvas, doc)
+    colw = (PAGE_WIDTH - 3 * MARGIN) / 2
+    x = MARGIN + colw + MARGIN / 2
+    canvas.saveState()
+    canvas.setStrokeColor(colors.HexColor("#444444"))
+    canvas.setLineWidth(1)
+    canvas.line(x, BOTTOM_MARGIN, x, PAGE_HEIGHT - MARGIN)
+    canvas.restoreState()
+
+
+def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -> bytes:
+    """
+    2-column compact layout (paper-saving). Each variant starts on a NEW PAGE;
+    a question is kept together so it never splits across a column break. Math
+    routes through the SAME render_to_markup pipeline as build_variants_pdf();
+    only the SCALE changes — a formula wider than the column is shrunk to fit,
+    never cropped, never dropped to ASCII. The answer key stays single-column.
+    """
+    buf = io.BytesIO()
+    colw = (PAGE_WIDTH - 3 * MARGIN) / 2
+    frame_pad = 6
+    usable = colw - frame_pad                 # content width inside a column
+    opt_indent = 8
+    # cap images to the TRUE available width, leaving room for the leading
+    # prefix ("10." / "A)") so they never overflow or orphan the number
+    stem_max_w = usable - 18
+    opt_max_w = usable - opt_indent - 14
+    frame_h = PAGE_HEIGHT - MARGIN - BOTTOM_MARGIN
+    left = Frame(MARGIN, BOTTOM_MARGIN, colw, frame_h,
+                 leftPadding=0, rightPadding=frame_pad, topPadding=0, bottomPadding=0, id="c1")
+    right = Frame(MARGIN + colw + MARGIN, BOTTOM_MARGIN, colw, frame_h,
+                  leftPadding=frame_pad, rightPadding=0, topPadding=0, bottomPadding=0, id="c2")
+    doc = BaseDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN, topMargin=MARGIN, bottomMargin=BOTTOM_MARGIN,
+    )
+    doc.addPageTemplates([
+        PageTemplate(id="twocol", frames=[left, right], onPage=_compact_page)
+    ])
+
+    head = ParagraphStyle("c_head", parent=STYLES["variant_header"], fontSize=10)
+    q_st = ParagraphStyle("c_q", parent=STYLES["question"], fontSize=9)
+    o_st = ParagraphStyle("c_o", parent=STYLES["option"], fontSize=8, leftIndent=opt_indent)
+    ctx_st = ParagraphStyle("c_ctx", parent=STYLES["context"], fontSize=8)
+    open_st = ParagraphStyle("c_open", parent=STYLES["open_ended_label"], fontSize=8)
+    fill_st = ParagraphStyle("c_fill", parent=STYLES["fillin"], fontSize=9)
+
+    story: list = []
+    for vi, variant in enumerate(variants):
+        if vi > 0:
+            story.append(PageBreak())  # every variant begins on a fresh page
+        vnum      = variant["variant_number"]
+        questions = variant.get("questions_data", [])
+
+        story.append(Paragraph(f"Variant {vnum}", head))
+        for label, dashes in _FILLIN_ROWS_COMPACT:
+            story.append(Paragraph(f"{label} " + "_" * dashes, fill_st))
+        story.append(Spacer(1, 1.5 * mm))
+        story.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#1a237e")))
+        story.append(Spacer(1, 2 * mm))
+
+        for q in questions:
+            block: list = []
+            pos       = q.get("position_in_variant", q.get("question_number", "?"))
+            q_text    = _fit_imgs(render_to_markup(q.get("question_text", "")), stem_max_w)
+            options   = q.get("options", {})
+            group_ctx = q.get("group_context")
+            is_open   = q.get("is_open_ended", False)
+
+            if group_ctx:
+                para = Paragraph(
+                    _fit_imgs(render_to_markup(group_ctx), usable - 10).replace("\n", "<br/>"),
+                    ctx_st,
+                )
+                tbl = Table([[para]], colWidths=[colw])
+                tbl.setStyle(TableStyle([
+                    ("BOX",        (0, 0), (-1, -1), 0.75, colors.HexColor("#1a237e")),
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#e8eaf6")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ]))
+                block.append(tbl)
+                block.append(Spacer(1, 1.5 * mm))
+
+            block.extend(_compact_flowables(q_text, q_st, stem_max_w, usable,
+                                            prefix=f"{pos}. "))
+
+            # ── Image block — scaled to fit the column, never cropped ─────────
+            if q.get("has_image"):
+                img_path = q.get("image_path")
+                img_desc = q.get("image_description")
+                if img_path:
+                    img_flow = _load_image_rl(img_path, max_width=usable)
+                    if img_flow:
+                        block.append(Spacer(1, 1.5 * mm))
+                        tbl = Table([[img_flow]], colWidths=[colw])
+                        tbl.setStyle(TableStyle([
+                            ("ALIGN",  (0, 0), (-1, -1), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                        ]))
+                        block.append(tbl)
+                        block.append(Spacer(1, 1.5 * mm))
+                    else:
+                        _append_img_desc(block, img_desc, colw)
+                elif img_desc:
+                    _append_img_desc(block, img_desc, colw)
+
+            if is_open:
+                block.append(Paragraph("<i>(Javobni yozing)</i>", open_st))
+                block.append(Spacer(1, 1.5 * mm))
+                block.append(HRFlowable(width="80%", thickness=0.5,
+                                        color=colors.HexColor("#aaaaaa"),
+                                        dash=(2, 4), spaceAfter=1.5 * mm))
+            else:
+                for letter in ["A", "B", "C", "D", "E"]:
+                    opt_text = options.get(letter)
+                    if opt_text:
+                        mk = _fit_imgs(render_to_markup(opt_text), opt_max_w)
+                        block.extend(_compact_flowables(
+                            mk, o_st, opt_max_w, usable, prefix=f"{letter}) ",
+                            space=5.0,
+                        ))
+
+            block.append(Spacer(1, 2.5 * mm))
+            # keep a whole question together so it never splits across a column
+            story.append(KeepTogether(block))
+
+    doc.build(story)
+    logger.info("variants_pdf_compact_built", variants=len(variants))
+    return buf.getvalue()
 
 
 def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
