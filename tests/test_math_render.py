@@ -135,10 +135,23 @@ def test_bug3_prompt_has_subscript_rule():
 
 def test_buga_sqrt_takes_only_its_argument():
     assert _latex("8(sqrt(3) - 1)") == "8\\left(\\sqrt{3} - 1\\right)"
+    # a trailing "+ term" stays OUTSIDE the radical (with and without "*")
     assert _latex("4sqrt(3) + 2") == "4\\sqrt{3} + 2"
-    # the source genuinely prints a nested radical here — preserve it, do NOT
-    # flatten it (that would change the answer)
+    assert _latex("4*sqrt(3) + 2").endswith("\\sqrt{3} + 2")
+    assert "\\sqrt{3 + 2}" not in _latex("4sqrt(3) + 2")  # +2 not under the bar
+    # a genuinely nested SOURCE renders faithfully — the renderer NEVER un-nests
+    # (that would corrupt real nested expressions); scoping is fixed in the prompt
     assert _latex("4sqrt(sqrt(3) + 2)") == "4\\sqrt{\\sqrt{3} + 2}"
+
+
+def test_vision_prompt_sqrt_rule_is_bidirectional():
+    from app.services.ai_analyzer import VISION_PROMPT as p
+    assert "must not escape it" in p                 # under-the-bar direction
+    assert "4sqrt(3) + 2" in p                       # outside-term worked example
+    assert "NEVER as 4sqrt(3 + 2)" in p
+    assert "4sqrt(sqrt(3) + 2)" in p                 # the exact regression case
+    # image keywords are a TRAILING rule, not wedged into the math-notation block
+    assert "18. IMAGE KEYWORDS" in p
 
 
 def test_buga_tall_math_options_do_not_overlap():
