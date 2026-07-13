@@ -34,6 +34,16 @@
   `ko'rsatilgan` / `tasvirlangan` / `sxemada` → force `has_image=True`.
 - Also mention these keywords in `VISION_PROMPT` so Gemini sets `img=true` itself.
 
+### Known extraction risks
+Gemini extraction of radicals is non-deterministic. On 1 of 6 T-108 runs it
+nested "4sqrt(3) + 2" as "4sqrt(sqrt(3) + 2)" — a meaning error (7.46 vs 8.93).
+The VISION_PROMPT sqrt rule is now **bidirectional** to guard both directions
+(a term must neither escape the radical nor be pulled into it). The renderer is
+faithful by design and will NOT un-nest a corrupt source (un-nesting would be a
+regex-on-math fix that corrupts genuinely nested expressions). If a wrong
+radical ever appears in an exported PDF, check the **DB source first** — it is
+almost certainly extraction, not rendering.
+
 ### DO NOT IMPLEMENT — poisoned items from an old pre-T-108 planning doc
 - ~~"Answer options have digits bleeding from the adjacent column (`B) 1, 2` → `B) 1, 25`)"~~
 - ~~"Gemini invents numbers (`y = x - 0,2` → `y = x - 0,212`)"~~
