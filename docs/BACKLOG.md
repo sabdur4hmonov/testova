@@ -14,6 +14,14 @@
 - Flow: teacher sends PDF → bot asks *"Variantlarni qanday formatda olmoqchisiz?"* with **[Oddiy] / [Ixcham]** → teacher picks → **THEN** extract → generate in chosen format.
 - Touches: `upload.py`, `keyboards/inline.py`, `states/forms.py` (new `FORMAT_CHOICE` state), `pdf_generator.py`.
 
+**Shipped simplifications (revisit later):**
+- Compact PDF: wide figures currently scale to column width. If a real exam needs a
+  true full-page-width figure, add a second `PageTemplate` with a full-width frame and
+  switch templates mid-document.
+- Compact format is currently only offered in the single-upload flow (`upload.py`). The
+  multi-source builder (`multi_source.py`) always produces standard single-column output.
+  Wire the format choice into `multi_source` later.
+
 ### FEATURE — Gemini API cost optimization (`ai_analyzer.py`)
 1. **Skip blank pages**: if a page image is >90% white pixels (PIL), skip the Gemini call.
 2. **Skip header-only pages**: if the PDF page text < 100 chars, skip the Gemini call.
