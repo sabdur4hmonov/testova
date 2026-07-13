@@ -30,6 +30,7 @@ from app.services.ai_analyzer import (
 )
 from app.services.file_processor import (
     attach_images_to_questions,
+    compute_page_infos,
     docx_to_images,
     image_to_pages,
     pdf_to_images,
@@ -140,9 +141,19 @@ async def process_file(
     page_images, col_map = await asyncio.to_thread(split_two_column_pages, src_pages)
     images = [p.image for p in page_images]
 
+    # Cost optimizer metadata (PDF only): per-page text length + has-figure, so
+    # blank/header-only pages can be skipped WITHOUT ever dropping a figure page.
+    page_infos = None
+    if file_type == "pdf":
+        page_infos = await asyncio.to_thread(
+            compute_page_infos, content, page_images, col_map
+        )
+
     # ── Extract via Gemini Vision ─────────────────────────────────────────────
     analyzer = AIAnalyzer()
-    all_questions = await analyzer.extract_all_questions(images=images)
+    all_questions = await analyzer.extract_all_questions(
+        images=images, page_infos=page_infos
+    )
 
     if not all_questions:
         await _set_project_status(project_id, ProjectStatus.FAILED)

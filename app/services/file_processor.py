@@ -87,19 +87,65 @@ def pdf_extract_pages_text(pdf_bytes: bytes) -> list[str]:
 
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = DPI) -> list[PageImage]:
-    """Convert every PDF page to a PIL Image."""
+    """Convert every PDF page to a PIL Image.
+
+    Cost optimization: a page with NO embedded raster image renders fine for
+    Gemini at a lower DPI (150) — fewer image tiles, cheaper call. Pages that
+    carry an embedded image keep the full DPI so figure detail survives. Figure
+    CROPS are re-rendered straight from the PDF at CROP_DPI, so the page DPI
+    never affects crop sharpness.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: list[PageImage] = []
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
     for page_num in range(len(doc)):
         page = doc[page_num]
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        page_dpi = dpi if page.get_images() else min(dpi, 150)
+        zoom = page_dpi / 72
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         pages.append(PageImage(page_number=page_num + 1, image=img))
-        logger.debug("converted_page", page=page_num + 1, total=len(doc))
+        logger.debug("converted_page", page=page_num + 1, total=len(doc), dpi=page_dpi)
     doc.close()
     return pages
+
+
+def compute_page_infos(
+    pdf_bytes: bytes,
+    page_images: list["PageImage"],
+    col_map: dict[int, dict] | None,
+) -> list[dict]:
+    """
+    Per-analysis-image metadata for the cost optimizer: text length and whether
+    the source PDF page carries ANY figure (embedded image OR vector drawing).
+    Computed per SOURCE page (conservative): a page with a figure is NEVER a
+    skip candidate, so a figure-heavy, text-light page (e.g. the number line)
+    is always sent to Gemini.
+    """
+    src_meta: dict[int, dict] = {}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return [{"text_len": 999, "has_visual": True} for _ in page_images]
+
+    def meta(src: int) -> dict:
+        if src not in src_meta:
+            try:
+                pg = doc[src - 1]
+                has_visual = bool(pg.get_images()) or bool(pg.get_drawings())
+                src_meta[src] = {
+                    "text_len": len(pg.get_text().strip()),
+                    "has_visual": has_visual,
+                }
+            except Exception:
+                src_meta[src] = {"text_len": 999, "has_visual": True}
+        return src_meta[src]
+
+    infos: list[dict] = []
+    for p in page_images:
+        src = (col_map or {}).get(p.page_number, {}).get("src_page", p.page_number)
+        infos.append(meta(src))
+    doc.close()
+    return infos
 
 
 # ── Two-column detection & splitting ─────────────────────────────────────────
