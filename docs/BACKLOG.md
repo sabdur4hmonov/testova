@@ -37,6 +37,10 @@
 ### Follow-ups
 - Per-user attribution for `gemini_usage`: thread `user_id` through to `AIAnalyzer`
   (currently logged as NULL) so `/usage` can break cost down per teacher.
+- `/usage` merges output + thinking into one figure. Split them into separate
+  columns so the thinking-token share of cost is visible (2.5 Flash thinks by
+  default and bills thinking at the $2.50/1M output rate). Low priority — total
+  cost is currently ~200 so'm per extraction.
 
 ### Known extraction risks
 Gemini extraction of radicals is non-deterministic. On 1 of 6 T-108 runs it
