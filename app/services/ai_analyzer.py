@@ -982,6 +982,12 @@ class AIAnalyzer:
                 response_mime_type="application/json",
             ),
         )
+        # Instrumentation only — read-only usage accounting, never crashes.
+        try:
+            from app.services.usage_log import log_gemini_usage
+            log_gemini_usage(response, kind="extract", model=settings.GEMINI_MODEL)
+        except Exception:
+            pass
         fr = 0
         if response.candidates:
             fr = int(response.candidates[0].finish_reason)
