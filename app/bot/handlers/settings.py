@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from app.config import settings
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, language_menu, main_menu
 from app.bot.states.forms import SettingsStates
 from app.database import async_session_factory
@@ -130,9 +131,10 @@ async def handle_pricing(message: Message, db_user: User) -> None:
 @router.message(F.text.in_({v["support"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_support(message: Message, db_user: User) -> None:
     lang = db_user.language.value
+    handle = f"@{settings.ADMIN_USERNAME}"
     msgs = {
-        "uz": "💬 Yordam uchun: @testova_support\n\nBot versiyasi: 1.0.0",
-        "en": "💬 Support: @testova_support\n\nBot version: 1.0.0",
-        "ru": "💬 Поддержка: @testova_support\n\nВерсия бота: 1.0.0",
+        "uz": f"💬 Yordam uchun: {handle}\n\nBot versiyasi: 1.0.0",
+        "en": f"💬 Support: {handle}\n\nBot version: 1.0.0",
+        "ru": f"💬 Поддержка: {handle}\n\nВерсия бота: 1.0.0",
     }
     await message.answer(msgs.get(lang, msgs["en"]))

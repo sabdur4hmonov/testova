@@ -5,6 +5,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from app.bot.keyboards.main_menu import main_menu
+from app.config import settings
 from app.models.user import User
 from app.services import access
 
@@ -62,7 +63,7 @@ async def cmd_help(message: Message, db_user: User) -> None:
             "   Variant raqamini ko'rsating — bot avtomatik tekshiradi.\n\n"
             "3. <b>Loyihalar</b>\n"
             "   Barcha yuklangan fayllar saqlanadi.\n\n"
-            "Muammo bo'lsa: @testova_support"
+            f"Muammo bo'lsa: @{settings.ADMIN_USERNAME}"
         ),
         "en": (
             "📖 <b>Help</b>\n\n"
@@ -74,7 +75,7 @@ async def cmd_help(message: Message, db_user: User) -> None:
             "   Specify the variant number — bot checks automatically.\n\n"
             "3. <b>Projects</b>\n"
             "   All uploaded files are saved for reuse.\n\n"
-            "Problems: @testova_support"
+            f"Problems: @{settings.ADMIN_USERNAME}"
         ),
         "ru": (
             "📖 <b>Помощь</b>\n\n"
@@ -86,7 +87,7 @@ async def cmd_help(message: Message, db_user: User) -> None:
             "   Укажите номер варианта — бот проверит автоматически.\n\n"
             "3. <b>Проекты</b>\n"
             "   Все загруженные файлы сохраняются.\n\n"
-            "Проблемы: @testova_support"
+            f"Проблемы: @{settings.ADMIN_USERNAME}"
         ),
     }
     await message.answer(texts.get(lang, texts["uz"]), parse_mode="HTML")

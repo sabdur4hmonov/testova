@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
+from app.config import settings
 from app.tasks.celery_app import celery_app
 from app.utils.logging import get_logger
 
@@ -70,7 +71,7 @@ def send_processing_failed(
     text = (
         f"❌ Fayl tahlil qilishda xatolik yuz berdi.\n\n"
         f"<code>{error_message[:200]}</code>\n\n"
-        f"Iltimos, boshqa fayl yuboring yoki @testova_support ga murojaat qiling."
+        f"Iltimos, boshqa fayl yuboring yoki @{settings.ADMIN_USERNAME} ga murojaat qiling."
     )
     with httpx.Client(timeout=10) as client:
         client.post(
