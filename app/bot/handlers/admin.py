@@ -15,8 +15,10 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models.admin_log import AdminLog
 from app.models.builder import BuilderSession, BuilderStatus
+from app.models.gemini_usage import GeminiUsage
 from app.models.project import Project
 from app.models.user import User
+from app.services.usage_log import estimate_cost
 from app.utils.logging import get_logger
 
 router = Router(name="admin")
@@ -308,6 +310,51 @@ async def cmd_stats(message: Message, db_user: User) -> None:
     )
 
 
+# ── /usage — read-only Gemini cost tracking ──────────────────────────────────
+
+@router.message(Command("usage"))
+async def cmd_usage(message: Message, db_user: User) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    now = _now()
+    windows = [
+        ("Bugun", now.replace(hour=0, minute=0, second=0, microsecond=0)),
+        ("30 kun", now - timedelta(days=30)),
+    ]
+    blocks: list[str] = []
+    async with async_session_factory() as session:
+        for label, start in windows:
+            calls, in_tok, out_tok = (await session.execute(
+                select(
+                    func.count(),
+                    func.coalesce(func.sum(GeminiUsage.prompt_tokens), 0),
+                    func.coalesce(
+                        func.sum(GeminiUsage.output_tokens + GeminiUsage.thinking_tokens), 0
+                    ),
+                ).where(GeminiUsage.created_at >= start)
+            )).one()
+            calls, in_tok, out_tok = int(calls), int(in_tok), int(out_tok)
+            # out_tok already includes thinking → pass thinking=0 to the cost fn
+            cost = estimate_cost(
+                in_tok, out_tok, 0,
+                settings.GEMINI_PRICE_IN_PER_M, settings.GEMINI_PRICE_OUT_PER_M,
+                settings.UZS_PER_USD,
+            )
+            blocks.append(
+                f"<b>{label}</b>: {calls} ta chaqiruv\n"
+                f"   📥 kirish: {in_tok:,} token\n"
+                f"   📤 chiqish (+thinking): {out_tok:,} token\n"
+                f"   💵 ~${cost['usd']:.4f}  ≈ {cost['som']:,.0f} so‘m"
+            )
+    await message.answer(
+        "📈 <b>Gemini xarajati</b>\n"
+        f"model: <code>{settings.GEMINI_MODEL}</code>\n\n"
+        + "\n\n".join(blocks),
+        parse_mode="HTML",
+    )
+
+
 # ── /help_admin ───────────────────────────────────────────────────────────────
 
 @router.message(Command("help_admin"))
@@ -326,6 +373,7 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
         "<code>/info &lt;id&gt;</code> — batafsil ma’lumot\n"
         "<code>/users [sahifa]</code> — ro‘yxat (20 tadan)\n"
-        "<code>/stats</code> — umumiy statistika",
+        "<code>/stats</code> — umumiy statistika\n"
+        "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)",
         parse_mode="HTML",
     )
