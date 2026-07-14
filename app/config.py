@@ -34,8 +34,14 @@ class Settings(BaseSettings):
 
     # ── AI ────────────────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash-exp"
+    # gemini-2.0-flash-exp was shut down 2026-06-01; keep the fallback valid.
+    # (.env overrides this; live behavior is unchanged.)
+    GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_MAX_RETRIES: int = 3
+    # Cost tracking (read-only). Prices are USD per 1M tokens; so'm via UZS rate.
+    GEMINI_PRICE_IN_PER_M: float = 0.30    # gemini-2.5-flash input list price
+    GEMINI_PRICE_OUT_PER_M: float = 2.50   # gemini-2.5-flash output list price
+    UZS_PER_USD: float = 12000.0
 
     # ── Storage ───────────────────────────────────────────────────────────────
     STORAGE_TYPE: str = "local"  # "local" | "s3"
