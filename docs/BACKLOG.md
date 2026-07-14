@@ -34,6 +34,10 @@
   `ko'rsatilgan` / `tasvirlangan` / `sxemada` → force `has_image=True`.
 - Also mention these keywords in `VISION_PROMPT` so Gemini sets `img=true` itself.
 
+### Follow-ups
+- Per-user attribution for `gemini_usage`: thread `user_id` through to `AIAnalyzer`
+  (currently logged as NULL) so `/usage` can break cost down per teacher.
+
 ### Known extraction risks
 Gemini extraction of radicals is non-deterministic. On 1 of 6 T-108 runs it
 nested "4sqrt(3) + 2" as "4sqrt(sqrt(3) + 2)" — a meaning error (7.46 vs 8.93).
