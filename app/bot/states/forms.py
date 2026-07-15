@@ -20,6 +20,7 @@ class BuilderStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_answers = State()
     waiting_for_next_action = State()
+    waiting_for_builder_format = State()  # Oddiy / Ixcham, asked at finish
     waiting_for_variant_count = State()
     waiting_for_question_count = State()
     waiting_for_reuse_confirm = State()

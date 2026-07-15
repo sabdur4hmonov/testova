@@ -34,6 +34,7 @@ from app.bot.keyboards.inline import (
     builder_retry_keyboard,
     builder_reuse_keyboard,
     builder_save_keyboard,
+    format_choice_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import BuilderStates
@@ -52,7 +53,9 @@ from app.models.user import User
 from app.models.variant import Variant
 from app.services import access, storage
 from app.services.file_processor import detect_file_type
-from app.services.pdf_generator import build_answer_key_pdf, build_variants_pdf
+from app.services.pdf_generator import (
+    build_answer_key_pdf, build_variants_pdf, build_variants_pdf_compact,
+)
 from app.services.variant_generator import (
     assemble_pool,
     pool_variant_builder,
@@ -622,7 +625,6 @@ async def handle_finish(callback: CallbackQuery, state: FSMContext, db_user: Use
 
     img_count = sum(1 for q in pool if q.get("image_path"))
     await state.update_data(pool_size=len(pool))
-    await state.set_state(BuilderStates.waiting_for_variant_count)
     await callback.message.edit_text(
         bt(
             "pool_summary", lang,
@@ -631,6 +633,23 @@ async def handle_finish(callback: CallbackQuery, state: FSMContext, db_user: Use
         ),
         parse_mode="HTML",
     )
+    # Ask Oddiy/Ixcham BEFORE the variant-count prompt. All extraction is
+    # already done (per-file at upload) and generation is pure shuffle+render,
+    # so this costs no extra Gemini call.
+    await state.set_state(BuilderStates.waiting_for_builder_format)
+    await callback.message.answer(
+        "Variantlarni qanday formatda olmoqchisiz?",
+        reply_markup=format_choice_keyboard(),
+    )
+
+
+@router.callback_query(BuilderStates.waiting_for_builder_format, F.data.startswith("fmt:"))
+async def handle_builder_format(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    fmt = "compact" if callback.data == "fmt:compact" else "standard"
+    await state.update_data(pdf_format=fmt)   # same FSM key as the single flow
+    await callback.answer()
+    await state.set_state(BuilderStates.waiting_for_variant_count)
     await callback.message.answer(bt("ask_variants", lang, max=MAX_VARIANTS))
 
 
@@ -759,6 +778,7 @@ async def _do_generate(
     message: Message, state: FSMContext, db_user: User,
     session_id: str, n: int, m: int, status, lang: str,
 ) -> None:
+    data = await state.get_data()
     pool, _collapsed, _siblings, _sources = await _load_pool(session_id)
 
     # Selection is pure CPU — run OFF the event loop so it can never block the
@@ -802,8 +822,16 @@ async def _do_generate(
             pass
 
     exam_title = "Ko'p manbali test"
+    # Layout choice only — compact if the teacher chose Ixcham at finish, else
+    # standard (also the default when pdf_format is absent). The answer key
+    # stays single-column in both.
+    _build = (
+        build_variants_pdf_compact
+        if data.get("pdf_format") == "compact"
+        else build_variants_pdf
+    )
     variants_pdf = await asyncio.wait_for(
-        asyncio.to_thread(build_variants_pdf, variants, exam_title),
+        asyncio.to_thread(_build, variants, exam_title),
         timeout=PDF_BUILD_TIMEOUT,
     )
     key_pdf = await asyncio.wait_for(
