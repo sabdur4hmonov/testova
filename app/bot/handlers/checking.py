@@ -9,12 +9,19 @@ Flow:
 """
 from __future__ import annotations
 
+import uuid
+
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from app.bot.keyboards.inline import check_project_keyboard
-from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
+from app.bot.keyboards.inline import (
+    check_again_keyboard,
+    check_mode_keyboard,
+    check_project_keyboard,
+    key_confirm_keyboard,
+)
+from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, main_menu
 from app.bot.states.forms import CheckingStates
 from app.config import settings
 from app.database import async_session_factory
@@ -22,7 +29,10 @@ from app.models.user import User
 from app.services import storage
 from app.services.ai_analyzer import AIAnalyzer
 from app.services.answer_checker import check_answers
+from app.services.answer_key_parser import parse_answer_key
+from app.services.checker import compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
+from app.services.sheet_reader import read_answer_sheet
 from app.utils.logging import get_logger
 
 router = Router(name="checking")
@@ -38,6 +48,32 @@ _PHOTO_PROMPTS = {
 
 @router.message(F.text.in_({v["check"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_check_button(message: Message, state: FSMContext, db_user: User) -> None:
+    """Entry: offer the two grading modes. Free (gated by can_check, ignores uses_left)."""
+    lang = db_user.language.value
+    await state.set_state(CheckingStates.choosing_check_mode)
+    prompts = {
+        "uz": "Testni qanday tekshiramiz?",
+        "en": "How do you want to check the test?",
+        "ru": "Как проверим тест?",
+    }
+    await message.answer(
+        prompts.get(lang, prompts["en"]),
+        reply_markup=check_mode_keyboard(lang),
+    )
+
+
+@router.callback_query(CheckingStates.choosing_check_mode, F.data == "chk:saved")
+async def handle_mode_saved(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """Saved-project grading — the existing, unchanged flow."""
+    await callback.answer()
+    await _show_project_picker(callback.message, state, db_user)
+
+
+async def _show_project_picker(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
     lang = db_user.language.value
 
     # Load the teacher's OWN completed projects that actually have variants,
@@ -246,3 +282,240 @@ async def handle_variant_number(
             )
             session.add(sub)
             await session.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MANUAL "Javob orqali tekshirish" flow — grade against a typed answer key.
+# Free by design: lives under the "Test tekshirish" button (gated by can_check,
+# which ignores uses_left). NEVER calls access.decrement_use.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_KEY_PROMPT = {
+    "uz": (
+        "📝 To'g'ri javoblarni kiriting.\n"
+        "Masalan: <code>1A 2B 3C 4D</code> yoki <code>ABCDABCD</code>"
+    ),
+    "en": (
+        "📝 Enter the correct answers.\n"
+        "e.g. <code>1A 2B 3C 4D</code> or <code>ABCDABCD</code>"
+    ),
+    "ru": (
+        "📝 Введите правильные ответы.\n"
+        "Например: <code>1A 2B 3C 4D</code> или <code>ABCDABCD</code>"
+    ),
+}
+
+_SHEET_PROMPT = {
+    "uz": "📷 O'quvchining javob varaqasi rasmini yuboring:",
+    "en": "📷 Send a photo of the student's answer sheet:",
+    "ru": "📷 Отправьте фото листа ответов ученика:",
+}
+
+_UNREADABLE = {
+    "uz": "📷 Rasm aniq chiqmagan. Yorug'roq joyda, tepadan qayta suratga oling va yuboring.",
+    "en": "📷 The photo wasn't clear. Retake it from above in better light and resend.",
+    "ru": "📷 Фото нечёткое. Переснимите сверху при хорошем свете и отправьте снова.",
+}
+
+
+@router.callback_query(CheckingStates.choosing_check_mode, F.data == "chk:manual")
+async def handle_mode_manual(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    await state.set_state(CheckingStates.waiting_for_key)
+    await callback.message.edit_text(_KEY_PROMPT.get(lang, _KEY_PROMPT["uz"]))
+    await callback.answer()
+
+
+@router.message(CheckingStates.waiting_for_key, F.text)
+async def handle_manual_key(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    key, reason = parse_answer_key(message.text)
+    if not key:
+        # Stay in the same state — let the teacher retype.
+        await message.answer("❌ " + reason)
+        return
+
+    await state.update_data(manual_key={str(k): v for k, v in key.items()})
+    await state.set_state(CheckingStates.waiting_for_key_confirm)
+
+    preview = ", ".join(f"{q}-{key[q]}" for q in sorted(key))
+    headers = {
+        "uz": f"✅ {len(key)} ta javob: {preview}",
+        "en": f"✅ {len(key)} answers: {preview}",
+        "ru": f"✅ {len(key)} ответов: {preview}",
+    }
+    await message.answer(
+        headers.get(lang, headers["en"]),
+        reply_markup=key_confirm_keyboard(lang),
+    )
+
+
+@router.callback_query(CheckingStates.waiting_for_key_confirm, F.data == "chk:key_redo")
+async def handle_key_redo(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    await state.set_state(CheckingStates.waiting_for_key)
+    await callback.message.edit_text(_KEY_PROMPT.get(lang, _KEY_PROMPT["uz"]))
+    await callback.answer()
+
+
+@router.callback_query(CheckingStates.waiting_for_key_confirm, F.data == "chk:key_ok")
+async def handle_key_ok(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    key = data.get("manual_key") or {}
+
+    # Persist the session; every sheet graded now references it.
+    from app.models.manual_check_session import ManualCheckSession
+    async with async_session_factory() as session:
+        row = ManualCheckSession(
+            user_id=db_user.telegram_id,
+            correct_answers=key,
+        )
+        session.add(row)
+        await session.commit()
+        session_id = str(row.id)
+
+    await state.update_data(manual_session_id=session_id, manual_total=len(key))
+    await state.set_state(CheckingStates.waiting_for_manual_sheet)
+    await callback.message.edit_text(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    await callback.answer()
+
+
+@router.callback_query(CheckingStates.waiting_for_manual_sheet, F.data == "chk:again")
+async def handle_manual_again(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    await callback.message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    await callback.answer()
+
+
+@router.callback_query(CheckingStates.waiting_for_manual_sheet, F.data == "chk:finish")
+async def handle_manual_finish(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    await state.clear()
+    done = {"uz": "🏁 Tekshiruv yakunlandi.", "en": "🏁 Checking finished.",
+            "ru": "🏁 Проверка завершена."}
+    await callback.message.answer(
+        done.get(lang, done["en"]), reply_markup=main_menu(lang)
+    )
+    await callback.answer()
+
+
+def _format_manual_result(res: dict, lang: str) -> str:
+    total = res["total"]
+    score = res["score"]
+    wrong = res["wrong"]
+    unclear = res["unclear"]
+    percent = round(score / total * 100) if total else 0
+    grade = grade_for(percent)
+    xato = total - score
+
+    L = {
+        "uz": ("✅ Tekshiruv natijasi:", "📊 To'g'ri", "❌ Xato", "savol",
+               "O'quvchi", "To'g'ri", "❓ Aniqlanmadi", "qo'lda tekshiring", "⭐ Baho"),
+        "en": ("✅ Result:", "📊 Correct", "❌ Wrong", "Q",
+               "Student", "Correct", "❓ Unclear", "check by hand", "⭐ Grade"),
+        "ru": ("✅ Результат:", "📊 Верно", "❌ Ошибки", "вопрос",
+               "Ученик", "Верно", "❓ Не распознано", "проверьте вручную", "⭐ Оценка"),
+    }.get(lang) or None
+    if L is None:
+        L = ("✅ Result:", "📊 Correct", "❌ Wrong", "Q",
+             "Student", "Correct", "❓ Unclear", "check by hand", "⭐ Grade")
+    (hdr, t_lbl, x_lbl, q_lbl, stu_lbl, cor_lbl,
+     unc_lbl, hand_lbl, grade_lbl) = L
+
+    lines = [hdr, f"{t_lbl}: {score}/{total} ({percent}%)", f"{x_lbl}: {xato}"]
+    for w in wrong:
+        s = w["student"] or "—"
+        lines.append(f"{w['q']}-{q_lbl}: {stu_lbl} {s} → {cor_lbl} {w['correct']}")
+    if unclear:
+        nums = ", ".join(str(q) for q in unclear)
+        lines.append(f"{unc_lbl}: {nums} — {hand_lbl}")
+    lines.append(f"{grade_lbl}: {grade}")
+    return "\n".join(lines)
+
+
+@router.message(CheckingStates.waiting_for_manual_sheet, F.photo | F.document)
+async def handle_manual_sheet(
+    message: Message, state: FSMContext, db_user: User, bot: Bot
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    key_raw = data.get("manual_key") or {}
+    total = data.get("manual_total") or len(key_raw)
+    session_id = data.get("manual_session_id")
+
+    # Reuse the existing photo-download pattern.
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document:
+        file_id = message.document.file_id
+    else:
+        return
+
+    thinking = await message.answer({
+        "uz": "🤖 Javob varaqasi tekshirilmoqda...",
+        "en": "🤖 Checking answer sheet...",
+        "ru": "🤖 Проверяем лист ответов...",
+    }.get(lang, "🤖 Checking..."))
+
+    try:
+        tg_file = await bot.get_file(file_id)
+        file_bytes_io = await bot.download_file(tg_file.file_path)
+        content = file_bytes_io.read()
+
+        read = await read_answer_sheet(content, total)
+        detected = len(read["answers"]) + len(read["unclear"])
+        if detected == 0:
+            await thinking.delete()
+            await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
+            return  # stay in waiting_for_manual_sheet — let them retry
+
+        key_int = {int(k): v for k, v in key_raw.items()}
+        res = compare_with_unclear(read["answers"], key_int, read["unclear"])
+    except Exception as e:
+        code = "#CHK-" + uuid.uuid4().hex[:4].upper()
+        logger.warning("manual_check_failed", code=code, error=str(e))
+        await thinking.delete()
+        errs = {
+            "uz": f"⚠️ Xatolik yuz berdi ({code}). Rasmni qaytadan yuboring.",
+            "en": f"⚠️ Something went wrong ({code}). Please resend the photo.",
+            "ru": f"⚠️ Произошла ошибка ({code}). Отправьте фото ещё раз.",
+        }
+        await message.answer(errs.get(lang, errs["en"]))
+        return
+
+    report = _format_manual_result(res, lang)
+    await thinking.delete()
+    await message.answer(report, reply_markup=check_again_keyboard(lang))
+
+    # Persist the result (manual_session_id set, project_id NULL).
+    try:
+        import uuid as _uuid
+        from app.models.check_result import CheckResult
+        async with async_session_factory() as session:
+            session.add(CheckResult(
+                user_id=db_user.telegram_id,
+                project_id=None,
+                manual_session_id=_uuid.UUID(session_id) if session_id else None,
+                variant_number=read["variant"],
+                score=res["score"],
+                total=res["total"],
+                wrong_answers=res["wrong"],
+                unclear=res["unclear"],
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning("check_result_save_failed", error=str(e))
+    # Stay in waiting_for_manual_sheet so another photo grades immediately.

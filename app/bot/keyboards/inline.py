@@ -172,6 +172,39 @@ def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def check_mode_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Pick how to grade: against a saved project, or by a typed answer key."""
+    labels = {
+        "uz": [("📂 Saqlangan testni tekshirish", "chk:saved"),
+               ("📷 Javob orqali tekshirish", "chk:manual")],
+        "en": [("📂 Check a saved test", "chk:saved"),
+               ("📷 Check by answer key", "chk:manual")],
+        "ru": [("📂 Проверить сохранённый тест", "chk:saved"),
+               ("📷 Проверить по ключу", "chk:manual")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def key_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Confirm the parsed answer key, or re-enter it."""
+    labels = {
+        "uz": [("✅ To'g'ri", "chk:key_ok"), ("✏️ Qayta kiritish", "chk:key_redo")],
+        "en": [("✅ Correct", "chk:key_ok"), ("✏️ Re-enter", "chk:key_redo")],
+        "ru": [("✅ Верно", "chk:key_ok"), ("✏️ Ввести заново", "chk:key_redo")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def check_again_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """After a result: grade another sheet in the same session, or finish."""
+    labels = {
+        "uz": [("➕ Yana varaqa yuborish", "chk:again"), ("🏁 Yakunlash", "chk:finish")],
+        "en": [("➕ Send another sheet", "chk:again"), ("🏁 Finish", "chk:finish")],
+        "ru": [("➕ Отправить ещё лист", "chk:again"), ("🏁 Завершить", "chk:finish")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
 def confirm_keyboard(action: str, lang: str = "uz") -> InlineKeyboardMarkup:
     labels = {
         "uz": ("✅ Ha", "❌ Yo'q"),

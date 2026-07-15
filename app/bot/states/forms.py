@@ -10,9 +10,15 @@ class UploadStates(StatesGroup):
 
 
 class CheckingStates(StatesGroup):
+    # Saved-project grading flow (unchanged).
     waiting_for_project = State()
     waiting_for_answer_sheet = State()
     waiting_for_variant_number = State()
+    # Manual "Javob orqali tekshirish" flow.
+    choosing_check_mode = State()      # picking Saqlangan vs Javob orqali
+    waiting_for_key = State()          # teacher types the answer key
+    waiting_for_key_confirm = State()  # echo shown, confirm / re-enter
+    waiting_for_manual_sheet = State() # awaiting a student answer-sheet photo
 
 
 class BuilderStates(StatesGroup):

@@ -7,6 +7,8 @@ from app.models.subscription import Subscription
 from app.models.builder import BuilderSession, BuilderSource, BuilderStatus
 from app.models.admin_log import AdminLog
 from app.models.gemini_usage import GeminiUsage
+from app.models.check_result import CheckResult
+from app.models.manual_check_session import ManualCheckSession
 
 __all__ = [
     "User",
@@ -23,4 +25,6 @@ __all__ = [
     "BuilderStatus",
     "AdminLog",
     "GeminiUsage",
+    "CheckResult",
+    "ManualCheckSession",
 ]
