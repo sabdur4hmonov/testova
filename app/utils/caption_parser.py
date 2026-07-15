@@ -35,3 +35,17 @@ def parse_caption(caption: str | None) -> tuple[str | None, int | None]:
 
     name = " ".join(name_tokens).strip() or None
     return name, variant
+
+
+def parse_name_input(text: str | None) -> str | None:
+    """
+    Resolve a free-typed name for the "give a name / or /skip" prompts (test
+    names AND student names). Returns None for blank/None/"/skip"; otherwise the
+    trimmed text, capped at 100 chars (matches projects.display_name width).
+    """
+    if not text:
+        return None
+    s = text.strip()
+    if not s or s.lower() == "/skip":
+        return None
+    return s[:100]

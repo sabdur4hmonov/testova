@@ -158,8 +158,11 @@ def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
     """List the teacher's own projects to pick which test to grade against."""
     builder = InlineKeyboardBuilder()
     for p in projects:
+        # Teacher-given display_name wins; fall back to the auto name for
+        # projects created before naming existed.
+        label = getattr(p, "display_name", None) or p.name
         builder.button(
-            text=f"📄 {p.name}",
+            text=f"📄 {label}",
             callback_data=f"check_project:{p.id}",
         )
     cancel = {
@@ -201,6 +204,16 @@ def check_again_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
         "uz": [("➕ Yana varaqa yuborish", "chk:again"), ("🏁 Yakunlash", "chk:finish")],
         "en": [("➕ Send another sheet", "chk:again"), ("🏁 Finish", "chk:finish")],
         "ru": [("➕ Отправить ещё лист", "chk:again"), ("🏁 Завершить", "chk:finish")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def project_name_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """After variants are delivered: name the test, or keep it nameless."""
+    labels = {
+        "uz": [("📝 Nom berish", "pname:set"), ("⏭ Nomsiz saqlash", "pname:skip")],
+        "en": [("📝 Give a name", "pname:set"), ("⏭ Save without a name", "pname:skip")],
+        "ru": [("📝 Дать имя", "pname:set"), ("⏭ Без имени", "pname:skip")],
     }
     return _two_button_kb(labels.get(lang, labels["en"]))
 

@@ -36,7 +36,7 @@ from app.services.answer_key_parser import parse_answer_key
 from app.services.checker import compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
-from app.utils.caption_parser import parse_caption
+from app.utils.caption_parser import parse_caption, parse_name_input
 from app.utils.logging import get_logger
 
 router = Router(name="checking")
@@ -47,6 +47,13 @@ _PHOTO_PROMPTS = {
     "uz": "📷 O'quvchining javob varaqasi rasmini yuboring:",
     "en": "📷 Send a photo of the student's answer sheet:",
     "ru": "📷 Отправьте фото листа ответов ученика:",
+}
+
+# Asked once per sheet ONLY when the photo arrived without a name caption.
+_STUDENT_NAME_PROMPT = {
+    "uz": "👤 O'quvchi ismi? (yoki /skip)",
+    "en": "👤 Student's name? (or /skip)",
+    "ru": "👤 Имя ученика? (или /skip)",
 }
 
 
@@ -236,6 +243,7 @@ async def handle_project_selected(
     _, project_id = callback.data.split(":", 1)
 
     # Stash the project name for the group-result header (best-effort).
+    # Prefer the teacher-given display_name, fall back to the auto name.
     test_name = None
     try:
         import uuid as _uuid
@@ -243,9 +251,12 @@ async def handle_project_selected(
         from app.models.project import Project
         async with async_session_factory() as session:
             res = await session.execute(
-                select(Project.name).where(Project.id == _uuid.UUID(project_id))
+                select(Project.display_name, Project.name)
+                .where(Project.id == _uuid.UUID(project_id))
             )
-            test_name = res.scalar_one_or_none()
+            row = res.first()
+            if row:
+                test_name = row[0] or row[1]
     except Exception:
         pass
 
@@ -283,9 +294,35 @@ async def handle_answer_sheet_upload(
 
     # Caption may carry the student's name and/or the variant number.
     name, variant = parse_caption(message.caption)
-    await state.update_data(answer_sheet_key=key, student_name=name)
+    await state.update_data(
+        answer_sheet_key=key, student_name=name, pending_variant=variant
+    )
 
-    # Skip the variant question ONLY when the caption gave an integer variant.
+    # No caption name → ask for it once (fast path preserved when caption has it).
+    if name is None:
+        await state.set_state(CheckingStates.waiting_for_saved_name)
+        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
+        return
+
+    await _proceed_saved_variant(message, state, db_user, name)
+
+
+@router.message(CheckingStates.waiting_for_saved_name, F.text)
+async def handle_saved_student_name(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    name = parse_name_input(message.text)  # /skip or empty → None
+    await state.update_data(student_name=name)
+    await _proceed_saved_variant(message, state, db_user, name)
+
+
+async def _proceed_saved_variant(
+    message: Message, state: FSMContext, db_user: User, name: str | None
+) -> None:
+    """After the name is settled: grade if the variant is known, else ask it."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    variant = data.get("pending_variant")
     if variant is not None:
         await _grade_saved(message, state, db_user, variant, name)
         return
@@ -319,7 +356,7 @@ async def handle_variant_number(
         return
 
     data = await state.get_data()
-    name = data.get("student_name")  # from the photo caption, if any
+    name = data.get("student_name")  # from caption or the name prompt, if any
     await _grade_saved(message, state, db_user, variant_num, name)
 
 
@@ -494,6 +531,12 @@ _UNREADABLE = {
     "ru": "📷 Фото нечёткое. Переснимите сверху при хорошем свете и отправьте снова.",
 }
 
+_MANUAL_TESTNAME_PROMPT = {
+    "uz": "📌 Bu tekshiruvga nom bering (masalan: 8B), yoki /skip:",
+    "en": "📌 Name this check (e.g. 8B), or /skip:",
+    "ru": "📌 Назовите эту проверку (например: 8B) или /skip:",
+}
+
 
 @router.callback_query(CheckingStates.choosing_check_mode, F.data == "chk:manual")
 async def handle_mode_manual(
@@ -564,9 +607,21 @@ async def handle_key_ok(
         manual_session_id=session_id, manual_total=len(key),
         flow="manual", run_results=[],
     )
-    await state.set_state(CheckingStates.waiting_for_manual_sheet)
-    await callback.message.edit_text(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    # Name this checking session once, so its group header reads "<name> — <date>".
+    await state.set_state(CheckingStates.waiting_for_manual_test_name)
+    await callback.message.edit_text(_MANUAL_TESTNAME_PROMPT.get(lang, _MANUAL_TESTNAME_PROMPT["uz"]))
     await callback.answer()
+
+
+@router.message(CheckingStates.waiting_for_manual_test_name, F.text)
+async def handle_manual_test_name(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    test_name = parse_name_input(message.text)  # /skip or empty → None (date-only)
+    await state.update_data(test_name=test_name)
+    await state.set_state(CheckingStates.waiting_for_manual_sheet)
+    await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
 
 
 # ── Loop / finish — shared by BOTH flows (branch on FSM `flow`) ───────────────
@@ -678,13 +733,10 @@ def _format_manual_result(
 async def handle_manual_sheet(
     message: Message, state: FSMContext, db_user: User, bot: Bot
 ) -> None:
+    """Gate: fast-path when the photo carries a name caption; else ask the name
+    first. Re-runs for EVERY photo in the [➕ Yana] loop."""
     lang = db_user.language.value
-    data = await state.get_data()
-    key_raw = data.get("manual_key") or {}
-    total = data.get("manual_total") or len(key_raw)
-    session_id = data.get("manual_session_id")
 
-    # Reuse the existing photo-download pattern.
     if message.photo:
         file_id = message.photo[-1].file_id
     elif message.document:
@@ -692,8 +744,58 @@ async def handle_manual_sheet(
     else:
         return
 
-    # Caption may carry the student's name (and optionally a variant number).
     name, caption_variant = parse_caption(message.caption)
+
+    # No caption name → ask once, remembering this photo, then grade.
+    if name is None:
+        await state.update_data(
+            pending_sheet_file_id=file_id, pending_caption_variant=caption_variant
+        )
+        await state.set_state(CheckingStates.waiting_for_manual_name)
+        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
+        return
+
+    await _grade_manual(message, state, db_user, bot, file_id, name, caption_variant)
+
+
+@router.message(CheckingStates.waiting_for_manual_name, F.text)
+async def handle_manual_student_name(
+    message: Message, state: FSMContext, db_user: User, bot: Bot
+) -> None:
+    name = parse_name_input(message.text)  # /skip or empty → None
+    data = await state.get_data()
+    file_id = data.get("pending_sheet_file_id")
+    caption_variant = data.get("pending_caption_variant")
+    if not file_id:
+        # Nothing pending (stale) — bounce back to awaiting a photo.
+        lang = db_user.language.value
+        await state.set_state(CheckingStates.waiting_for_manual_sheet)
+        await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+        return
+    await _grade_manual(message, state, db_user, bot, file_id, name, caption_variant)
+
+
+async def _grade_manual(
+    message: Message,
+    state: FSMContext,
+    db_user: User,
+    bot: Bot,
+    file_id: str,
+    name: str | None,
+    caption_variant: int | None,
+) -> None:
+    """Download → read → grade one manual sheet, then return to the loop."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    key_raw = data.get("manual_key") or {}
+    total = data.get("manual_total") or len(key_raw)
+    session_id = data.get("manual_session_id")
+
+    # Return to the loop state up front so EVERY exit (unreadable, error,
+    # success) leaves the next photo catchable — including when we arrived here
+    # from the name prompt.
+    await state.set_state(CheckingStates.waiting_for_manual_sheet)
+    await state.update_data(pending_sheet_file_id=None, pending_caption_variant=None)
 
     thinking = await message.answer({
         "uz": "🤖 Javob varaqasi tekshirilmoqda...",

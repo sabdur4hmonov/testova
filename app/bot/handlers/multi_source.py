@@ -175,10 +175,20 @@ BT = {
         "en": "What should we do with the session?",
         "ru": "Что делаем с сессией?",
     },
+    "ask_name": {
+        "uz": "📌 Bu testga nom bering (masalan: 8B), yoki /skip:",
+        "en": "📌 Give this test a name (e.g. 8B), or /skip:",
+        "ru": "📌 Введите название теста (например: 8B) или /skip:",
+    },
     "saved": {
         "uz": "💾 Sessiya saqlandi (savollar banki keyinroq ishlatiladi).",
         "en": "💾 Session saved (the question bank feature will use it later).",
         "ru": "💾 Сессия сохранена (банк вопросов будет использован позже).",
+    },
+    "saved_named": {
+        "uz": "💾 Saqlandi: {name}",
+        "en": "💾 Saved: {name}",
+        "ru": "💾 Сохранено: {name}",
     },
     "deleted": {
         "uz": "🗑 Sessiya o'chirildi.",
@@ -928,10 +938,40 @@ async def handle_gen_regen_params(callback: CallbackQuery, state: FSMContext, db
 @router.callback_query(BuilderStates.waiting_for_save_choice, F.data.in_({"bld:save", "bld:delete"}))
 async def handle_save_choice(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
-    data = await state.get_data()
-    session_id = data.get("builder_session_id")
     save = callback.data == "bld:save"
 
+    if not save:
+        data = await state.get_data()
+        session_id = data.get("builder_session_id")
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+            res = await session.execute(
+                select(BuilderSession).where(BuilderSession.id == uuid.UUID(session_id))
+            )
+            bs = res.scalar_one_or_none()
+            if bs:
+                await session.delete(bs)  # sources cascade; source projects stay
+                await session.commit()
+        await state.clear()
+        await callback.message.edit_text(bt("deleted", lang))
+        await callback.answer()
+        return
+
+    # Save: ask for a name FIRST, then finalize in the name handler (reuses the
+    # existing save keyboard/flow — only adds the name step before completion).
+    await state.set_state(BuilderStates.waiting_for_builder_name)
+    await callback.message.edit_text(bt("ask_name", lang))
+    await callback.answer()
+
+
+@router.message(BuilderStates.waiting_for_builder_name, F.text)
+async def handle_builder_name(message: Message, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    from app.utils.caption_parser import parse_name_input
+    name = parse_name_input(message.text)
+
+    data = await state.get_data()
+    session_id = data.get("builder_session_id")
     async with async_session_factory() as session:
         from sqlalchemy import select
         res = await session.execute(
@@ -939,15 +979,18 @@ async def handle_save_choice(callback: CallbackQuery, state: FSMContext, db_user
         )
         bs = res.scalar_one_or_none()
         if bs:
-            if save:
-                bs.status = BuilderStatus.SAVED
-            else:
-                await session.delete(bs)  # sources cascade; source projects stay
+            bs.status = BuilderStatus.SAVED
+            if name and bs.pool_project_id:
+                proj = await session.get(Project, bs.pool_project_id)
+                if proj:
+                    proj.display_name = name
             await session.commit()
 
     await state.clear()
-    await callback.message.edit_text(bt("saved" if save else "deleted", lang))
-    await callback.answer()
+    if name:
+        await message.answer(bt("saved_named", lang, name=name))
+    else:
+        await message.answer(bt("saved", lang))
 
 
 # ── P2: stray messages inside builder states ─────────────────────────────────

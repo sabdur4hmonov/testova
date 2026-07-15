@@ -40,6 +40,21 @@ class Project(Base):
     question_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(256), nullable=True)  # Celery task id
+
+    # Teacher-supplied test name (asked AFTER a successful generation). Falls
+    # back to `name` when NULL so existing projects still label correctly.
+    display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Reserved for later phases — added now so we never re-migrate `projects`.
+    checking_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    exam_start_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    exam_end_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

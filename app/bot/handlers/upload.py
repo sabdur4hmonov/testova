@@ -13,10 +13,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from app.bot.keyboards.inline import (
-    dup_resolution_keyboard, format_choice_keyboard, reextract_keyboard,
+    dup_resolution_keyboard, format_choice_keyboard,
+    project_name_keyboard, reextract_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
+from app.utils.caption_parser import parse_name_input
 from app.config import settings
 from app.database import async_session_factory
 from app.models.project import Project, ProjectStatus
@@ -1042,5 +1044,58 @@ async def _generate_and_send(
         BufferedInputFile(key_pdf, filename="answer_keys.pdf"),
         caption=t("key_cap", lang),
     )
-    await state.clear()
     logger.info("variants_sent", project_id=project_id, count=count)
+
+    # Naming step — asked ONLY now that the variants exist (no orphan names).
+    await state.set_state(UploadStates.waiting_for_project_name_choice)
+    await state.update_data(project_id=project_id)
+    prompts = {
+        "uz": "📛 Bu testni nomlaysizmi?",
+        "en": "📛 Name this test?",
+        "ru": "📛 Назвать этот тест?",
+    }
+    await message.answer(prompts.get(lang, prompts["uz"]), reply_markup=project_name_keyboard(lang))
+
+
+# ── Naming the generated test (after variants delivered) ─────────────────────
+
+@router.callback_query(UploadStates.waiting_for_project_name_choice, F.data == "pname:set")
+async def handle_name_set(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    await state.set_state(UploadStates.waiting_for_project_name)
+    prompts = {
+        "uz": "📌 Testga nom bering (masalan: 8B 14.07.26):",
+        "en": "📌 Give the test a name (e.g. 8B 14.07.26):",
+        "ru": "📌 Введите название теста (например: 8B 14.07.26):",
+    }
+    await callback.message.edit_text(prompts.get(lang, prompts["uz"]))
+    await callback.answer()
+
+
+@router.callback_query(UploadStates.waiting_for_project_name_choice, F.data == "pname:skip")
+async def handle_name_skip(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
+    # display_name stays NULL — identical to the pre-naming behaviour.
+    await state.clear()
+    await callback.answer()
+
+
+@router.message(UploadStates.waiting_for_project_name, F.text)
+async def handle_project_name(message: Message, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    name = parse_name_input(message.text)
+    data = await state.get_data()
+    project_id = data.get("project_id")
+
+    if name and project_id:
+        async with async_session_factory() as session:
+            proj = await session.get(Project, uuid.UUID(project_id))
+            if proj:
+                proj.display_name = name
+                await session.commit()
+        oks = {
+            "uz": f"✅ Saqlandi: {name}",
+            "en": f"✅ Saved: {name}",
+            "ru": f"✅ Сохранено: {name}",
+        }
+        await message.answer(oks.get(lang, oks["en"]))
+    await state.clear()
