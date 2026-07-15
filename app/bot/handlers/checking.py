@@ -9,7 +9,9 @@ Flow:
 """
 from __future__ import annotations
 
+import html
 import uuid
+from datetime import date
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
@@ -19,6 +21,7 @@ from app.bot.keyboards.inline import (
     check_again_keyboard,
     check_mode_keyboard,
     check_project_keyboard,
+    group_copy_keyboard,
     key_confirm_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, main_menu
@@ -33,6 +36,7 @@ from app.services.answer_key_parser import parse_answer_key
 from app.services.checker import compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
+from app.utils.caption_parser import parse_caption
 from app.utils.logging import get_logger
 
 router = Router(name="checking")
@@ -46,9 +50,109 @@ _PHOTO_PROMPTS = {
 }
 
 
+# ── Shared per-session run accumulation + group result (both flows) ───────────
+
+def _name_line(name: str | None, variant: int | None, lang: str) -> str | None:
+    """Above-the-score identity line, e.g. '👤 Saidakbar — Variant 13'."""
+    if not name:
+        return None
+    v_lbl = {"uz": "Variant", "en": "Variant", "ru": "Вариант"}.get(lang, "Variant")
+    if variant is not None:
+        return f"👤 {name} — {v_lbl} {variant}"
+    return f"👤 {name}"
+
+
+async def _append_run_result(
+    state: FSMContext,
+    *,
+    name: str | None,
+    variant: int | None,
+    score: int,
+    total: int,
+    grade: int,
+) -> None:
+    """Record one graded sheet in FSM so [🏁 Yakunlash] can build a group table."""
+    data = await state.get_data()
+    runs = list(data.get("run_results") or [])
+    runs.append({
+        "name": name, "variant": variant,
+        "score": score, "total": total, "grade": grade,
+    })
+    await state.update_data(run_results=runs)
+
+
+def _row_label(entry: dict, idx: int, lang: str) -> str:
+    """Name, else '(Variant N)' when the variant is known, else '(Varaqa N)'."""
+    if entry.get("name"):
+        return entry["name"]
+    v_lbl = {"uz": "Variant", "en": "Variant", "ru": "Вариант"}.get(lang, "Variant")
+    s_lbl = {"uz": "Varaqa", "en": "Sheet", "ru": "Лист"}.get(lang, "Sheet")
+    if entry.get("variant") is not None:
+        return f"({v_lbl} {entry['variant']})"
+    return f"({s_lbl} {idx})"
+
+
+def build_group_result(
+    runs: list[dict], lang: str, test_name: str | None = None
+) -> tuple[str, str]:
+    """
+    Build (pretty_text, tsv_text) for a finished grading session.
+
+    pretty_text: header + rank table (score DESC) + average + grade histogram.
+    tsv_text:    'label<TAB>score<TAB>grade' per line, same sort — Excel-ready.
+    """
+    today = date.today().isoformat()
+    hdr = {
+        "uz": "📊 Umumiy natija", "en": "📊 Group result", "ru": "📊 Общий результат",
+    }.get(lang, "📊 Group result")
+    header = f"{hdr}\n{test_name} — {today}" if test_name else f"{hdr}\n{today}"
+
+    if not runs:
+        empty = {
+            "uz": "Hech qanday varaqa tekshirilmadi.",
+            "en": "No sheets were checked.",
+            "ru": "Ни один лист не проверен.",
+        }.get(lang, "No sheets were checked.")
+        return f"{header}\n\n{empty}", ""
+
+    # Rank by score DESC (stable: preserves grading order within ties).
+    ordered = sorted(
+        enumerate(runs, start=1), key=lambda p: p[1]["score"], reverse=True
+    )
+
+    lines = [header, ""]
+    tsv_lines: list[str] = []
+    for rank, (orig_idx, e) in enumerate(ordered, start=1):
+        label = _row_label(e, orig_idx, lang)
+        lines.append(f"{rank}. {label} — {e['score']}/{e['total']} ⭐{e['grade']}")
+        tsv_lines.append(f"{label}\t{e['score']}\t{e['grade']}")
+
+    total = runs[0]["total"]
+    avg_score = sum(e["score"] for e in runs) / len(runs)
+    avg_pct = round(
+        sum((e["score"] / e["total"] * 100) if e["total"] else 0 for e in runs)
+        / len(runs)
+    )
+    avg_lbl = {"uz": "📈 O'rtacha", "en": "📈 Average", "ru": "📈 Среднее"}.get(
+        lang, "📈 Average"
+    )
+    lines.append("")
+    lines.append(f"{avg_lbl}: {avg_score:.1f}/{total} ({avg_pct}%)")
+
+    dist = {5: 0, 4: 0, 3: 0, 2: 0}
+    for e in runs:
+        dist[e["grade"]] = dist.get(e["grade"], 0) + 1
+    lines.append(
+        f"⭐5: {dist[5]}  |  ⭐4: {dist[4]}  |  ⭐3: {dist[3]}  |  ⭐2: {dist[2]}"
+    )
+
+    return "\n".join(lines), "\n".join(tsv_lines)
+
+
 @router.message(F.text.in_({v["check"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_check_button(message: Message, state: FSMContext, db_user: User) -> None:
     """Entry: offer the two grading modes. Free (gated by can_check, ignores uses_left)."""
+    await state.clear()  # drop any stale run_results / copy_tsv from a prior session
     lang = db_user.language.value
     await state.set_state(CheckingStates.choosing_check_mode)
     prompts = {
@@ -131,7 +235,23 @@ async def handle_project_selected(
     lang = db_user.language.value
     _, project_id = callback.data.split(":", 1)
 
-    await state.update_data(project_id=project_id)
+    # Stash the project name for the group-result header (best-effort).
+    test_name = None
+    try:
+        import uuid as _uuid
+        from sqlalchemy import select
+        from app.models.project import Project
+        async with async_session_factory() as session:
+            res = await session.execute(
+                select(Project.name).where(Project.id == _uuid.UUID(project_id))
+            )
+            test_name = res.scalar_one_or_none()
+    except Exception:
+        pass
+
+    await state.update_data(
+        project_id=project_id, flow="saved", test_name=test_name, run_results=[]
+    )
     await state.set_state(CheckingStates.waiting_for_answer_sheet)
     await callback.message.edit_text(_PHOTO_PROMPTS.get(lang, _PHOTO_PROMPTS["uz"]))
     await callback.answer()
@@ -160,9 +280,17 @@ async def handle_answer_sheet_upload(
 
     # Save temporarily
     key = await storage.save_file(content, folder="temp/answer_sheets", filename=filename)
-    await state.update_data(answer_sheet_key=key)
-    await state.set_state(CheckingStates.waiting_for_variant_number)
 
+    # Caption may carry the student's name and/or the variant number.
+    name, variant = parse_caption(message.caption)
+    await state.update_data(answer_sheet_key=key, student_name=name)
+
+    # Skip the variant question ONLY when the caption gave an integer variant.
+    if variant is not None:
+        await _grade_saved(message, state, db_user, variant, name)
+        return
+
+    await state.set_state(CheckingStates.waiting_for_variant_number)
     prompts = {
         "uz": "🔢 Variant raqamini kiriting (masalan: 1, 2, 3...):",
         "en": "🔢 Enter the variant number (e.g. 1, 2, 3...):",
@@ -190,6 +318,20 @@ async def handle_variant_number(
         await message.answer(errs.get(lang, errs["en"]))
         return
 
+    data = await state.get_data()
+    name = data.get("student_name")  # from the photo caption, if any
+    await _grade_saved(message, state, db_user, variant_num, name)
+
+
+async def _grade_saved(
+    message: Message,
+    state: FSMContext,
+    db_user: User,
+    variant_num: int,
+    name: str | None,
+) -> None:
+    """Grade one sheet in the saved-project flow. Loops via [➕ Yana]/[🏁 Yakunlash]."""
+    lang = db_user.language.value
     data = await state.get_data()
     answer_sheet_key = data.get("answer_sheet_key")
     project_id = data.get("project_id")  # set during project-selection step
@@ -247,7 +389,8 @@ async def handle_variant_number(
         }
         await thinking.delete()
         await message.answer(msgs.get(lang, msgs["en"]))
-        await state.clear()
+        # Stay in the flow so the teacher can retry a different variant/photo.
+        await state.set_state(CheckingStates.waiting_for_answer_sheet)
         return
 
     # ── Extract student answers from image ────────────────────────────────────
@@ -261,12 +404,22 @@ async def handle_variant_number(
     # ── Grade ─────────────────────────────────────────────────────────────────
     result = check_answers(student_answers, answer_key)
     report = result.format_telegram_report(lang)
+    name_line = _name_line(name, variant_num, lang)
+    if name_line:
+        report = name_line + "\n" + report
 
     await thinking.delete()
-    await message.answer(report)
-    await state.clear()
+    await message.answer(report, reply_markup=check_again_keyboard(lang))
 
-    # Save submission record
+    grade = grade_for(result.score_percent)
+    await _append_run_result(
+        state, name=name, variant=variant_num,
+        score=result.correct, total=result.total, grade=grade,
+    )
+    # Ready for the next sheet in the same run.
+    await state.set_state(CheckingStates.waiting_for_answer_sheet)
+
+    # Save submission record (UNCHANGED — existing shipped behaviour).
     if variant_record:
         from app.models.submission import Submission
         async with async_session_factory() as session:
@@ -282,6 +435,30 @@ async def handle_variant_number(
             )
             session.add(sub)
             await session.commit()
+
+    # ADDED alongside Submission: a check_results row for group aggregation.
+    try:
+        from app.models.check_result import CheckResult
+        import uuid as _uuid
+        async with async_session_factory() as session:
+            session.add(CheckResult(
+                user_id=db_user.telegram_id,
+                project_id=_uuid.UUID(project_id) if project_id else None,
+                manual_session_id=None,
+                variant_number=variant_num,
+                student_name=name,
+                score=result.correct,
+                total=result.total,
+                wrong_answers=[
+                    {"q": r.position, "student": r.student_answer, "correct": r.correct_answer}
+                    for r in result.question_results
+                    if not r.is_correct and not r.is_skipped
+                ],
+                unclear=[],
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning("saved_check_result_save_failed", error=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,27 +560,54 @@ async def handle_key_ok(
         await session.commit()
         session_id = str(row.id)
 
-    await state.update_data(manual_session_id=session_id, manual_total=len(key))
+    await state.update_data(
+        manual_session_id=session_id, manual_total=len(key),
+        flow="manual", run_results=[],
+    )
     await state.set_state(CheckingStates.waiting_for_manual_sheet)
     await callback.message.edit_text(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
     await callback.answer()
 
 
-@router.callback_query(CheckingStates.waiting_for_manual_sheet, F.data == "chk:again")
-async def handle_manual_again(
+# ── Loop / finish — shared by BOTH flows (branch on FSM `flow`) ───────────────
+
+@router.callback_query(F.data == "chk:again")
+async def handle_check_again(
     callback: CallbackQuery, state: FSMContext, db_user: User
 ) -> None:
+    """Grade another sheet in the same session — re-prompt for a photo."""
     lang = db_user.language.value
-    await callback.message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    data = await state.get_data()
+    if data.get("flow") == "saved":
+        await state.set_state(CheckingStates.waiting_for_answer_sheet)
+        await callback.message.answer(_PHOTO_PROMPTS.get(lang, _PHOTO_PROMPTS["uz"]))
+    else:
+        await state.set_state(CheckingStates.waiting_for_manual_sheet)
+        await callback.message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
     await callback.answer()
 
 
-@router.callback_query(CheckingStates.waiting_for_manual_sheet, F.data == "chk:finish")
-async def handle_manual_finish(
+@router.callback_query(F.data == "chk:finish")
+async def handle_check_finish(
     callback: CallbackQuery, state: FSMContext, db_user: User
 ) -> None:
+    """Finish: send the group result + a copy button, then return to the menu."""
     lang = db_user.language.value
-    await state.clear()
+    data = await state.get_data()
+    runs = list(data.get("run_results") or [])
+    test_name = data.get("test_name")
+
+    text, tsv = build_group_result(runs, lang, test_name)
+
+    # Keep the TSV available for the copy button; drop state but retain data.
+    await state.set_state(None)
+    await state.update_data(copy_tsv=tsv, run_results=[])
+
+    if runs:
+        await callback.message.answer(text, reply_markup=group_copy_keyboard(lang))
+    else:
+        await callback.message.answer(text)
+
     done = {"uz": "🏁 Tekshiruv yakunlandi.", "en": "🏁 Checking finished.",
             "ru": "🏁 Проверка завершена."}
     await callback.message.answer(
@@ -412,7 +616,28 @@ async def handle_manual_finish(
     await callback.answer()
 
 
-def _format_manual_result(res: dict, lang: str) -> str:
+@router.callback_query(F.data == "chk:copy")
+async def handle_check_copy(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """Send a paste-ready TSV (name<TAB>score<TAB>grade) for the last session."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    tsv = data.get("copy_tsv")
+    if not tsv:
+        expired = {
+            "uz": "📋 Ma'lumot eskirgan.", "en": "📋 This data has expired.",
+            "ru": "📋 Данные устарели.",
+        }.get(lang, "📋 This data has expired.")
+        await callback.answer(expired, show_alert=True)
+        return
+    await callback.message.answer(f"<pre>{html.escape(tsv)}</pre>")
+    await callback.answer()
+
+
+def _format_manual_result(
+    res: dict, lang: str, name_line: str | None = None
+) -> str:
     total = res["total"]
     score = res["score"]
     wrong = res["wrong"]
@@ -435,7 +660,10 @@ def _format_manual_result(res: dict, lang: str) -> str:
     (hdr, t_lbl, x_lbl, q_lbl, stu_lbl, cor_lbl,
      unc_lbl, hand_lbl, grade_lbl) = L
 
-    lines = [hdr, f"{t_lbl}: {score}/{total} ({percent}%)", f"{x_lbl}: {xato}"]
+    lines = [hdr]
+    if name_line:
+        lines.append(name_line)
+    lines += [f"{t_lbl}: {score}/{total} ({percent}%)", f"{x_lbl}: {xato}"]
     for w in wrong:
         s = w["student"] or "—"
         lines.append(f"{w['q']}-{q_lbl}: {stu_lbl} {s} → {cor_lbl} {w['correct']}")
@@ -463,6 +691,9 @@ async def handle_manual_sheet(
         file_id = message.document.file_id
     else:
         return
+
+    # Caption may carry the student's name (and optionally a variant number).
+    name, caption_variant = parse_caption(message.caption)
 
     thinking = await message.answer({
         "uz": "🤖 Javob varaqasi tekshirilmoqda...",
@@ -496,9 +727,19 @@ async def handle_manual_sheet(
         await message.answer(errs.get(lang, errs["en"]))
         return
 
-    report = _format_manual_result(res, lang)
+    # Variant for display/record: prefer the caption's, else what the sheet showed.
+    variant = caption_variant if caption_variant is not None else read["variant"]
+    name_line = _name_line(name, variant, lang)
+
+    report = _format_manual_result(res, lang, name_line)
     await thinking.delete()
     await message.answer(report, reply_markup=check_again_keyboard(lang))
+
+    percent = round(res["score"] / res["total"] * 100) if res["total"] else 0
+    await _append_run_result(
+        state, name=name, variant=variant,
+        score=res["score"], total=res["total"], grade=grade_for(percent),
+    )
 
     # Persist the result (manual_session_id set, project_id NULL).
     try:
@@ -509,7 +750,8 @@ async def handle_manual_sheet(
                 user_id=db_user.telegram_id,
                 project_id=None,
                 manual_session_id=_uuid.UUID(session_id) if session_id else None,
-                variant_number=read["variant"],
+                variant_number=variant,
+                student_name=name,
                 score=res["score"],
                 total=res["total"],
                 wrong_answers=res["wrong"],

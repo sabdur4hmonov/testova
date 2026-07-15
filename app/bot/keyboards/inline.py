@@ -205,6 +205,19 @@ def check_again_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     return _two_button_kb(labels.get(lang, labels["en"]))
 
 
+def group_copy_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """One button under a session's group result: emit a paste-ready TSV."""
+    label = {
+        "uz": "📋 Nusxa olish",
+        "en": "📋 Copy",
+        "ru": "📋 Копировать",
+    }.get(lang, "📋 Copy")
+    builder = InlineKeyboardBuilder()
+    builder.button(text=label, callback_data="chk:copy")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def confirm_keyboard(action: str, lang: str = "uz") -> InlineKeyboardMarkup:
     labels = {
         "uz": ("✅ Ha", "❌ Yo'q"),
