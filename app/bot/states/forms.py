@@ -2,14 +2,12 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class UploadStates(StatesGroup):
+    waiting_for_test_name = State()  # name FIRST, before file/format (held in FSM)
     waiting_for_file = State()
     waiting_for_format = State()  # choose Oddiy / Ixcham before extraction
     waiting_for_answers = State()
     waiting_for_dup_resolution = State()
     waiting_for_variant_count = State()
-    # Naming, asked AFTER variants are delivered.
-    waiting_for_project_name_choice = State()  # [📝 Nom berish] / [⏭ Nomsiz saqlash]
-    waiting_for_project_name = State()         # teacher types the test name
 
 
 class CheckingStates(StatesGroup):
@@ -30,6 +28,7 @@ class CheckingStates(StatesGroup):
 
 class BuilderStates(StatesGroup):
     """Multi-Source Test Builder."""
+    waiting_for_test_name = State()  # name FIRST, before any file
     waiting_for_file = State()
     waiting_for_answers = State()
     waiting_for_next_action = State()
@@ -38,7 +37,6 @@ class BuilderStates(StatesGroup):
     waiting_for_question_count = State()
     waiting_for_reuse_confirm = State()
     waiting_for_save_choice = State()
-    waiting_for_builder_name = State()  # test name asked on 💾 Saqlash
 
 
 class SettingsStates(StatesGroup):

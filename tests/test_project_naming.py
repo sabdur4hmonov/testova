@@ -65,13 +65,20 @@ def test_label_falls_back_when_no_display_name_attr():
 
 # ── new states exist (existing ones preserved) ───────────────────────────────
 
-def test_new_states_exist():
-    assert hasattr(UploadStates, "waiting_for_project_name_choice")
-    assert hasattr(UploadStates, "waiting_for_project_name")
-    assert hasattr(BuilderStates, "waiting_for_builder_name")
+def test_naming_first_states_exist():
+    # Up-front naming states (asked at the START of each flow).
+    assert hasattr(UploadStates, "waiting_for_test_name")
+    assert hasattr(BuilderStates, "waiting_for_test_name")
     for s in ("waiting_for_manual_test_name", "waiting_for_saved_name",
               "waiting_for_manual_name"):
         assert hasattr(CheckingStates, s)
+
+
+def test_phase3_post_gen_naming_states_removed():
+    # The post-generation naming states/keyboard were replaced by naming-first.
+    assert not hasattr(UploadStates, "waiting_for_project_name_choice")
+    assert not hasattr(UploadStates, "waiting_for_project_name")
+    assert not hasattr(BuilderStates, "waiting_for_builder_name")
 
 
 # ── manual test name flows into the group header ─────────────────────────────

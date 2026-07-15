@@ -39,9 +39,9 @@ def parse_caption(caption: str | None) -> tuple[str | None, int | None]:
 
 def parse_name_input(text: str | None) -> str | None:
     """
-    Resolve a free-typed name for the "give a name / or /skip" prompts (test
-    names AND student names). Returns None for blank/None/"/skip"; otherwise the
-    trimmed text, capped at 100 chars (matches projects.display_name width).
+    Resolve a free-typed name for the OPTIONAL "give a name / or /skip" prompts
+    (currently the per-sheet STUDENT name). Returns None for blank/None/"/skip";
+    otherwise the trimmed text, capped at 100 chars (matches display_name width).
     """
     if not text:
         return None
@@ -49,3 +49,27 @@ def parse_name_input(text: str | None) -> str | None:
     if not s or s.lower() == "/skip":
         return None
     return s[:100]
+
+
+# Error slugs returned by validate_test_name — handlers map them to messages.
+NAME_EMPTY = "empty"
+NAME_TOO_LONG = "too_long"
+
+
+def validate_test_name(text: str | None) -> tuple[str | None, str | None]:
+    """
+    Validate a REQUIRED test name (Flow 1/2/3 up-front naming). No /skip — the
+    name becomes the project name / PDF exam_title, so it must be present and
+    <= 100 chars.
+
+    Returns (name, error):
+      * (name, None)          on success (trimmed).
+      * (None, NAME_EMPTY)    blank / None.
+      * (None, NAME_TOO_LONG) longer than 100 chars → caller re-prompts.
+    """
+    if not text or not text.strip():
+        return None, NAME_EMPTY
+    s = text.strip()
+    if len(s) > 100:
+        return None, NAME_TOO_LONG
+    return s, None

@@ -176,19 +176,24 @@ BT = {
         "ru": "Что делаем с сессией?",
     },
     "ask_name": {
-        "uz": "📌 Bu testga nom bering (masalan: 8B), yoki /skip:",
-        "en": "📌 Give this test a name (e.g. 8B), or /skip:",
-        "ru": "📌 Введите название теста (например: 8B) или /skip:",
+        "uz": "📝 Testga nom bering (masalan: Matematika 9-sinf 1-chorak):",
+        "en": "📝 Name the test (e.g. Math 9th grade Q1):",
+        "ru": "📝 Назовите тест (например: Математика 9 класс 1 четверть):",
+    },
+    "name_too_long": {
+        "uz": "Test nomi juda uzun. Iltimos, qisqartiring (100 ta belgigacha):",
+        "en": "The test name is too long. Please shorten it (up to 100 characters):",
+        "ru": "Название теста слишком длинное. Сократите (до 100 символов):",
+    },
+    "name_needed": {
+        "uz": "Iltimos, avval test nomini yozing (matn ko'rinishida):",
+        "en": "Please type the test name first (as text):",
+        "ru": "Пожалуйста, сначала напишите название теста (текстом):",
     },
     "saved": {
         "uz": "💾 Sessiya saqlandi (savollar banki keyinroq ishlatiladi).",
         "en": "💾 Session saved (the question bank feature will use it later).",
         "ru": "💾 Сессия сохранена (банк вопросов будет использован позже).",
-    },
-    "saved_named": {
-        "uz": "💾 Saqlandi: {name}",
-        "en": "💾 Saved: {name}",
-        "ru": "💾 Сохранено: {name}",
     },
     "deleted": {
         "uz": "🗑 Sessiya o'chirildi.",
@@ -313,10 +318,31 @@ async def handle_builder_button(message: Message, state: FSMContext, db_user: Us
             reply_markup=builder_resume_keyboard(lang),
         )
         return
+    # Name FIRST — no BuilderSession/project row is created until the name is
+    # given and the first file arrives.
+    await state.set_state(BuilderStates.waiting_for_test_name)
+    await message.answer(bt("ask_name", lang))
+
+
+@router.message(BuilderStates.waiting_for_test_name, F.text)
+async def handle_builder_test_name(message: Message, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    from app.utils.caption_parser import NAME_TOO_LONG, validate_test_name
+    name, error = validate_test_name(message.text)
+    if error:
+        await message.answer(bt("name_too_long" if error == NAME_TOO_LONG else "ask_name", lang))
+        return
     session_id = await _create_session(db_user.id)
-    await state.update_data(builder_session_id=session_id)
+    await state.update_data(builder_session_id=session_id, test_name=name)
     await state.set_state(BuilderStates.waiting_for_file)
     await message.answer(bt("start", lang))
+
+
+@router.message(BuilderStates.waiting_for_test_name, F.document | F.photo)
+async def handle_builder_file_before_name(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    await message.answer(bt("name_needed", db_user.language.value))
 
 
 @router.callback_query(F.data == "bld:resume")
@@ -831,7 +857,8 @@ async def _do_generate(
         except Exception:
             pass
 
-    exam_title = "Ko'p manbali test"
+    # The teacher's test name becomes the PDF title (variants + answer key).
+    exam_title = data.get("test_name") or "Ko'p manbali test"
     # Layout choice only — compact if the teacher chose Ixcham at finish, else
     # standard (also the default when pdf_format is absent). The answer key
     # stays single-column in both.
@@ -856,7 +883,7 @@ async def _do_generate(
         project = Project(
             id=pool_project_id,
             user_id=db_user.id,
-            name=f"📚 Bank ({len(pool)} savol)",
+            name=data.get("test_name") or f"📚 Bank ({len(pool)} savol)",
             status=ProjectStatus.COMPLETED,
             question_count=len(pool),
         )
@@ -938,40 +965,12 @@ async def handle_gen_regen_params(callback: CallbackQuery, state: FSMContext, db
 @router.callback_query(BuilderStates.waiting_for_save_choice, F.data.in_({"bld:save", "bld:delete"}))
 async def handle_save_choice(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
-    save = callback.data == "bld:save"
-
-    if not save:
-        data = await state.get_data()
-        session_id = data.get("builder_session_id")
-        async with async_session_factory() as session:
-            from sqlalchemy import select
-            res = await session.execute(
-                select(BuilderSession).where(BuilderSession.id == uuid.UUID(session_id))
-            )
-            bs = res.scalar_one_or_none()
-            if bs:
-                await session.delete(bs)  # sources cascade; source projects stay
-                await session.commit()
-        await state.clear()
-        await callback.message.edit_text(bt("deleted", lang))
-        await callback.answer()
-        return
-
-    # Save: ask for a name FIRST, then finalize in the name handler (reuses the
-    # existing save keyboard/flow — only adds the name step before completion).
-    await state.set_state(BuilderStates.waiting_for_builder_name)
-    await callback.message.edit_text(bt("ask_name", lang))
-    await callback.answer()
-
-
-@router.message(BuilderStates.waiting_for_builder_name, F.text)
-async def handle_builder_name(message: Message, state: FSMContext, db_user: User) -> None:
-    lang = db_user.language.value
-    from app.utils.caption_parser import parse_name_input
-    name = parse_name_input(message.text)
-
     data = await state.get_data()
     session_id = data.get("builder_session_id")
+    save = callback.data == "bld:save"
+
+    # The pool project is already named (test_name given up front) — save just
+    # finalizes; delete drops the session.
     async with async_session_factory() as session:
         from sqlalchemy import select
         res = await session.execute(
@@ -979,18 +978,15 @@ async def handle_builder_name(message: Message, state: FSMContext, db_user: User
         )
         bs = res.scalar_one_or_none()
         if bs:
-            bs.status = BuilderStatus.SAVED
-            if name and bs.pool_project_id:
-                proj = await session.get(Project, bs.pool_project_id)
-                if proj:
-                    proj.display_name = name
+            if save:
+                bs.status = BuilderStatus.SAVED
+            else:
+                await session.delete(bs)  # sources cascade; source projects stay
             await session.commit()
 
     await state.clear()
-    if name:
-        await message.answer(bt("saved_named", lang, name=name))
-    else:
-        await message.answer(bt("saved", lang))
+    await callback.message.edit_text(bt("saved" if save else "deleted", lang))
+    await callback.answer()
 
 
 # ── P2: stray messages inside builder states ─────────────────────────────────

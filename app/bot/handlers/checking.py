@@ -36,7 +36,9 @@ from app.services.answer_key_parser import parse_answer_key
 from app.services.checker import compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
-from app.utils.caption_parser import parse_caption, parse_name_input
+from app.utils.caption_parser import (
+    NAME_TOO_LONG, parse_caption, parse_name_input, validate_test_name,
+)
 from app.utils.logging import get_logger
 
 router = Router(name="checking")
@@ -532,9 +534,15 @@ _UNREADABLE = {
 }
 
 _MANUAL_TESTNAME_PROMPT = {
-    "uz": "📌 Bu tekshiruvga nom bering (masalan: 8B), yoki /skip:",
-    "en": "📌 Name this check (e.g. 8B), or /skip:",
-    "ru": "📌 Назовите эту проверку (например: 8B) или /skip:",
+    "uz": "📝 Testga nom bering (masalan: 8B 14.07.26):",
+    "en": "📝 Name the test (e.g. 8B 14.07.26):",
+    "ru": "📝 Назовите тест (например: 8B 14.07.26):",
+}
+
+_NAME_TOO_LONG = {
+    "uz": "Test nomi juda uzun. Iltimos, qisqartiring (100 ta belgigacha):",
+    "en": "The test name is too long. Please shorten it (up to 100 characters):",
+    "ru": "Название теста слишком длинное. Сократите (до 100 символов):",
 }
 
 
@@ -543,9 +551,25 @@ async def handle_mode_manual(
     callback: CallbackQuery, state: FSMContext, db_user: User
 ) -> None:
     lang = db_user.language.value
-    await state.set_state(CheckingStates.waiting_for_key)
-    await callback.message.edit_text(_KEY_PROMPT.get(lang, _KEY_PROMPT["uz"]))
+    # Name the check FIRST, so the group header reads "<name> — <date>".
+    await state.set_state(CheckingStates.waiting_for_manual_test_name)
+    await callback.message.edit_text(_MANUAL_TESTNAME_PROMPT.get(lang, _MANUAL_TESTNAME_PROMPT["uz"]))
     await callback.answer()
+
+
+@router.message(CheckingStates.waiting_for_manual_test_name, F.text)
+async def handle_manual_test_name(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    name, error = validate_test_name(message.text)
+    if error:
+        prompt = _NAME_TOO_LONG if error == NAME_TOO_LONG else _MANUAL_TESTNAME_PROMPT
+        await message.answer(prompt.get(lang, prompt["uz"]))
+        return
+    await state.update_data(test_name=name)
+    await state.set_state(CheckingStates.waiting_for_key)
+    await message.answer(_KEY_PROMPT.get(lang, _KEY_PROMPT["uz"]))
 
 
 @router.message(CheckingStates.waiting_for_key, F.text)
@@ -603,25 +627,14 @@ async def handle_key_ok(
         await session.commit()
         session_id = str(row.id)
 
+    # test_name was captured up front (before the key). Go straight to grading.
     await state.update_data(
         manual_session_id=session_id, manual_total=len(key),
         flow="manual", run_results=[],
     )
-    # Name this checking session once, so its group header reads "<name> — <date>".
-    await state.set_state(CheckingStates.waiting_for_manual_test_name)
-    await callback.message.edit_text(_MANUAL_TESTNAME_PROMPT.get(lang, _MANUAL_TESTNAME_PROMPT["uz"]))
-    await callback.answer()
-
-
-@router.message(CheckingStates.waiting_for_manual_test_name, F.text)
-async def handle_manual_test_name(
-    message: Message, state: FSMContext, db_user: User
-) -> None:
-    lang = db_user.language.value
-    test_name = parse_name_input(message.text)  # /skip or empty → None (date-only)
-    await state.update_data(test_name=test_name)
     await state.set_state(CheckingStates.waiting_for_manual_sheet)
-    await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    await callback.message.edit_text(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+    await callback.answer()
 
 
 # ── Loop / finish — shared by BOTH flows (branch on FSM `flow`) ───────────────

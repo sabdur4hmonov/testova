@@ -208,16 +208,6 @@ def check_again_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     return _two_button_kb(labels.get(lang, labels["en"]))
 
 
-def project_name_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
-    """After variants are delivered: name the test, or keep it nameless."""
-    labels = {
-        "uz": [("📝 Nom berish", "pname:set"), ("⏭ Nomsiz saqlash", "pname:skip")],
-        "en": [("📝 Give a name", "pname:set"), ("⏭ Save without a name", "pname:skip")],
-        "ru": [("📝 Дать имя", "pname:set"), ("⏭ Без имени", "pname:skip")],
-    }
-    return _two_button_kb(labels.get(lang, labels["en"]))
-
-
 def group_copy_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """One button under a session's group result: emit a paste-ready TSV."""
     label = {

@@ -13,12 +13,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from app.bot.keyboards.inline import (
-    dup_resolution_keyboard, format_choice_keyboard,
-    project_name_keyboard, reextract_keyboard,
+    dup_resolution_keyboard, format_choice_keyboard, reextract_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import UploadStates
-from app.utils.caption_parser import parse_name_input
+from app.utils.caption_parser import NAME_TOO_LONG, validate_test_name
 from app.config import settings
 from app.database import async_session_factory
 from app.models.project import Project, ProjectStatus
@@ -51,6 +50,10 @@ logger = get_logger(__name__)
 MAX_PAGES = 20
 
 T = {
+    "ask_name":   {"uz": "📝 Testga nom bering (masalan: Matematika 9-sinf 1-chorak):", "en": "📝 Name the test (e.g. Math 9th grade Q1):", "ru": "📝 Назовите тест (например: Математика 9 класс 1 четверть):"},
+    "name_too_long": {"uz": "Test nomi juda uzun. Iltimos, qisqartiring (100 ta belgigacha):", "en": "The test name is too long. Please shorten it (up to 100 characters):", "ru": "Название теста слишком длинное. Сократите (до 100 символов):"},
+    "name_needed": {"uz": "Iltimos, avval test nomini yozing (matn ko'rinishida):", "en": "Please type the test name first (as text):", "ru": "Пожалуйста, сначала напишите название теста (текстом):"},
+    "send_file_now": {"uz": "📎 Endi test faylini yuboring (PDF):", "en": "📎 Now send the test file (PDF):", "ru": "📎 Теперь отправьте файл теста (PDF):"},
     "send_file":  {"uz": "📤 Test faylini yuboring (PDF, DOCX yoki rasm):", "en": "📤 Send your test file (PDF, DOCX or image):", "ru": "📤 Отправьте файл теста (PDF, DOCX или изображение):"},
     "too_big":    {"uz": "❌ Fayl {mb}MB dan katta bo'lmasin.", "en": "❌ File must be under {mb}MB.", "ru": "❌ Файл должен быть меньше {mb}МБ."},
     "bad_format": {"uz": "❌ Faqat PDF, DOCX yoki rasm yuboring.", "en": "❌ Send PDF, DOCX or image only.", "ru": "❌ Отправьте PDF, DOCX или изображение."},
@@ -522,8 +525,31 @@ async def _maybe_start_dup_resolution(
 @router.message(F.text.in_({v["upload"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_upload_button(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
-    await state.set_state(UploadStates.waiting_for_file)
-    await message.answer(t("send_file", lang))
+    # Name FIRST — held in FSM; NO project row is created until the file arrives.
+    await state.set_state(UploadStates.waiting_for_test_name)
+    await message.answer(t("ask_name", lang))
+
+
+@router.message(UploadStates.waiting_for_test_name, F.text)
+async def handle_test_name(message: Message, state: FSMContext, db_user: User) -> None:
+    lang = db_user.language.value
+    name, error = validate_test_name(message.text)
+    if error:
+        key = "name_too_long" if error == NAME_TOO_LONG else "ask_name"
+        await message.answer(t(key, lang))
+        return
+    await state.update_data(test_name=name)
+    await state.set_state(UploadStates.waiting_for_format)
+    await message.answer(
+        "Variantlarni qanday formatda olmoqchisiz?",
+        reply_markup=format_choice_keyboard(),
+    )
+
+
+@router.message(UploadStates.waiting_for_test_name, F.document | F.photo)
+async def handle_file_before_name(message: Message, state: FSMContext, db_user: User) -> None:
+    # A file at the name step — ask for the name first, keep waiting.
+    await message.answer(t("name_needed", db_user.language.value))
 
 
 @router.message(UploadStates.waiting_for_file, F.document | F.photo)
@@ -549,7 +575,13 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         await message.answer(t("bad_format", lang))
         return
 
-    # ── Download & save; then ask the FORMAT before any (paid) extraction ─────
+    # Name + format are already chosen; the file arrives LAST. NOW create the
+    # project row (named after the teacher's test_name) and run extraction — no
+    # orphan project could exist if they abandoned before this point.
+    data = await state.get_data()
+    test_name = data.get("test_name") or filename
+    fmt = data.get("pdf_format", "standard")
+
     tg_file = await bot.get_file(file_id)
     raw = await bot.download_file(tg_file.file_path)
     content = raw.read()
@@ -564,7 +596,7 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         project = Project(
             id=uuid.UUID(project_id),
             user_id=db_user.id,
-            name=filename,
+            name=test_name,
             original_file_path=file_key,
             original_file_name=filename,
             file_type=file_type,
@@ -573,15 +605,11 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
         session.add(project)
         await session.commit()
 
-    # Ask Oddiy/Ixcham FIRST — extraction runs only after the choice, so the
-    # chosen layout costs a single Gemini run (no regeneration).
     await state.update_data(
-        project_id=project_id, file_type=file_type, file_key=file_key,
+        project_id=project_id, file_type=file_type, file_key=file_key, pdf_format=fmt,
     )
-    await state.set_state(UploadStates.waiting_for_format)
-    await message.answer(
-        "Variantlarni qanday formatda olmoqchisiz?",
-        reply_markup=format_choice_keyboard(),
+    await _run_extraction(
+        message, state, db_user, content, file_type, project_id, lang
     )
 
 
@@ -589,29 +617,13 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
 async def handle_format_choice(
     callback: CallbackQuery, state: FSMContext, db_user: User
 ) -> None:
-    """The teacher picked Oddiy/Ixcham; NOW run extraction (one Gemini pass)."""
+    """Layout picked BEFORE the file — just store it, then ask for the file."""
     lang = db_user.language.value
     fmt = "compact" if callback.data == "fmt:compact" else "standard"
-    data = await state.get_data()
-    project_id: str = data.get("project_id", "")
-    file_type: str = data.get("file_type", "")
-    file_key: str = data.get("file_key", "")
-    if not project_id or not file_key:
-        await callback.answer()
-        return
-
     await callback.answer()
     await state.update_data(pdf_format=fmt)
-    try:
-        content = await storage.read_file(file_key)
-    except Exception as e:
-        logger.error("format_reload_failed", project_id=project_id, error=str(e))
-        await callback.message.answer(t("no_q", lang))
-        await state.clear()
-        return
-    await _run_extraction(
-        callback.message, state, db_user, content, file_type, project_id, lang
-    )
+    await state.set_state(UploadStates.waiting_for_file)
+    await callback.message.answer(t("send_file_now", lang))
 
 
 async def _run_extraction(
@@ -1012,7 +1024,8 @@ async def _generate_and_send(
         ))
 
     variants     = await asyncio.to_thread(generate_variants, raw_qs, count)
-    exam_title   = (db_user.full_name or "Test") + " — Test"
+    # The teacher's test name becomes the PDF title (variants + answer key).
+    exam_title   = data_pre.get("test_name") or ((db_user.full_name or "Test") + " — Test")
     # compact (2-column) only when the teacher chose it before extraction;
     # the answer key is ALWAYS single-column.
     _build = (
@@ -1044,58 +1057,5 @@ async def _generate_and_send(
         BufferedInputFile(key_pdf, filename="answer_keys.pdf"),
         caption=t("key_cap", lang),
     )
+    await state.clear()
     logger.info("variants_sent", project_id=project_id, count=count)
-
-    # Naming step — asked ONLY now that the variants exist (no orphan names).
-    await state.set_state(UploadStates.waiting_for_project_name_choice)
-    await state.update_data(project_id=project_id)
-    prompts = {
-        "uz": "📛 Bu testni nomlaysizmi?",
-        "en": "📛 Name this test?",
-        "ru": "📛 Назвать этот тест?",
-    }
-    await message.answer(prompts.get(lang, prompts["uz"]), reply_markup=project_name_keyboard(lang))
-
-
-# ── Naming the generated test (after variants delivered) ─────────────────────
-
-@router.callback_query(UploadStates.waiting_for_project_name_choice, F.data == "pname:set")
-async def handle_name_set(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
-    lang = db_user.language.value
-    await state.set_state(UploadStates.waiting_for_project_name)
-    prompts = {
-        "uz": "📌 Testga nom bering (masalan: 8B 14.07.26):",
-        "en": "📌 Give the test a name (e.g. 8B 14.07.26):",
-        "ru": "📌 Введите название теста (например: 8B 14.07.26):",
-    }
-    await callback.message.edit_text(prompts.get(lang, prompts["uz"]))
-    await callback.answer()
-
-
-@router.callback_query(UploadStates.waiting_for_project_name_choice, F.data == "pname:skip")
-async def handle_name_skip(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
-    # display_name stays NULL — identical to the pre-naming behaviour.
-    await state.clear()
-    await callback.answer()
-
-
-@router.message(UploadStates.waiting_for_project_name, F.text)
-async def handle_project_name(message: Message, state: FSMContext, db_user: User) -> None:
-    lang = db_user.language.value
-    name = parse_name_input(message.text)
-    data = await state.get_data()
-    project_id = data.get("project_id")
-
-    if name and project_id:
-        async with async_session_factory() as session:
-            proj = await session.get(Project, uuid.UUID(project_id))
-            if proj:
-                proj.display_name = name
-                await session.commit()
-        oks = {
-            "uz": f"✅ Saqlandi: {name}",
-            "en": f"✅ Saved: {name}",
-            "ru": f"✅ Сохранено: {name}",
-        }
-        await message.answer(oks.get(lang, oks["en"]))
-    await state.clear()
