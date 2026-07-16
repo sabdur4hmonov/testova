@@ -47,9 +47,14 @@ Rules:
 - If a question is left completely blank (no mark at all), output null.
 - Also read the VARIANT NUMBER if it is written anywhere on the sheet
   (e.g. "Variant 3", "V-3", "3-variant"); if none is visible, use null.
-- Also read the STUDENT'S NAME if it is handwritten anywhere on the sheet
-  (usually at the top). Transcribe it EXACTLY as written — do NOT correct
-  spelling, do NOT translate, do NOT reformat. If no name is visible, use null.
+- Also read the STUDENT'S NAME. It is HANDWRITTEN, usually at the very top of
+  the sheet, often next to or above the variant label. It is an Uzbek name and
+  may be written in Latin OR Cyrillic script. Transcribe it letter-by-letter
+  EXACTLY as written: do NOT correct it into a real/dictionary word, do NOT
+  translate, and do NOT transliterate between scripts (keep Cyrillic as
+  Cyrillic, Latin as Latin). If a single letter is genuinely illegible, choose
+  the most likely letter for THAT letter — never invent a different name. If the
+  name area is blank or completely unreadable, use null (do NOT guess a name).
 
 Return ONLY valid JSON, no markdown, no explanation:
 {{"variant": 3, "student_name": "Ali Valiyev", "answers": {{"1": "A", "2": "?", "3": null, "4": "C"}}}}"""
