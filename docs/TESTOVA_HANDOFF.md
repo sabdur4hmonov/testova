@@ -1,6 +1,6 @@
 # TESTOVA — PROJECT HANDOFF (continue from here)
 
-> **Handoff updated: 15 July 2026.** Supersedes the previous handoff. Access-control gauntlet is now COMPLETE (all 7 tests green), cost tracking shipped (v0.4), support-handle bug fixed, and multi-source format choice shipped (v0.5). The next big piece is the **"Variant yaratish" grading UX flow** (generate *and* grade). See NEXT.
+> **Handoff updated: 16 July 2026 — reconciled to v0.9.** Supersedes the previous handoff. The old handoff was stale at v0.5 (the commit labelled "docs: update handoff through v0.8" actually contained v0.5 text). This version is reconciled against the real git log through the latest commit `a9b21d0`. Since v0.5 the whole **grading half of the product shipped**: manual answer-key grading, saved-project grading, student names, a class group-result table with copy-to-Excel, test naming across every flow, and test-name-first with the name flowing into the PDF. **Generate AND grade is now real.** The next big piece is **VPS deployment** — see NEXT.
 
 ## CONTEXT
 
@@ -22,9 +22,9 @@ I work with **Claude Code in the terminal**. I'm a beginner — I need **exact c
 
 ## ✅ COMPLETED (all committed & tagged)
 
-**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format`
+**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format` → `v0.6-grader` → `v0.7-names` → `v0.8-naming` → `v0.9-name-first`
 
-**272 tests green.** (3 red in `test_subscription.py` are pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.)
+**351 tests green.** (3 errors in `test_subscription.py` are the same pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.) Run with `venv311/Scripts/python.exe -m pytest -q`.
 
 ### Extraction & cleaning
 16-bug audit, token truncation fix (8192 + salvage parser), two-column PDF support, gap recovery, isotope/math verbatim guarantee, OCR confusion dictionary, [Rasm] policy, crop sanity checks, suspicious-question flagging, regression tests.
@@ -64,7 +64,7 @@ The whole point: if `uses_left` doesn't decrement correctly, nobody can ever be 
 
 **REAL COST DATA (measured, not estimated):**
 - **One extraction (= 1 use): ~200 so'm (~$0.017)** — roughly half the paper estimate. Page-skip + DPI work is paying off (~2,700 input tokens/call).
-- Full cycle incl. ~30 graded sheets (grading not built yet): estimated ~1,000 so'm worst case.
+- Full cycle incl. ~30 graded sheets (grading not built yet at v0.4): estimated ~1,000 so'm worst case. Grading now ships (v0.6+) and its Gemini Vision cost is auto-captured by the same `usage_log` instrumentation — check `/usage` for live grading numbers.
 - VPS ~$5/mo ≈ 60,000 so'm — one paying teacher covers it 20×.
 - **Pricing implication: API cost is NOISE. Price on VALUE (hours of hand-grading saved), never cost-plus. `uses_left` is the abuse cap.**
 
@@ -84,6 +84,33 @@ Previously compact format was single-upload only. Now "Ko'p manbadan" also asks 
 - `_do_generate` picks `build_variants_pdf_compact` vs `build_variants_pdf` from the key; absent key → standard (safe fallback, never crashes). Answer key stays single-column in both.
 - **Closed the coverage gap the old handoff flagged:** compact is now tested on MULTI-SOURCE pool variants (merged pool, "Ko'p manbadan" title), not just single-upload. It's a genuine drop-in — multi-source variants come through the same `_generate_one_variant` code, so every per-question field the compact builder reads is already present.
 - **Multi-source is confirmed to do NO Gemini calls at generate time** — all extraction happens per-file at upload; generation just reads the persisted pool + CPU shuffle. That's why asking format at finish costs zero extra API calls.
+
+### v0.6 — Manual answer-key grading ("Javob orqali tekshirish") + saved-project grader wired
+**This is where "generate AND grade" started shipping.** Migration **005** adds two tables:
+- `manual_check_sessions` (`app/models/manual_check_session.py`): one row per typed-key sitting — `user_id`, `correct_answers` JSONB `{"1":"A",...}`, `created_at`, `expires_at`.
+- `check_results` (`app/models/check_result.py`): ONE row per graded sheet, serves BOTH paths — `manual_session_id` set for the manual flow, `project_id` set for the saved-project flow. Holds `variant_number`, `student_name` (reserved at this version), `score`, `total`, `wrong_answers` JSONB, `unclear` JSONB.
+
+Flow: tap **✅ Test tekshirish** → `CheckingStates.choosing_check_mode` → pick **Saqlangan** (saved project) vs **Javob orqali** (manual). Manual path: teacher types the key → echo shown → confirm / re-enter → send student answer-sheet photos one at a time. Grading is FREE (gated by `can_check`, ignores `uses_left` — by design).
+
+New pure/independent services (heavy reuse, no touching of the protected extraction path):
+- `app/services/answer_key_parser.py` — `parse_answer_key(text) -> (key, reason)`. Accepts labelled (`"1) A, 2-B. 3C"` with any separators) OR bare (`"ABCDABCD"` numbered from 1). Folds Cyrillic look-alikes **А В С Д Е → A B C D E**, upper-cases, accepts **only A–D**, returns a human-readable Uzbek reason on failure.
+- `app/services/sheet_reader.py` — `read_answer_sheet` via Gemini Vision. Has its OWN `ANSWER_SHEET_PROMPT` and **never imports or touches `VISION_PROMPT`** (which the hard-won extraction rules protect). Reuses the SAME `image_to_pages` / `preprocess_image` decode+deskew helpers. Reads MARKED answers, never guesses; ambiguous marks come back as unclear.
+- `app/services/checker.py` — pure grading, no I/O. `grade_for(percent)` is **THE single source of truth for the Uzbek 5/4/3/2 scale** (≥86→5, ≥71→4, ≥56→3, else 2). `compare_with_unclear(student, key, unclear)` — an unclear question counts as WRONG but is reported separately so the teacher grades it by hand; missing answers count as wrong (unanswered).
+
+### v0.7 — Student names + class group-result table with copy-to-Excel (both flows)
+- `app/utils/caption_parser.py` `parse_caption(caption) -> (name, variant)`: teacher captions the photo `"13 Saidakbar"` / `"Saidakbar 13"` / `"Saidakbar"` / `"13"`, either order. FIRST all-digit token is the variant; the rest (trimmed, space-collapsed) is the name. `"A12"`/`"12b"` stay part of the name.
+- `build_group_result(runs, lang, test_name) -> (pretty_text, tsv_text)` in `checking.py`: pretty text = header + **rank table sorted by score DESC** (stable within ties) + average (score + %) + grade histogram (⭐5/⭐4/⭐3/⭐2 counts). `tsv_text` = `label\tscore\tgrade` per line, same sort — **Excel-ready**.
+- Emitted under a **📋 Nusxa olish** button (`group_copy_keyboard`, callback `chk:copy`) so the teacher pastes the whole class straight into a spreadsheet. Works in BOTH grading flows.
+
+### v0.8 — Test naming (all flows) + optional student-name prompt + display_name labelling
+- Migration **006** adds `projects.display_name` (String(100), nullable) — the teacher-supplied test name; **falls back to `projects.name` when NULL** so old projects still label correctly. Also added `projects.checking_mode` (reserved for a later phase, added now to avoid re-migrating `projects`).
+- Optional per-sheet STUDENT-name prompt: when an answer-sheet photo has **no caption**, the bot asks for the name; `parse_name_input` treats blank / `/skip` as None. New states `waiting_for_saved_name` / `waiting_for_manual_name`.
+- `display_name` is used to label the finished group result and results.
+
+### v0.9 — Ask test name FIRST in all flows + test name as PDF title
+- The test name is now asked **up-front, before the file/format**, in all three flows: `UploadStates.waiting_for_test_name`, `BuilderStates.waiting_for_test_name`, and the manual checker's `waiting_for_manual_test_name`.
+- `validate_test_name(text) -> (name, error)` in `caption_parser.py`: the single-upload / multi-source name is **REQUIRED** (no `/skip`), trimmed, **≤100 chars** (`NAME_EMPTY` / `NAME_TOO_LONG` → caller re-prompts). The manual-session name is still optional (`/skip`).
+- The name flows through as `exam_title`. **Where it actually prints:** the **answer-key PDF** header (`{exam_title} — Javob kaliti`) and it becomes the project label. **`build_variants_pdf` / `build_variants_pdf_compact` no longer PRINT the title on the variant sheets** — each variant starts with a handwriting fill-in block and a prominent **"Variant N"** (kept prominent on purpose: grading matches sheets to keys by variant number). `exam_title` is retained in those signatures for compatibility. Fallbacks: single-upload `"<full_name> — Test"`, multi-source `"Ko'p manbali test"`.
 
 ### Earlier work (unchanged, still true)
 
@@ -120,46 +147,54 @@ VISION_PROMPT now states BOTH: a term under the radical must not escape it, AND 
 ### 6. 2 columns is the ceiling on A4
 A 3-column mode would drop column width to ~135pt, making math overflow and overlap dramatically worse. Rejected.
 
-### 7. (new) Cost/instrumentation must never crash the main flow
+### 7. (v0.4) Cost/instrumentation must never crash the main flow
 `log_gemini_usage` is entirely inside try/except (warn-and-continue). If `/usage` shows zeros after a successful extraction, the write silently failed BY DESIGN — check the console warning, don't assume nothing was billed.
 
-### 8. (new) One source of truth for the contact handle
+### 8. (v0.4) One source of truth for the contact handle
 Every user-facing @-mention reads `settings.ADMIN_USERNAME`. A guard test blocks any hardcoded `@testova_` literal. Don't reintroduce a second handle.
+
+### 9. (v0.6) The answer-sheet reader must never touch `VISION_PROMPT`
+`sheet_reader.py` has its OWN `ANSWER_SHEET_PROMPT`. The extraction prompt is protected by principles 1–4. Reading a filled answer sheet is a DIFFERENT task (read marks, don't extract questions) — keep the two prompts separate forever. Reuse only the image decode/deskew helpers, never the prompt.
+
+### 10. (v0.6) One grading scale, one place
+`checker.grade_for()` is the ONLY definition of the Uzbek 5/4/3/2 scale. Nothing else may define its own thresholds. An unclear (unreadable) answer counts as WRONG but is listed apart so the teacher can override by hand — do not silently mark it correct.
 
 ---
 
-## ⏭️ NEXT — THE "VARIANT YARATISH" GRADING UX FLOW (feature #1, biggest unbuilt value)
+## ⏭️ NEXT — VPS DEPLOYMENT (now the biggest unbuilt piece)
 
-**This is the whole pitch: generate AND grade.** Right now the bot generates PDFs and stops; the teacher still grades by hand. Build the rest:
+The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, and test naming. Grading is free and ignores `uses_left` by design.
 
-PDF → `[✅ Tasdiqlash]` / `[🔄 Qayta yaratish]` → on confirm send pages as photos → offer checking → collect answer-sheet photo per variant → grade via Gemini Vision → per-variant results → `[✅ Ha, yakunlash]` → delete project data from DB, keep chat messages, return to main menu.
+The remaining gate before any real teacher touches this is deployment:
 
-**Before building — do an INVESTIGATION-ONLY pass first** (map the current end-of-generation state, where the flow currently stops, how the single-upload confirm/save step works, and whether grading should charge a `use` or be free like "Test tekshirish"). The grading half will run Gemini Vision on answer-sheet photos — the `usage_log` instrumentation will catch that cost automatically, so we get real grading-cost numbers on the first run.
+**VPS deployment** — kills the Telegram block permanently, bot online 24/7. ~$5/mo (Hetzner/Contabo/DigitalOcean). On deploy:
+- `.env` with `ADMIN_IDS=[8206475760]` (JSON list), `ADMIN_USERNAME=testova_admin`, `GEMINI_MODEL=gemini-2.5-flash`, Gemini price vars if non-default (`GEMINI_PRICE_IN_PER_M`, `GEMINI_PRICE_OUT_PER_M`, `UZS_PER_USD`), Postgres connection string.
+- `pip install -r requirements.txt` (incl. matplotlib==3.11.0).
+- `alembic upgrade head` — schema is now at migration **006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming).
+- Set Gemini Prepay auto-reload so nobody hits a $0 balance mid-exam.
 
-Suggested opening prompt for the new session:
-> "Investigation only — do NOT edit. I want to build the full 'Variant yaratish' grade-and-finish flow (generate → confirm → send photos → collect answer sheets → grade via Gemini Vision → results → finish → clear project). Map the current flow: where does generation currently stop, what FSM states exist at that point, how does the single-upload confirm/save step work, and does grading go through the same `uses_left` counter or is it free like 'Test tekshirish'? Report the map with file:line refs. No code yet."
+Suggested opening prompt for the deployment session:
+> "Walk me through deploying Testova to a VPS step by step — I'm a beginner. We're at migration 006, model gemini-2.5-flash. Cover the .env, Postgres, alembic upgrade head, keeping the bot running 24/7, and Gemini auto-reload."
 
 ---
 
 ## 🚀 THEN — REMAINING BIG FEATURES (in order)
 
-2. **"Test tekshirish" standalone flow:** ask variant count → collect answer KEY photo per variant → accept student sheet photos one by one (bot reads variant number + answers) → immediate result per sheet → `[✅ Ha]` / `[🏁 Yakunlash]` → clear keys, main menu. (Ignores `uses_left` by design.)
-
-3. **VPS deployment** — kills the Telegram block permanently, bot online 24/7. Needed before any real teacher touches this. ~$5/mo (Hetzner/Contabo/DigitalOcean). On deploy: `.env` with `ADMIN_IDS=[8206475760]` (JSON list), `GEMINI_MODEL=gemini-2.5-flash`, Gemini price vars if non-default, Postgres connection string, `pip install -r requirements.txt` (incl. matplotlib==3.11.0), `alembic upgrade head`. Set Gemini Prepay auto-reload.
-
-4. **Pricing / monetization** (deferred to the end, per my decision — now backed by real cost data: ~200 so'm/extraction, so any sane price = huge margin).
-
-5. Web admin panel later (thin skin over existing admin tables).
+1. **VPS deployment** (see NEXT) — must happen before any real teacher.
+2. **Pricing / monetization** (deferred to the end, per my decision — now backed by real cost data: ~200 so'm/extraction + free grading, so any sane price = huge margin). `uses_left` is the abuse cap.
+3. **Optional grade-and-finish polish on the generation side:** the original sketch of appending confirm → send pages as photos → collect sheets → finish → auto-clear directly onto the "Variant yaratish" flow was NOT built as one integrated flow (grading is reached via its own button instead). Revisit only if teachers actually want it inline.
+4. Web admin panel later (thin skin over existing admin tables).
 
 ---
 
 ## 📌 PARKED / BACKLOG (see `docs/BACKLOG.md`)
 
-- Per-user attribution for `gemini_usage`: thread `user_id` through to `AIAnalyzer` (currently logged NULL) so `/usage` can break cost down per teacher.
+- Per-user attribution for `gemini_usage`: thread `user_id` through to `AIAnalyzer` (currently logged NULL) so `/usage` can break cost down per teacher. The grading (`sheet_reader`) Gemini calls have the same NULL-attribution gap.
 - `/usage` merges output + thinking into one figure. Split into separate columns so the thinking-token share is visible (2.5 Flash thinks by default, bills thinking at $2.50/1M). Low priority — total cost ~200 so'm/extraction.
 - Compact PDF: wide figures currently scale to column width. If a real exam needs a true full-page-width figure, add a 2nd PageTemplate with a full-width frame and switch templates mid-document.
 - Parser splits `f(x) = x^2 - x + 1` prose/math boundary inconsistently in places. Correct, just cosmetic.
-- Main menu button layout (5-min job): confirm Row 1 `[🚀 Variant yaratish] [📚 Ko'p manbadan]`, Row 2 `[✅ Test tekshirish]`. File: `app/bot/keyboards/main_menu.py`
+- `check_results.student_name` and `projects.checking_mode` were added ahead of need (to avoid re-migrating). Wire them fully when the saved-project grading UX is fleshed out.
+- Main menu is currently Row 1 `[📤 Variant yaratish] [✅ Test tekshirish]`, Row 2 `[📚 Ko'p manbadan test yaratish]`, Row 3 `[projects] [pricing]`, Row 4 `[language] [support]`. File: `app/bot/keyboards/main_menu.py`.
 - `ADMIN_IDS` should accept bare `123` or `123,456` via validator, or document JSON format in `.env.example`.
 - `admin_log.target` vs `target_user_id` naming; `blocked_text()` has no lang param — deliberately skipped.
 - Nothing pushed to remote yet — `git push && git push --tags` when you want an off-machine backup.
@@ -169,6 +204,6 @@ Suggested opening prompt for the new session:
 ## MY FIRST QUESTION IN THE NEW CHAT
 
 [PICK ONE:]
-- "Investigation only — map the current 'Variant yaratish' flow so we can build the grade-and-finish UX." (recommended — biggest value)
-- "Walk me through the 'Test tekshirish' standalone flow."
-- "Walk me through deploying to a VPS."
+- "Walk me through deploying to a VPS." (recommended — the last gate before real teachers)
+- "Let's design pricing / monetization now that generate-and-grade both ship."
+- "Investigation only — should the grade-and-finish flow be inline on Variant yaratish, or is the separate Test tekshirish button better?"
