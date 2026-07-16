@@ -13,10 +13,19 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from app.bot.keyboards.inline import (
-    dup_resolution_keyboard, format_choice_keyboard, reextract_keyboard,
+    dup_resolution_keyboard, exam_timer_offer_keyboard, format_choice_keyboard,
+    reextract_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
-from app.bot.states.forms import UploadStates
+from app.bot.states.forms import ExamTimerStates, UploadStates
+
+# Exam-timer offer shown after variants are sent (the flow lives in
+# handlers/exam_timer.py). Kept here because this handler emits the prompt.
+EXAM_OFFER_TEXT = {
+    "uz": "⏱ Imtihon vaqtini belgilaysizmi?",
+    "en": "⏱ Do you want to set an exam time?",
+    "ru": "⏱ Хотите задать время экзамена?",
+}
 from app.utils.caption_parser import NAME_TOO_LONG, validate_test_name
 from app.config import settings
 from app.database import async_session_factory
@@ -1057,5 +1066,13 @@ async def _generate_and_send(
         BufferedInputFile(key_pdf, filename="answer_keys.pdf"),
         caption=t("key_cap", lang),
     )
-    await state.clear()
     logger.info("variants_sent", project_id=project_id, count=count)
+
+    # Offer the optional exam timer (Variant yaratish only). Instead of clearing
+    # state here, hand off to the exam_timer flow; its "⏭ Yo'q" handler clears.
+    await state.set_state(ExamTimerStates.choosing_offer)
+    await state.update_data(exam_project_id=project_id, exam_chat_id=message.chat.id)
+    await message.answer(
+        EXAM_OFFER_TEXT.get(lang, EXAM_OFFER_TEXT["en"]),
+        reply_markup=exam_timer_offer_keyboard(lang),
+    )

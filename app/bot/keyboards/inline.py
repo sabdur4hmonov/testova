@@ -221,6 +221,48 @@ def group_copy_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def exam_timer_offer_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Offer to set an exam time after variants are sent."""
+    yes, no = {
+        "uz": ("✅ Ha, vaqt belgilayman", "⏭ Yo'q"),
+        "en": ("✅ Yes, set a time", "⏭ No"),
+        "ru": ("✅ Да, задать время", "⏭ Нет"),
+    }.get(lang, ("✅ Yes, set a time", "⏭ No"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text=yes, callback_data="exam:yes")
+    builder.button(text=no, callback_data="exam:no")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def exam_mode_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Choose how the exam window is entered."""
+    start_dur, end = {
+        "uz": ("🕐 Boshlanish + davomiylik", "🕑 Tugash vaqti"),
+        "en": ("🕐 Start + duration", "🕑 End time"),
+        "ru": ("🕐 Начало + длительность", "🕑 Время окончания"),
+    }.get(lang, ("🕐 Start + duration", "🕑 End time"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text=start_dur, callback_data="exam:mode:startdur")
+    builder.button(text=end, callback_data="exam:mode:end")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def exam_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Confirm the computed end time before scheduling."""
+    ok, cancel = {
+        "uz": ("✅ Tasdiqlash", "❌ Bekor qilish"),
+        "en": ("✅ Confirm", "❌ Cancel"),
+        "ru": ("✅ Подтвердить", "❌ Отмена"),
+    }.get(lang, ("✅ Confirm", "❌ Cancel"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text=ok, callback_data="exam:confirm")
+    builder.button(text=cancel, callback_data="exam:cancel")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def confirm_keyboard(action: str, lang: str = "uz") -> InlineKeyboardMarkup:
     labels = {
         "uz": ("✅ Ha", "❌ Yo'q"),

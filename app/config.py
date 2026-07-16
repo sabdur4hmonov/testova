@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 50
     ADMIN_IDS: list[int] = Field(default_factory=list)
 
+    # ── Exam timer ────────────────────────────────────────────────────────────
+    # Wall-clock times a teacher types ("14:30") are interpreted in this fixed
+    # offset. Uzbekistan is UTC+5 year-round (no DST), so a fixed offset is
+    # exact and needs no tzdata/zoneinfo dependency.
+    EXAM_TZ_OFFSET_HOURS: int = 5
+
     # ── Access control ────────────────────────────────────────────────────────
     TRIAL_DAYS: int = 30          # free trial window applied on first /start
     TRIAL_USES: int = 1           # free full cycles for a fresh user

@@ -15,12 +15,23 @@ from aiohttp import web
 
 from app.bot.main import create_bot, create_dispatcher
 from app.config import settings
-from app.database import create_all_tables
+from app.database import async_session_factory, create_all_tables
+from app.services import exam_timer
 from app.utils.logging import get_logger, setup_logging
 
 
 async def on_startup(bot, dp) -> None:
     await create_all_tables()
+
+    # Start the in-process exam scheduler and re-load any running exams so a
+    # restart never loses a timer. NON-FATAL: if any of this fails the bot must
+    # still start and work normally — just without timers.
+    try:
+        exam_timer.init_scheduler()
+        await exam_timer.reload_pending(bot, async_session_factory)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("exam_scheduler_init_failed", error=str(exc))
+
     if settings.is_webhook_mode:
         webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
         await bot.set_webhook(
@@ -35,6 +46,8 @@ async def on_startup(bot, dp) -> None:
 
 
 async def on_shutdown(bot, dp) -> None:
+    # Safe no-op if the scheduler never started; never raises on exit.
+    exam_timer.shutdown_scheduler()
     if settings.is_webhook_mode:
         await bot.delete_webhook()
     await bot.session.close()

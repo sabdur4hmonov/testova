@@ -39,5 +39,15 @@ class BuilderStates(StatesGroup):
     waiting_for_save_choice = State()
 
 
+class ExamTimerStates(StatesGroup):
+    """Optional exam-timer offer after variants are sent (Variant yaratish)."""
+    choosing_offer = State()        # "set an exam time?" Ha / Yo'q
+    choosing_mode = State()         # start+duration / end-time
+    waiting_for_start_time = State()
+    waiting_for_duration = State()
+    waiting_for_end_time = State()
+    waiting_for_confirm = State()   # echo computed end, confirm / cancel
+
+
 class SettingsStates(StatesGroup):
     waiting_for_language = State()

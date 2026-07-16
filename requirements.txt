@@ -13,6 +13,9 @@ celery==5.5.2
 flower==2.0.1
 kombu==5.5.2
 
+# ── Scheduler (in-process exam timer; no broker/worker needed) ────────────────
+APScheduler==3.10.4
+
 # ── AI ────────────────────────────────────────────────────────────────────────
 google-generativeai==0.8.3
 
