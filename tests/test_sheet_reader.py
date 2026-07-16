@@ -45,7 +45,34 @@ async def test_fenced_json(patched):
 async def test_malformed_safe_failure(patched):
     patched("this is not json at all")
     res = await SR.read_answer_sheet(b"x", 10)
-    assert res == {"variant": None, "answers": {}, "unclear": []}
+    assert res == {"variant": None, "student_name": None, "answers": {}, "unclear": []}
+
+
+async def test_reads_student_name_and_variant(patched):
+    patched('{"variant": 3, "student_name": "Ali Valiyev", "answers": {"1":"A"}}')
+    res = await SR.read_answer_sheet(b"x", 1)
+    assert res["student_name"] == "Ali Valiyev"
+    assert res["variant"] == 3
+
+
+async def test_name_null_is_none(patched):
+    patched('{"variant": null, "student_name": null, "answers": {"1":"A"}}')
+    res = await SR.read_answer_sheet(b"x", 1)
+    assert res["student_name"] is None
+
+
+async def test_name_missing_key_is_none(patched):
+    patched('{"variant": 1, "answers": {"1":"A"}}')
+    res = await SR.read_answer_sheet(b"x", 1)
+    assert res["student_name"] is None
+
+
+async def test_name_returned_raw_not_normalized(patched):
+    # Odd casing/spacing and Cyrillic script must be preserved EXACTLY — the
+    # name is never spell-corrected, case-folded, or transliterated.
+    patched('{"student_name": "aliycha  QODIROVA", "answers": {"1":"A"}}')
+    res = await SR.read_answer_sheet(b"x", 1)
+    assert res["student_name"] == "aliycha  QODIROVA"
 
 
 async def test_salvage_trailing_prose(patched):

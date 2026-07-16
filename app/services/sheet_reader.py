@@ -47,9 +47,12 @@ Rules:
 - If a question is left completely blank (no mark at all), output null.
 - Also read the VARIANT NUMBER if it is written anywhere on the sheet
   (e.g. "Variant 3", "V-3", "3-variant"); if none is visible, use null.
+- Also read the STUDENT'S NAME if it is handwritten anywhere on the sheet
+  (usually at the top). Transcribe it EXACTLY as written — do NOT correct
+  spelling, do NOT translate, do NOT reformat. If no name is visible, use null.
 
 Return ONLY valid JSON, no markdown, no explanation:
-{{"variant": 3, "answers": {{"1": "A", "2": "?", "3": null, "4": "C"}}}}"""
+{{"variant": 3, "student_name": "Ali Valiyev", "answers": {{"1": "A", "2": "?", "3": null, "4": "C"}}}}"""
 
 
 _model: genai.GenerativeModel | None = None
@@ -125,6 +128,20 @@ def _coerce_variant(value: Any) -> int | None:
     return int(m.group()) if m else None
 
 
+def _clean_name(value: Any) -> str | None:
+    """
+    Return the handwritten name RAW — only trim whitespace and cap length. No
+    spelling correction, no case folding, no transliteration (per spec). Blank,
+    None, or the literal string "null" → None.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "null":
+        return None
+    return s[:100]  # matches CheckResult.student_name / display_name width
+
+
 async def read_answer_sheet(
     image_bytes: bytes, expected_count: int
 ) -> dict[str, Any]:
@@ -133,15 +150,16 @@ async def read_answer_sheet(
 
     Returns:
       {
-        "variant": int | None,      # variant number if visible on the sheet
-        "answers": {int: "A".."D"}, # confidently-read answers
-        "unclear": [int],           # questions marked "?" (ambiguous/blank-mark)
+        "variant": int | None,       # variant number if visible on the sheet
+        "student_name": str | None,  # handwritten name, RAW (unnormalized)
+        "answers": {int: "A".."D"},  # confidently-read answers
+        "unclear": [int],            # questions marked "?" (ambiguous/blank-mark)
       }
 
     On any Gemini/parse failure returns empty answers/unclear (the caller treats
     an empty read as "unreadable — ask for a clearer photo"). NEVER raises.
     """
-    empty = {"variant": None, "answers": {}, "unclear": []}
+    empty = {"variant": None, "student_name": None, "answers": {}, "unclear": []}
     try:
         pages = image_to_pages(image_bytes)
         if not pages:
@@ -187,6 +205,7 @@ async def read_answer_sheet(
 
     return {
         "variant": _coerce_variant(data.get("variant")),
+        "student_name": _clean_name(data.get("student_name")),
         "answers": answers,
         "unclear": sorted(unclear),
     }

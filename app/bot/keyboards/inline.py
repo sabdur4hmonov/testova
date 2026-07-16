@@ -175,6 +175,24 @@ def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def variant_pick_keyboard(numbers, lang: str = "uz") -> InlineKeyboardMarkup:
+    """Pick the variant when it couldn't be read from the sheet. Shown ONLY the
+    project's real variant numbers, so the teacher can't pick a non-existent one.
+    Typing the number still works as a fallback (same waiting state)."""
+    builder = InlineKeyboardBuilder()
+    for n in sorted(numbers):
+        builder.button(text=f"Variant {n}", callback_data=f"chk:variant:{n}")
+    cancel = {
+        "uz": "❌ Bekor qilish",
+        "en": "❌ Cancel",
+        "ru": "❌ Отмена",
+    }.get(lang, "❌ Cancel")
+    builder.button(text=cancel, callback_data="cancel")
+    # Numbers in a grid; cancel on its own row.
+    builder.adjust(3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1)
+    return builder.as_markup()
+
+
 def check_mode_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """Pick how to grade: against a saved project, or by a typed answer key."""
     labels = {

@@ -23,6 +23,7 @@ from app.bot.keyboards.inline import (
     check_project_keyboard,
     group_copy_keyboard,
     key_confirm_keyboard,
+    variant_pick_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, main_menu
 from app.bot.states.forms import CheckingStates
@@ -36,6 +37,7 @@ from app.services.answer_key_parser import parse_answer_key
 from app.services.checker import compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
+from app.services.variant_match import resolve_variant
 from app.utils.caption_parser import (
     NAME_TOO_LONG, parse_caption, parse_name_input, validate_test_name,
 )
@@ -51,12 +53,68 @@ _PHOTO_PROMPTS = {
     "ru": "📷 Отправьте фото листа ответов ученика:",
 }
 
-# Asked once per sheet ONLY when the photo arrived without a name caption.
+# Asked once per sheet ONLY when neither the caption NOR the sheet gave a name.
 _STUDENT_NAME_PROMPT = {
-    "uz": "👤 O'quvchi ismi? (yoki /skip)",
-    "en": "👤 Student's name? (or /skip)",
-    "ru": "👤 Имя ученика? (или /skip)",
+    "uz": "👤 Ism o'qilmadi. O'quvchi ismini kiriting (yoki /skip):",
+    "en": "👤 Couldn't read the name. Enter the student's name (or /skip):",
+    "ru": "👤 Имя не распознано. Введите имя ученика (или /skip):",
 }
+
+_CHECKING = {
+    "uz": "🤖 Javob varaqasi tekshirilmoqda...",
+    "en": "🤖 Checking answer sheet...",
+    "ru": "🤖 Проверяем лист ответов...",
+}
+
+# Shown when the OCR'd variant is missing or isn't one of THIS project's variants.
+_PICK_VARIANT = {
+    "uz": "🔢 Variant raqamini o'qib bo'lmadi. Ro'yxatdan tanlang (yoki raqamini yozing):",
+    "en": "🔢 Couldn't read the variant number. Pick it below (or type the number):",
+    "ru": "🔢 Не удалось распознать номер варианта. Выберите ниже (или введите номер):",
+}
+
+_NO_KEY = {
+    "uz": (
+        "⚠️ Bu loyiha uchun variantlar topilmadi.\n"
+        "Avval test faylini yuklang va variant yarating."
+    ),
+    "en": (
+        "⚠️ No variants found for this project.\n"
+        "Please upload a test file and generate variants first."
+    ),
+    "ru": (
+        "⚠️ Для этого проекта варианты не найдены.\n"
+        "Сначала загрузите файл теста и создайте варианты."
+    ),
+}
+
+
+async def _project_variants(project_id: str | None, user_id) -> tuple[set[int], int]:
+    """Valid variant numbers for the teacher's project + the question count.
+
+    Scoped to the teacher's own project (variant_number restarts at 1 per
+    project). expected_count = length of any variant's answer key (all equal).
+    """
+    valid: set[int] = set()
+    expected = 0
+    if not project_id:
+        return valid, expected
+    import uuid as _uuid
+    from sqlalchemy import select
+    from app.models.project import Project
+    from app.models.variant import Variant
+    async with async_session_factory() as session:
+        res = await session.execute(
+            select(Variant.variant_number, Variant.answer_key)
+            .join(Project, Variant.project_id == Project.id)
+            .where(Variant.project_id == _uuid.UUID(project_id))
+            .where(Project.user_id == user_id)
+        )
+        for vnum, akey in res.all():
+            valid.add(vnum)
+            if akey and not expected:
+                expected = len(akey)
+    return valid, expected
 
 
 # ── Shared per-session run accumulation + group result (both flows) ───────────
@@ -294,19 +352,46 @@ async def handle_answer_sheet_upload(
     # Save temporarily
     key = await storage.save_file(content, folder="temp/answer_sheets", filename=filename)
 
-    # Caption may carry the student's name and/or the variant number.
-    name, variant = parse_caption(message.caption)
+    # Caption is the fast path: a name and/or variant typed by the teacher wins.
+    name_cap, var_cap = parse_caption(message.caption)
+
+    data = await state.get_data()
+    project_id = data.get("project_id")
+    valid, expected_count = await _project_variants(project_id, db_user.id)
+    if expected_count == 0:
+        # Project has no generated variants — nothing to grade against.
+        await message.answer(_NO_KEY.get(lang, _NO_KEY["en"]))
+        return  # stay in waiting_for_answer_sheet
+
+    # Read the sheet ONCE (variant + name + answers). Cached in state so the
+    # optional name prompt and the variant picker never trigger a 2nd Gemini call.
+    thinking = await message.answer(_CHECKING.get(lang, _CHECKING["uz"]))
+    read = await read_answer_sheet(content, expected_count)
+    await thinking.delete()
+
+    # Keyed by position STRING to match check_answers / the stored answer key.
+    answers_str = {str(k): v for k, v in read["answers"].items()}
+    name = name_cap or read["student_name"]
+    candidate = var_cap if var_cap is not None else read["variant"]
     await state.update_data(
-        answer_sheet_key=key, student_name=name, pending_variant=variant
+        answer_sheet_key=key,
+        sheet_answers=answers_str,
+        valid_variants=sorted(valid),
+        pending_variant=candidate,
+        student_name=name,
     )
 
-    # No caption name → ask for it once (fast path preserved when caption has it).
-    if name is None:
+    if len(read["answers"]) + len(read["unclear"]) == 0:
+        await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
+        return  # unreadable sheet — stay and let them retake
+
+    # Name fallback: caption → OCR → optional prompt (type or /skip).
+    if not name:
         await state.set_state(CheckingStates.waiting_for_saved_name)
         await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
         return
 
-    await _proceed_saved_variant(message, state, db_user, name)
+    await _resolve_saved_variant(message, state, db_user, name)
 
 
 @router.message(CheckingStates.waiting_for_saved_name, F.text)
@@ -315,33 +400,49 @@ async def handle_saved_student_name(
 ) -> None:
     name = parse_name_input(message.text)  # /skip or empty → None
     await state.update_data(student_name=name)
-    await _proceed_saved_variant(message, state, db_user, name)
+    await _resolve_saved_variant(message, state, db_user, name)
 
 
-async def _proceed_saved_variant(
+async def _resolve_saved_variant(
     message: Message, state: FSMContext, db_user: User, name: str | None
 ) -> None:
-    """After the name is settled: grade if the variant is known, else ask it."""
+    """Auto-grade when the variant is known (caption or OCR, cross-checked
+    against the project's real variants); else show the picker — buttons of the
+    valid numbers only. Typing the number still works (same waiting state)."""
     lang = db_user.language.value
     data = await state.get_data()
-    variant = data.get("pending_variant")
+    valid = set(data.get("valid_variants") or [])
+    variant = resolve_variant(data.get("pending_variant"), valid)
     if variant is not None:
         await _grade_saved(message, state, db_user, variant, name)
         return
 
     await state.set_state(CheckingStates.waiting_for_variant_number)
-    prompts = {
-        "uz": "🔢 Variant raqamini kiriting (masalan: 1, 2, 3...):",
-        "en": "🔢 Enter the variant number (e.g. 1, 2, 3...):",
-        "ru": "🔢 Введите номер варианта (например: 1, 2, 3...):",
-    }
-    await message.answer(prompts.get(lang, prompts["uz"]))
+    await message.answer(
+        _PICK_VARIANT.get(lang, _PICK_VARIANT["uz"]),
+        reply_markup=variant_pick_keyboard(valid, lang),
+    )
+
+
+@router.callback_query(
+    CheckingStates.waiting_for_variant_number, F.data.startswith("chk:variant:")
+)
+async def handle_variant_pick(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """Teacher picked the variant from the buttons — grade from the cached read."""
+    await callback.answer()
+    variant_num = int(callback.data.rsplit(":", 1)[1])
+    data = await state.get_data()
+    name = data.get("student_name")
+    await _grade_saved(callback.message, state, db_user, variant_num, name)
 
 
 @router.message(CheckingStates.waiting_for_variant_number, F.text)
 async def handle_variant_number(
     message: Message, state: FSMContext, db_user: User
 ) -> None:
+    """Manual fallback: teacher typed the variant number instead of tapping."""
     lang = db_user.language.value
 
     try:
@@ -358,7 +459,7 @@ async def handle_variant_number(
         return
 
     data = await state.get_data()
-    name = data.get("student_name")  # from caption or the name prompt, if any
+    name = data.get("student_name")  # from caption / OCR / the name prompt, if any
     await _grade_saved(message, state, db_user, variant_num, name)
 
 
@@ -374,12 +475,6 @@ async def _grade_saved(
     data = await state.get_data()
     answer_sheet_key = data.get("answer_sheet_key")
     project_id = data.get("project_id")  # set during project-selection step
-
-    thinking = await message.answer({
-        "uz": "🤖 Javob varaqasi tekshirilmoqda...",
-        "en": "🤖 Checking answer sheet...",
-        "ru": "🤖 Проверяем лист ответов...",
-    }.get(lang, "🤖 Checking..."))
 
     # ── Load answer key for this variant ─────────────────────────────────────
     answer_key: dict = {}
@@ -426,19 +521,15 @@ async def _grade_saved(
                 "Сначала загрузите файл теста и создайте варианты."
             ),
         }
-        await thinking.delete()
         await message.answer(msgs.get(lang, msgs["en"]))
         # Stay in the flow so the teacher can retry a different variant/photo.
         await state.set_state(CheckingStates.waiting_for_answer_sheet)
         return
 
-    # ── Extract student answers from image ────────────────────────────────────
-    img_bytes = await storage.read_file(answer_sheet_key)
-    pages = image_to_pages(img_bytes)
-    preprocessed = preprocess_image(pages[0].image)
-
-    analyzer = AIAnalyzer()
-    student_answers = await analyzer.analyze_answer_sheet(preprocessed, total_questions)
+    # ── Student answers ───────────────────────────────────────────────────────
+    # Already read once at upload and cached in state (position-STRING keys, the
+    # exact shape check_answers/the answer key use) — no second Gemini call.
+    student_answers = data.get("sheet_answers") or {}
 
     # ── Grade ─────────────────────────────────────────────────────────────────
     result = check_answers(student_answers, answer_key)
@@ -447,7 +538,6 @@ async def _grade_saved(
     if name_line:
         report = name_line + "\n" + report
 
-    await thinking.delete()
     await message.answer(report, reply_markup=check_again_keyboard(lang))
 
     grade = grade_for(result.score_percent)
@@ -746,8 +836,9 @@ def _format_manual_result(
 async def handle_manual_sheet(
     message: Message, state: FSMContext, db_user: User, bot: Bot
 ) -> None:
-    """Gate: fast-path when the photo carries a name caption; else ask the name
-    first. Re-runs for EVERY photo in the [➕ Yana] loop."""
+    """Read the sheet ONCE (name + variant + answers), then grade — falling back
+    to the optional name prompt only when NEITHER caption nor sheet gave a name.
+    Re-runs for EVERY photo in the [➕ Yana] loop."""
     lang = db_user.language.value
 
     if message.photo:
@@ -757,82 +848,20 @@ async def handle_manual_sheet(
     else:
         return
 
-    name, caption_variant = parse_caption(message.caption)
-
-    # No caption name → ask once, remembering this photo, then grade.
-    if name is None:
-        await state.update_data(
-            pending_sheet_file_id=file_id, pending_caption_variant=caption_variant
-        )
-        await state.set_state(CheckingStates.waiting_for_manual_name)
-        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
-        return
-
-    await _grade_manual(message, state, db_user, bot, file_id, name, caption_variant)
-
-
-@router.message(CheckingStates.waiting_for_manual_name, F.text)
-async def handle_manual_student_name(
-    message: Message, state: FSMContext, db_user: User, bot: Bot
-) -> None:
-    name = parse_name_input(message.text)  # /skip or empty → None
-    data = await state.get_data()
-    file_id = data.get("pending_sheet_file_id")
-    caption_variant = data.get("pending_caption_variant")
-    if not file_id:
-        # Nothing pending (stale) — bounce back to awaiting a photo.
-        lang = db_user.language.value
-        await state.set_state(CheckingStates.waiting_for_manual_sheet)
-        await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
-        return
-    await _grade_manual(message, state, db_user, bot, file_id, name, caption_variant)
-
-
-async def _grade_manual(
-    message: Message,
-    state: FSMContext,
-    db_user: User,
-    bot: Bot,
-    file_id: str,
-    name: str | None,
-    caption_variant: int | None,
-) -> None:
-    """Download → read → grade one manual sheet, then return to the loop."""
-    lang = db_user.language.value
+    name_cap, var_cap = parse_caption(message.caption)
     data = await state.get_data()
     key_raw = data.get("manual_key") or {}
     total = data.get("manual_total") or len(key_raw)
-    session_id = data.get("manual_session_id")
 
-    # Return to the loop state up front so EVERY exit (unreadable, error,
-    # success) leaves the next photo catchable — including when we arrived here
-    # from the name prompt.
-    await state.set_state(CheckingStates.waiting_for_manual_sheet)
-    await state.update_data(pending_sheet_file_id=None, pending_caption_variant=None)
-
-    thinking = await message.answer({
-        "uz": "🤖 Javob varaqasi tekshirilmoqda...",
-        "en": "🤖 Checking answer sheet...",
-        "ru": "🤖 Проверяем лист ответов...",
-    }.get(lang, "🤖 Checking..."))
-
+    thinking = await message.answer(_CHECKING.get(lang, _CHECKING["uz"]))
     try:
         tg_file = await bot.get_file(file_id)
         file_bytes_io = await bot.download_file(tg_file.file_path)
         content = file_bytes_io.read()
-
         read = await read_answer_sheet(content, total)
-        detected = len(read["answers"]) + len(read["unclear"])
-        if detected == 0:
-            await thinking.delete()
-            await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
-            return  # stay in waiting_for_manual_sheet — let them retry
-
-        key_int = {int(k): v for k, v in key_raw.items()}
-        res = compare_with_unclear(read["answers"], key_int, read["unclear"])
     except Exception as e:
         code = "#CHK-" + uuid.uuid4().hex[:4].upper()
-        logger.warning("manual_check_failed", code=code, error=str(e))
+        logger.warning("manual_read_failed", code=code, error=str(e))
         await thinking.delete()
         errs = {
             "uz": f"⚠️ Xatolik yuz berdi ({code}). Rasmni qaytadan yuboring.",
@@ -841,13 +870,69 @@ async def _grade_manual(
         }
         await message.answer(errs.get(lang, errs["en"]))
         return
-
-    # Variant for display/record: prefer the caption's, else what the sheet showed.
-    variant = caption_variant if caption_variant is not None else read["variant"]
-    name_line = _name_line(name, variant, lang)
-
-    report = _format_manual_result(res, lang, name_line)
     await thinking.delete()
+
+    if len(read["answers"]) + len(read["unclear"]) == 0:
+        await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
+        return  # stay in waiting_for_manual_sheet — let them retry
+
+    name = name_cap or read["student_name"]
+    variant = var_cap if var_cap is not None else read["variant"]
+    # Cache the read so the optional name prompt never triggers a 2nd Gemini call.
+    await state.update_data(
+        manual_answers={str(k): v for k, v in read["answers"].items()},
+        manual_unclear=read["unclear"],
+        manual_variant=variant,
+        student_name=name,
+    )
+
+    # Name fallback: caption → OCR → optional prompt (type or /skip).
+    if not name:
+        await state.set_state(CheckingStates.waiting_for_manual_name)
+        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
+        return
+
+    await _grade_manual_cached(message, state, db_user, name)
+
+
+@router.message(CheckingStates.waiting_for_manual_name, F.text)
+async def handle_manual_student_name(
+    message: Message, state: FSMContext, db_user: User
+) -> None:
+    name = parse_name_input(message.text)  # /skip or empty → None
+    data = await state.get_data()
+    if data.get("manual_answers") is None:
+        # Nothing pending (stale) — bounce back to awaiting a photo.
+        lang = db_user.language.value
+        await state.set_state(CheckingStates.waiting_for_manual_sheet)
+        await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
+        return
+    await state.update_data(student_name=name)
+    await _grade_manual_cached(message, state, db_user, name)
+
+
+async def _grade_manual_cached(
+    message: Message, state: FSMContext, db_user: User, name: str | None
+) -> None:
+    """Grade one manual sheet from the cached read, then return to the loop."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    key_raw = data.get("manual_key") or {}
+    session_id = data.get("manual_session_id")
+    answers = data.get("manual_answers") or {}
+    unclear = data.get("manual_unclear") or []
+    variant = data.get("manual_variant")
+
+    # Return to the loop state and clear the cache so the next photo starts clean.
+    await state.set_state(CheckingStates.waiting_for_manual_sheet)
+    await state.update_data(manual_answers=None, manual_unclear=None, manual_variant=None)
+
+    key_int = {int(k): v for k, v in key_raw.items()}
+    answers_int = {int(k): v for k, v in answers.items()}
+    res = compare_with_unclear(answers_int, key_int, unclear)
+
+    name_line = _name_line(name, variant, lang)
+    report = _format_manual_result(res, lang, name_line)
     await message.answer(report, reply_markup=check_again_keyboard(lang))
 
     percent = round(res["score"] / res["total"] * 100) if res["total"] else 0
