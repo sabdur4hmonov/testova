@@ -1,6 +1,6 @@
 # TESTOVA — PROJECT HANDOFF (continue from here)
 
-> **Handoff updated: 16 July 2026 — reconciled to v0.9.** Supersedes the previous handoff. The old handoff was stale at v0.5 (the commit labelled "docs: update handoff through v0.8" actually contained v0.5 text). This version is reconciled against the real git log through the latest commit `a9b21d0`. Since v0.5 the whole **grading half of the product shipped**: manual answer-key grading, saved-project grading, student names, a class group-result table with copy-to-Excel, test naming across every flow, and test-name-first with the name flowing into the PDF. **Generate AND grade is now real.** The next big piece is **VPS deployment** — see NEXT.
+> **Handoff updated: 17 July 2026 — reconciled through v0.12.** Supersedes the previous handoff. Reconciled against the real git log through the block-letters tip commit. Since the v0.9 reconciliation three more features shipped: **v0.10 exam timer** (in-process APScheduler, restart-safe, proactive warnings), **v0.11 answer-sheet auto-detect** (variant + student name read straight off the photo), and **v0.12 name-prompt tuning** + a **block-letters** UX tip. **Generate AND grade is real, timed, and auto-identified.** The next big piece is still **VPS deployment** — see NEXT.
 
 ## CONTEXT
 
@@ -22,9 +22,9 @@ I work with **Claude Code in the terminal**. I'm a beginner — I need **exact c
 
 ## ✅ COMPLETED (all committed & tagged)
 
-**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format` → `v0.6-grader` → `v0.7-names` → `v0.8-naming` → `v0.9-name-first`
+**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format` → `v0.6-grader` → `v0.7-names` → `v0.8-naming` → `v0.9-name-first` → `v0.10-timer` → `v0.11-autodetect` → `v0.12-name-prompt`
 
-**351 tests green.** (3 errors in `test_subscription.py` are the same pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.) Run with `venv311/Scripts/python.exe -m pytest -q`.
+**418 tests green.** (3 errors in `test_subscription.py` are the same pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.) Run with `venv311/Scripts/python.exe -m pytest -q`.
 
 ### Extraction & cleaning
 16-bug audit, token truncation fix (8192 + salvage parser), two-column PDF support, gap recovery, isotope/math verbatim guarantee, OCR confusion dictionary, [Rasm] policy, crop sanity checks, suspicious-question flagging, regression tests.
@@ -112,6 +112,29 @@ New pure/independent services (heavy reuse, no touching of the protected extract
 - `validate_test_name(text) -> (name, error)` in `caption_parser.py`: the single-upload / multi-source name is **REQUIRED** (no `/skip`), trimmed, **≤100 chars** (`NAME_EMPTY` / `NAME_TOO_LONG` → caller re-prompts). The manual-session name is still optional (`/skip`).
 - The name flows through as `exam_title`. **Where it actually prints:** the **answer-key PDF** header (`{exam_title} — Javob kaliti`) and it becomes the project label. **`build_variants_pdf` / `build_variants_pdf_compact` no longer PRINT the title on the variant sheets** — each variant starts with a handwriting fill-in block and a prominent **"Variant N"** (kept prominent on purpose: grading matches sheets to keys by variant number). `exam_title` is retained in those signatures for compatibility. Fallbacks: single-upload `"<full_name> — Test"`, multi-source `"Ko'p manbali test"`.
 
+### v0.10 — Exam timer (in-process APScheduler, restart-safe, proactive warnings)
+Offered right after variants are sent in **Variant yaratish** (single-upload only for now). Teacher sets an exam window and the bot sends a 10-min warning + a time-up notice.
+- **APScheduler `AsyncIOScheduler` runs IN-PROCESS inside the bot** (started in `main.py` `on_startup`). **NO Celery, NO broker, NO Redis, NO worker** — the investigation confirmed Celery is dead code (defined tasks, never dispatched). Requires `pip install APScheduler` (added to `requirements.txt`, pinned 3.10.4).
+- Uses the **already-reserved `projects.exam_start_time` / `exam_end_time`** columns from migration 006 — **NO new migration.** (Migration 006 also added `expires_at`, still unused; there is NO column named `exam_scheduling`.)
+- `app/utils/time_parser.py` — PURE: `parse_clock` ("14:30", "2:30 PM", "14:30:00"), `parse_duration_minutes` (rejects 0/negative/garbage), `combine_today` (anchors wall-clock to today in **fixed UTC+5**, no tzdata dep — Uzbekistan has no DST), `compute_end_time`. Config `EXAM_TZ_OFFSET_HOURS=5`.
+- `app/services/exam_timer.py` — PURE `plan_jobs(end, now)` decides which jobs (past-end → none; `<10 min` out → warning skipped, end only; else both). `schedule_exam` / `reload_pending` / `init_scheduler` / `shutdown_scheduler`. Jobs keyed by project id, `replace_existing=True`.
+- **Restart safety (REQUIRED):** `reload_pending` re-schedules every project with a future `exam_end_time` on startup, so a mid-exam restart never loses a timer (jobs are in-memory only).
+- `app/services/notify.py` — the clean in-process proactive-send helper: `send_text(bot, chat_id, text)`, takes the aiogram `Bot`, swallows+logs failures. **NOT** the dead raw-httpx Celery approach.
+- Flow lives in `app/bot/handlers/exam_timer.py` (`ExamTimerStates`), offered from `upload.py` at the flow end. Free — does NOT touch `uses_left`.
+
+### v0.11 — Answer-sheet auto-detect: student name + variant off the photo (both modes)
+Removes the manual variant-typing step in **Saqlangan** mode and reads the student name in both modes.
+- `sheet_reader.read_answer_sheet` now returns **`{variant, student_name, answers, unclear}`** — the prompt reads the handwritten name RAW (`_clean_name`: trim + 100-char cap, no normalization). Robust as ever (failure → all-empty incl. `student_name=None`, never raises). **`VISION_PROMPT` untouched** (principle #9).
+- **Saqlangan mode now reads via `sheet_reader.read_answer_sheet`** instead of the weaker answers-only `AIAnalyzer.analyze_answer_sheet`. **Key-format fix:** `read_answer_sheet` returns `{int: letter}`; converted to `{str: letter}` before `check_answers` (which wants string position keys) — grading path byte-for-byte unchanged (principle #10).
+- **Read the sheet ONCE, cache in FSM state** — the variant picker and the name prompt grade from cache, so it's still **one Gemini call per sheet**.
+- Variant resolution: caption (fast path) → OCR, cross-checked via new PURE `app/services/variant_match.py` `resolve_variant(candidate, valid)` against the project's real variant numbers (`_project_variants`). Exact match → **auto-grade, no typing**. Null / no-match → **`variant_pick_keyboard`** buttons of the valid numbers only (typing still works as fallback — never hard-break).
+- Name resolution (both modes): caption → OCR → the existing optional prompt (type or `/skip`) only when BOTH are empty.
+- **Manual mode** refactored to the same read-once-then-grade shape; variant stays display-only (single typed key). **Grading stays FREE** — grep-verified no `decrement_use` in `checking.py`; the only call is `upload.py` (generation).
+
+### v0.12 — Name-prompt tuning + block-letters finding
+- **Prompt-wording only** in `sheet_reader.ANSWER_SHEET_PROMPT` (name portion): transcribe the handwritten Uzbek name **letter-by-letter**, keep **Latin/Cyrillic script as written** (no transliteration), do NOT correct into a dictionary word, scope any uncertainty to a single letter (never invent a different name), blank → null. Fixed mangling like "Səyyarəbəf" for "Sanjarbek". Return shape unchanged; variant/answer reading untouched.
+- **Block-letters finding (measured):** **cursive** handwritten names read unreliably even after tuning; **BLOCK LETTERS read accurately.** A 💡 tip was added to the answer-sheet photo prompts (`_PHOTO_PROMPTS`, `_SHEET_PROMPT`) telling teachers to have students write names in BLOCK LETTERS. **The photo caption remains the 100% path** — if the teacher captions the photo with the name, OCR is bypassed entirely.
+
 ### Earlier work (unchanged, still true)
 
 **THE T-108 MATH QUALITY WAR (won):** tested against a real 2-column, 30-question Uzbek math exam (T-108, code 8000008). `app/services/math_render.py` — tokenizer → recursive-descent parser → AST → LaTeX → cached matplotlib mathtext PNG, inlined as ReportLab `<img>`. LaTeX-quality output: stacked fractions, radicals with vinculum, `log₂`, `2²¹`, `x₁`, `3½`, real number-line image.
@@ -159,18 +182,24 @@ Every user-facing @-mention reads `settings.ADMIN_USERNAME`. A guard test blocks
 ### 10. (v0.6) One grading scale, one place
 `checker.grade_for()` is the ONLY definition of the Uzbek 5/4/3/2 scale. Nothing else may define its own thresholds. An unclear (unreadable) answer counts as WRONG but is listed apart so the teacher can override by hand — do not silently mark it correct.
 
+### 11. (v0.10) The exam timer is IN-PROCESS and must never take down the bot
+APScheduler runs inside the bot process — **do NOT wire up Celery** to run it (Celery is dead code; reviving it is a trap). `init_scheduler`/`reload_pending` are wrapped in try/except in `main.py`: if the scheduler fails to start, **the bot still runs, just without timers.** `shutdown_scheduler` is a safe no-op if it never started and must never hang/throw on exit. Timer times live in the **reserved `projects.exam_*` columns — never add a migration for them.** Jobs are in-memory, so the startup DB reload is what makes a restart safe — keep it.
+
+### 12. (v0.11) Auto-detect never guesses, and grading stays FREE
+Read the sheet ONCE and cache it (one Gemini call per sheet). A variant is used ONLY if it exactly matches the project's real variants (`resolve_variant`); otherwise show the picker — **never guess a variant.** The handwritten name is returned RAW (no spelling correction). And **`checking.py` must never call `decrement_use`** — grading is free by design (the `can_check` gate ignores `uses_left`). If you ever add charging, it belongs in generation (`upload.py`), never here.
+
 ---
 
 ## ⏭️ NEXT — VPS DEPLOYMENT (now the biggest unbuilt piece)
 
-The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, and test naming. Grading is free and ignores `uses_left` by design.
+The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, test naming, an **exam timer** (v0.10), and **auto-detect of variant + student name off the photo** (v0.11–v0.12). Grading is free and ignores `uses_left` by design.
 
 The remaining gate before any real teacher touches this is deployment:
 
 **VPS deployment** — kills the Telegram block permanently, bot online 24/7. ~$5/mo (Hetzner/Contabo/DigitalOcean). On deploy:
 - `.env` with `ADMIN_IDS=[8206475760]` (JSON list), `ADMIN_USERNAME=testova_admin`, `GEMINI_MODEL=gemini-2.5-flash`, Gemini price vars if non-default (`GEMINI_PRICE_IN_PER_M`, `GEMINI_PRICE_OUT_PER_M`, `UZS_PER_USD`), Postgres connection string.
-- `pip install -r requirements.txt` (incl. matplotlib==3.11.0).
-- `alembic upgrade head` — schema is now at migration **006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming).
+- `pip install -r requirements.txt` (incl. matplotlib==3.11.0 **and APScheduler==3.10.4** for the exam timer).
+- `alembic upgrade head` — schema is **still at migration 006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming). The exam timer reused 006's reserved columns, so v0.10–v0.12 added NO migration.
 - Set Gemini Prepay auto-reload so nobody hits a $0 balance mid-exam.
 
 Suggested opening prompt for the deployment session:
@@ -197,7 +226,8 @@ Suggested opening prompt for the deployment session:
 - Main menu is currently Row 1 `[📤 Variant yaratish] [✅ Test tekshirish]`, Row 2 `[📚 Ko'p manbadan test yaratish]`, Row 3 `[projects] [pricing]`, Row 4 `[language] [support]`. File: `app/bot/keyboards/main_menu.py`.
 - `ADMIN_IDS` should accept bare `123` or `123,456` via validator, or document JSON format in `.env.example`.
 - `admin_log.target` vs `target_user_id` naming; `blocked_text()` has no lang param — deliberately skipped.
-- Nothing pushed to remote yet — `git push && git push --tags` when you want an off-machine backup.
+- **No git remote is configured yet** — `git remote -v` is empty, so nothing is backed up off-machine. Add a remote (`git remote add origin <url>`) then `git push -u origin master && git push --tags` when you want an off-machine backup.
+- Exam timer is **single-upload only** — the "Ko'p manbadan" (multi-source) flow doesn't offer it yet. Auto-detect covers both grading modes; timer does not yet cover both generation flows.
 
 ---
 
