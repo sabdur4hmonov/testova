@@ -48,9 +48,21 @@ logger = get_logger(__name__)
 
 
 _PHOTO_PROMPTS = {
-    "uz": "📷 O'quvchining javob varaqasi rasmini yuboring:",
-    "en": "📷 Send a photo of the student's answer sheet:",
-    "ru": "📷 Отправьте фото листа ответов ученика:",
+    "uz": (
+        "📷 O'quvchining javob varaqasi rasmini yuboring:\n\n"
+        "💡 Ism aniq o'qilishi uchun o'quvchilar ismini BOSH HARFLAR bilan "
+        "yozsin. Eng ishonchlisi — rasm izohiga (caption) ismni yozing."
+    ),
+    "en": (
+        "📷 Send a photo of the student's answer sheet:\n\n"
+        "💡 For accurate name reading, have students write their name in "
+        "BLOCK LETTERS. Most reliable: add the name in the photo caption."
+    ),
+    "ru": (
+        "📷 Отправьте фото листа ответов ученика:\n\n"
+        "💡 Для точного распознавания имени пусть ученики пишут имя ПЕЧАТНЫМИ "
+        "БУКВАМИ. Надёжнее всего — укажите имя в подписи (caption) к фото."
+    ),
 }
 
 # Asked once per sheet ONLY when neither the caption NOR the sheet gave a name.
@@ -612,9 +624,21 @@ _KEY_PROMPT = {
 }
 
 _SHEET_PROMPT = {
-    "uz": "📷 O'quvchining javob varaqasi rasmini yuboring:",
-    "en": "📷 Send a photo of the student's answer sheet:",
-    "ru": "📷 Отправьте фото листа ответов ученика:",
+    "uz": (
+        "📷 O'quvchining javob varaqasi rasmini yuboring:\n\n"
+        "💡 Ism aniq o'qilishi uchun o'quvchilar ismini BOSH HARFLAR bilan "
+        "yozsin. Eng ishonchlisi — rasm izohiga (caption) ismni yozing."
+    ),
+    "en": (
+        "📷 Send a photo of the student's answer sheet:\n\n"
+        "💡 For accurate name reading, have students write their name in "
+        "BLOCK LETTERS. Most reliable: add the name in the photo caption."
+    ),
+    "ru": (
+        "📷 Отправьте фото листа ответов ученика:\n\n"
+        "💡 Для точного распознавания имени пусть ученики пишут имя ПЕЧАТНЫМИ "
+        "БУКВАМИ. Надёжнее всего — укажите имя в подписи (caption) к фото."
+    ),
 }
 
 _UNREADABLE = {
