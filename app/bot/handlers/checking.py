@@ -916,6 +916,16 @@ async def handle_manual_sheet(
         return
     await thinking.delete()
 
+    # TEMP DEBUG v0.14 — remove after flag testing
+    logger.info(
+        "DEBUG_FLAGS",
+        name_unclear=read.get("name_unclear"),
+        low_confidence=read.get("low_confidence"),
+        unclear=read.get("unclear"),
+        student_name=read.get("student_name"),
+        texts=read.get("texts"),
+    )
+
     # A sheet of only WRITTEN answers is readable too — count texts as detected.
     if len(read["answers"]) + len(read["texts"]) + len(read["unclear"]) == 0:
         await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
@@ -930,6 +940,9 @@ async def handle_manual_sheet(
         manual_unclear=read["unclear"],
         manual_variant=variant,
         student_name=name,
+        # v0.14 confidence flags — cached for the future confirm step (Build 2b).
+        manual_low_confidence=read.get("low_confidence") or [],
+        manual_name_unclear=bool(read.get("name_unclear")),
     )
 
     # Name fallback: caption → OCR → optional prompt (type or /skip).
@@ -970,12 +983,10 @@ async def _grade_manual_cached(
     unclear = data.get("manual_unclear") or []
     variant = data.get("manual_variant")
 
-    # Return to the loop state and clear the cache so the next photo starts clean.
+    # Return to the loop state up front so the next photo is always catchable.
+    # The cache is cleared AFTER scoring (below), so a future confirm step can
+    # still read the cached read (Build 2b).
     await state.set_state(CheckingStates.waiting_for_manual_sheet)
-    await state.update_data(
-        manual_answers=None, manual_texts=None,
-        manual_unclear=None, manual_variant=None,
-    )
 
     # One student answer per question: a marked letter OR a written text. The
     # key's accepted list handles both (a letter is a one-item list).
@@ -987,6 +998,12 @@ async def _grade_manual_cached(
     name_line = _name_line(name, variant, lang)
     report = _format_manual_result(res, lang, name_line)
     await message.answer(report, reply_markup=check_again_keyboard(lang))
+
+    # Cache no longer needed — clear it so the next photo starts clean.
+    await state.update_data(
+        manual_answers=None, manual_texts=None, manual_unclear=None,
+        manual_variant=None, manual_low_confidence=None, manual_name_unclear=None,
+    )
 
     percent = round(res["score"] / res["total"] * 100) if res["total"] else 0
     await _append_run_result(
