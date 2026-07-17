@@ -34,17 +34,26 @@ _CYRILLIC_MAP = {"А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E"}
 _VALID = {"A", "B", "C", "D"}
 
 # NEW prompt — do NOT reuse VISION_PROMPT. Reads MARKED answers, never guesses.
-ANSWER_SHEET_PROMPT = """You are reading a photo of a student's multiple-choice ANSWER SHEET.
-The test has {total} questions. For each question the student has marked ONE
-option: A, B, C or D.
+ANSWER_SHEET_PROMPT = """You are reading a photo of a student's exam ANSWER SHEET.
+The test has {total} questions. For MOST questions the student marks ONE option:
+A, B, C or D. Some questions have NO options — for those the student WRITES a
+short answer by hand (a word, a number, or a very short phrase), usually in
+BLOCK CAPITAL LETTERS.
 
 Rules:
-- Report ONLY what the student actually marked — read the marks, do NOT solve
-  the test and do NOT guess.
+- Report ONLY what the student actually marked or wrote — read the sheet, do NOT
+  solve the test and do NOT guess.
+- For a MARKED option, output just the letter: "A", "B", "C" or "D".
+- For a WRITTEN answer, output the text EXACTLY as written, letter by letter.
+  Do NOT correct spelling, do NOT translate, do NOT transliterate between
+  scripts (Latin stays Latin, Cyrillic stays Cyrillic), do NOT expand
+  abbreviations. If a single letter is genuinely illegible, choose the most
+  likely letter for THAT letter — never invent a different word.
 - If a mark is ambiguous, erased, crossed-out, or the student marked TWO or more
   options for the same question, output "?" for that question. NEVER guess a
   single letter in that case.
-- If a question is left completely blank (no mark at all), output null.
+- If a question is left completely blank (nothing marked and nothing written),
+  output null.
 - Also read the VARIANT NUMBER if it is written anywhere on the sheet
   (e.g. "Variant 3", "V-3", "3-variant"); if none is visible, use null.
 - Also read the STUDENT'S NAME. It is HANDWRITTEN, usually at the very top of
@@ -56,8 +65,9 @@ Rules:
   the most likely letter for THAT letter — never invent a different name. If the
   name area is blank or completely unreadable, use null (do NOT guess a name).
 
-Return ONLY valid JSON, no markdown, no explanation:
-{{"variant": 3, "student_name": "Ali Valiyev", "answers": {{"1": "A", "2": "?", "3": null, "4": "C"}}}}"""
+Return ONLY valid JSON, no markdown, no explanation. Question 22 below is a
+written answer; the rest are marked options:
+{{"variant": 3, "student_name": "Ali Valiyev", "answers": {{"1": "A", "2": "?", "3": null, "4": "C", "22": "SMARTPHONE"}}}}"""
 
 
 _model: genai.GenerativeModel | None = None
@@ -114,7 +124,13 @@ def _parse_response(raw: str) -> dict[str, Any]:
 
 
 def _norm_letter(value: Any) -> str | None:
-    """Fold a raw answer to 'A'..'D', '?' (unclear), or None (blank/invalid)."""
+    """
+    Fold a raw answer to 'A'..'D', '?' (unclear), or None.
+
+    The WHOLE value must be a single letter to count as a marked option — a
+    written answer like "APPLE" must NOT be read as "A". None here means "not a
+    bare letter", i.e. it may be a written short answer (see _clean_text).
+    """
     if value is None:
         return None
     s = str(value).strip().upper()
@@ -122,8 +138,24 @@ def _norm_letter(value: Any) -> str | None:
         return None
     if s[0] == "?":
         return "?"
-    ch = _CYRILLIC_MAP.get(s[0], s[0])
+    if len(s) != 1:
+        return None  # a written word is not an option letter
+    ch = _CYRILLIC_MAP.get(s, s)
     return ch if ch in _VALID else None
+
+
+def _clean_text(value: Any) -> str | None:
+    """
+    A WRITTEN short answer, kept RAW — script preserved, no spell-fixing, no
+    transliteration. Only whitespace-collapsed and length-capped. Matching
+    (case-insensitivity) happens later in checker.py, not here.
+    """
+    if value is None:
+        return None
+    s = " ".join(str(value).split())
+    if not s or s.startswith("?"):
+        return None
+    return s[:100]
 
 
 def _coerce_variant(value: Any) -> int | None:
@@ -157,14 +189,21 @@ async def read_answer_sheet(
       {
         "variant": int | None,       # variant number if visible on the sheet
         "student_name": str | None,  # handwritten name, RAW (unnormalized)
-        "answers": {int: "A".."D"},  # confidently-read answers
+        "answers": {int: "A".."D"},  # confidently-read MARKED options
+        "texts": {int: str},         # WRITTEN short answers, RAW (unnormalized)
         "unclear": [int],            # questions marked "?" (ambiguous/blank-mark)
       }
 
-    On any Gemini/parse failure returns empty answers/unclear (the caller treats
-    an empty read as "unreadable — ask for a clearer photo"). NEVER raises.
+    Marked options and written answers come from the SAME single vision call —
+    there is no second Gemini request.
+
+    On any Gemini/parse failure returns empty answers/texts/unclear (the caller
+    treats an empty read as "unreadable — ask for a clearer photo"). NEVER raises.
     """
-    empty = {"variant": None, "student_name": None, "answers": {}, "unclear": []}
+    empty = {
+        "variant": None, "student_name": None,
+        "answers": {}, "texts": {}, "unclear": [],
+    }
     try:
         pages = image_to_pages(image_bytes)
         if not pages:
@@ -196,6 +235,7 @@ async def read_answer_sheet(
 
     data = _parse_response(raw)
     answers: dict[int, str] = {}
+    texts: dict[int, str] = {}
     unclear: list[int] = []
     for k, v in (data.get("answers") or {}).items():
         try:
@@ -206,11 +246,16 @@ async def read_answer_sheet(
         if letter == "?":
             unclear.append(q)
         elif letter is not None:
-            answers[q] = letter
+            answers[q] = letter          # a marked option
+        else:
+            txt = _clean_text(v)
+            if txt:
+                texts[q] = txt           # a written short answer
 
     return {
         "variant": _coerce_variant(data.get("variant")),
         "student_name": _clean_name(data.get("student_name")),
         "answers": answers,
+        "texts": texts,
         "unclear": sorted(unclear),
     }

@@ -45,7 +45,10 @@ async def test_fenced_json(patched):
 async def test_malformed_safe_failure(patched):
     patched("this is not json at all")
     res = await SR.read_answer_sheet(b"x", 10)
-    assert res == {"variant": None, "student_name": None, "answers": {}, "unclear": []}
+    assert res == {
+        "variant": None, "student_name": None,
+        "answers": {}, "texts": {}, "unclear": [],
+    }
 
 
 async def test_reads_student_name_and_variant(patched):

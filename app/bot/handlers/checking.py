@@ -611,33 +611,51 @@ async def _grade_saved(
 _KEY_PROMPT = {
     "uz": (
         "📝 To'g'ri javoblarni kiriting.\n"
-        "Masalan: <code>1A 2B 3C 4D</code> yoki <code>ABCDABCD</code>"
+        "Masalan: <code>1A 2B 3C 4D</code> yoki <code>ABCDABCD</code>\n\n"
+        "✍️ Yozma javob uchun: <code>5: TOSHKENT</code>\n"
+        "Bir nechta to'g'ri javob bo'lsa, <code>/</code> bilan ajrating:\n"
+        "<code>22: PHONE / TELEPHONE / SMARTPHONE</code>\n\n"
+        "💡 Yozma javoblarni o'quvchilar BOSH HARFLAR bilan yozsin — shunda "
+        "aniq o'qiladi."
     ),
     "en": (
         "📝 Enter the correct answers.\n"
-        "e.g. <code>1A 2B 3C 4D</code> or <code>ABCDABCD</code>"
+        "e.g. <code>1A 2B 3C 4D</code> or <code>ABCDABCD</code>\n\n"
+        "✍️ For a written answer: <code>5: TOSHKENT</code>\n"
+        "If several answers are accepted, separate them with <code>/</code>:\n"
+        "<code>22: PHONE / TELEPHONE / SMARTPHONE</code>\n\n"
+        "💡 Have students write written answers in BLOCK CAPITAL LETTERS — "
+        "they read most accurately."
     ),
     "ru": (
         "📝 Введите правильные ответы.\n"
-        "Например: <code>1A 2B 3C 4D</code> или <code>ABCDABCD</code>"
+        "Например: <code>1A 2B 3C 4D</code> или <code>ABCDABCD</code>\n\n"
+        "✍️ Для письменного ответа: <code>5: TOSHKENT</code>\n"
+        "Если подходит несколько ответов, разделите их <code>/</code>:\n"
+        "<code>22: PHONE / TELEPHONE / SMARTPHONE</code>\n\n"
+        "💡 Пусть ученики пишут письменные ответы ПЕЧАТНЫМИ БУКВАМИ — так они "
+        "распознаются точнее."
     ),
 }
 
 _SHEET_PROMPT = {
     "uz": (
         "📷 O'quvchining javob varaqasi rasmini yuboring:\n\n"
-        "💡 Ism aniq o'qilishi uchun o'quvchilar ismini BOSH HARFLAR bilan "
-        "yozsin. Eng ishonchlisi — rasm izohiga (caption) ismni yozing."
+        "💡 Ism va yozma javoblar aniq o'qilishi uchun o'quvchilar ularni "
+        "BOSH HARFLAR bilan yozsin. Ism uchun eng ishonchlisi — rasm izohiga "
+        "(caption) yozing."
     ),
     "en": (
         "📷 Send a photo of the student's answer sheet:\n\n"
-        "💡 For accurate name reading, have students write their name in "
-        "BLOCK LETTERS. Most reliable: add the name in the photo caption."
+        "💡 For accurate reading, have students write their name AND any "
+        "written answers in BLOCK CAPITAL LETTERS. For the name, the most "
+        "reliable way is the photo caption."
     ),
     "ru": (
         "📷 Отправьте фото листа ответов ученика:\n\n"
-        "💡 Для точного распознавания имени пусть ученики пишут имя ПЕЧАТНЫМИ "
-        "БУКВАМИ. Надёжнее всего — укажите имя в подписи (caption) к фото."
+        "💡 Для точного распознавания пусть ученики пишут имя И письменные "
+        "ответы ПЕЧАТНЫМИ БУКВАМИ. Для имени надёжнее всего — подпись "
+        "(caption) к фото."
     ),
 }
 
@@ -700,7 +718,9 @@ async def handle_manual_key(
     await state.update_data(manual_key={str(k): v for k, v in key.items()})
     await state.set_state(CheckingStates.waiting_for_key_confirm)
 
-    preview = ", ".join(f"{q}-{key[q]}" for q in sorted(key))
+    # Each answer is a list; a letter renders as "1-A", a multi-answer question
+    # as "22-PHONE / TELEPHONE" so the teacher can verify what was understood.
+    preview = ", ".join(f"{q}-{' / '.join(key[q])}" for q in sorted(key))
     headers = {
         "uz": f"✅ {len(key)} ta javob: {preview}",
         "en": f"✅ {len(key)} answers: {preview}",
@@ -896,7 +916,8 @@ async def handle_manual_sheet(
         return
     await thinking.delete()
 
-    if len(read["answers"]) + len(read["unclear"]) == 0:
+    # A sheet of only WRITTEN answers is readable too — count texts as detected.
+    if len(read["answers"]) + len(read["texts"]) + len(read["unclear"]) == 0:
         await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
         return  # stay in waiting_for_manual_sheet — let them retry
 
@@ -905,6 +926,7 @@ async def handle_manual_sheet(
     # Cache the read so the optional name prompt never triggers a 2nd Gemini call.
     await state.update_data(
         manual_answers={str(k): v for k, v in read["answers"].items()},
+        manual_texts={str(k): v for k, v in read["texts"].items()},
         manual_unclear=read["unclear"],
         manual_variant=variant,
         student_name=name,
@@ -944,16 +966,23 @@ async def _grade_manual_cached(
     key_raw = data.get("manual_key") or {}
     session_id = data.get("manual_session_id")
     answers = data.get("manual_answers") or {}
+    texts = data.get("manual_texts") or {}
     unclear = data.get("manual_unclear") or []
     variant = data.get("manual_variant")
 
     # Return to the loop state and clear the cache so the next photo starts clean.
     await state.set_state(CheckingStates.waiting_for_manual_sheet)
-    await state.update_data(manual_answers=None, manual_unclear=None, manual_variant=None)
+    await state.update_data(
+        manual_answers=None, manual_texts=None,
+        manual_unclear=None, manual_variant=None,
+    )
 
+    # One student answer per question: a marked letter OR a written text. The
+    # key's accepted list handles both (a letter is a one-item list).
     key_int = {int(k): v for k, v in key_raw.items()}
-    answers_int = {int(k): v for k, v in answers.items()}
-    res = compare_with_unclear(answers_int, key_int, unclear)
+    student = {int(k): v for k, v in answers.items()}
+    student.update({int(k): v for k, v in texts.items()})
+    res = compare_with_unclear(student, key_int, unclear)
 
     name_line = _name_line(name, variant, lang)
     report = _format_manual_result(res, lang, name_line)
