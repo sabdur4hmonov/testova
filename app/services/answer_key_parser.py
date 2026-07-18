@@ -6,14 +6,20 @@ EVERY answer is a LIST of accepted strings — a multiple-choice letter is simpl
 a one-item list (["A"]) — so ONE matching rule covers both kinds and a test may
 freely mix multiple-choice and written short answers.
 
-Accepted shapes (freely mixable; written entries are one per line):
+Accepted shapes (freely mixable across lines):
   * labelled  — "1A 2B 3C 4D", any separators ("1) A, 2) B. 3-C")
   * bare      — "ABCDABCD" (or "abcd abcd"): letters numbered from 1
   * written   — "5: TOSHKENT"                        (one accepted answer)
   * multi     — "22: PHONE / TELEPHONE / SMARTPHONE" (ANY of these is correct)
+  * one-line  — "1: banan 2: apple 3: peach": several written answers on ONE
+                line, split ONLY when the numbers are strictly consecutive.
 
-A written entry is marked by a COLON after the question number. "1:A 2:B" is
-still a legacy letter line, not one written answer.
+A written line is one whose FIRST token is `<number>:`. Within it, a new answer
+starts at `<number>:` that is NOT immediately followed by a digit — so a ratio
+"2:3", a time "14:30", or a scale "1:100" stays INSIDE the current answer and is
+never treated as a new question. If a one-line split is not confident (numbers
+not consecutive, or an empty segment), we REJECT with a clear message rather
+than guess — never silently drop or mis-parse an answer.
 
 Cyrillic look-alikes (А В С Д Е) are folded to Latin ONLY for a SINGLE-letter
 answer. A word is NEVER transliterated — Cyrillic "ТОШКЕНТ" stays Cyrillic;
@@ -36,13 +42,31 @@ _VALID = {"A", "B", "C", "D"}
 # "12) A", "12 - a". Separators between number and letter are optional.
 _LABELLED_RE = re.compile(r"(\d+)\s*[).\-:]?\s*([A-E])", re.IGNORECASE)
 
-# A written entry: "22: PHONE / TELEPHONE". The COLON is what marks it.
-_WRITTEN_RE = re.compile(r"^\s*(\d+)\s*:\s*(\S.*?)\s*$")
-# ...but "1:A 2:B" is a legacy letter LINE (more numbered pairs in the body),
-# not a single written answer.
-_MORE_PAIRS_RE = re.compile(r"\d+\s*[).\-:]\s*[A-EА-Яа-яa-e]", re.IGNORECASE)
+# A WRITTEN line starts with "<number>:" (that routes it to the written path).
+_STARTS_WRITTEN = re.compile(r"^\s*(\d+)\s*:")
+# An INTERNAL new-answer boundary inside a written line: whitespace, a number,
+# a colon that is NOT immediately followed by a digit. The `(?!\d)` is the whole
+# ratio/time/scale guard — "2:3" / "14:30" / "1:100" never start a new answer.
+_BOUNDARY_RE = re.compile(r"\s+(\d+)\s*:(?!\d)")
+# A leftover (letter-path) line that still hides a written entry ("1A 2B 3: cat")
+# — number, colon, then 2+ non-digit/non-space chars = a word. Warn, never drop.
+_WRITTEN_ON_LETTER_LINE = re.compile(r"\d+\s*:\s*[^\d\s]{2,}")
 
 _MAX_ITEM = 100  # matches CheckResult.student_name / display_name width
+
+# Trilingual "put each answer on its own line" — the ONLY per-lang message
+# (existing reasons stay Uzbek; their tests pin Uzbek substrings).
+_AMBIGUOUS = {
+    "uz": ("Bir qatordagi bir nechta javobni aniq ajratib bo'lmadi (raqamlar "
+           "ketma-ket emas). Har bir javobni ALOHIDA QATORGA yozing. Masalan:\n"
+           "5: TOSHKENT\n6: SMARTFON"),
+    "en": ("Couldn't reliably separate multiple answers on one line (the numbers "
+           "aren't consecutive). Put each answer on its OWN LINE, e.g.:\n"
+           "5: TOSHKENT\n6: SMARTPHONE"),
+    "ru": ("Не удалось надёжно разделить несколько ответов в одной строке "
+           "(номера не по порядку). Пишите каждый ответ на ОТДЕЛЬНОЙ СТРОКЕ, "
+           "напр.:\n5: TOSHKENT\n6: SMARTFON"),
+}
 
 
 def _fold(text: str) -> str:
@@ -101,14 +125,64 @@ def _parse_letters(text: str) -> tuple[dict[int, str], str]:
     return {i + 1: c for i, c in enumerate(letters_only)}, ""
 
 
-def parse_answer_key(text: str) -> tuple[dict[int, list[str]], str]:
+def _items(segment: str) -> list[str]:
+    """One answer segment → accepted list (split on '/', normalised, non-empty)."""
+    return [i for i in (_norm_item(p) for p in segment.split("/")) if i]
+
+
+def _split_written_line(line: str) -> tuple[dict[int, list[str]] | None, str]:
+    """
+    Parse ONE written line (starts with `<number>:`) into {num: [accepted, ...]}.
+
+    Returns (entries, status):
+      * status "ok"        → entries is the parsed dict.
+      * status "ambiguous" → a one-line multi-answer split that isn't confident
+                             (numbers not consecutive). entries is None.
+      * status "empty"     → some question's answer segment was blank. None.
+
+    A new answer starts only at a `<number>:` NOT immediately followed by a digit
+    (so ratios/times/scales stay inside the current answer). Multiple entries are
+    accepted ONLY when their numbers are strictly consecutive.
+    """
+    first = _STARTS_WRITTEN.match(line)
+    # Boundaries: the leading header, then every internal non-ratio "<num>:".
+    heads: list[tuple[int, int, int]] = [  # (question_number, hdr_start, hdr_end)
+        (int(first.group(1)), first.start(), first.end())
+    ]
+    for m in _BOUNDARY_RE.finditer(line):
+        if m.start(1) > first.end():          # strictly after the first header
+            heads.append((int(m.group(1)), m.start(), m.end()))
+
+    # Slice each answer from its header-end to the next header-start.
+    entries: list[tuple[int, str]] = []
+    for i, (num, _hs, he) in enumerate(heads):
+        end = heads[i + 1][1] if i + 1 < len(heads) else len(line)
+        entries.append((num, line[he:end].strip()))
+
+    if len(entries) > 1:
+        nums = [n for n, _ in entries]
+        if nums != list(range(nums[0], nums[0] + len(nums))):
+            return None, "ambiguous"          # not strictly consecutive → don't guess
+
+    out: dict[int, list[str]] = {}
+    for num, seg in entries:
+        items = _items(seg)
+        if not items:
+            return None, "empty"
+        out[num] = items
+    return out, "ok"
+
+
+def parse_answer_key(text: str, lang: str = "uz") -> tuple[dict[int, list[str]], str]:
     """
     Parse a typed answer key.
 
     Returns (key, reason):
       * key    — {question_number: ["ACCEPTED", ...]} (1-indexed), {} on failure.
                  A letter answer is a one-item list.
-      * reason — "" on success, else a short human-readable Uzbek explanation.
+      * reason — "" on success, else a short human-readable explanation. Only the
+                 one-line ambiguity message is translated (`lang`); other reasons
+                 are Uzbek.
     """
     if not text or not text.strip():
         return {}, "Javob kaliti bo'sh."
@@ -116,24 +190,28 @@ def parse_answer_key(text: str) -> tuple[dict[int, list[str]], str]:
     key: dict[int, list[str]] = {}
     leftover: list[str] = []
 
-    # Written entries are line-scoped; everything else falls through to the
-    # legacy letter parser, so old inputs behave exactly as before.
+    # A line starting with "<number>:" is a WRITTEN line (single or one-line
+    # multi). Everything else falls through to the legacy letter parser.
     for line in text.splitlines():
         if not line.strip():
             continue
-        m = _WRITTEN_RE.match(line)
-        if m and not _MORE_PAIRS_RE.search(m.group(2)):
-            num = int(m.group(1))
-            items = [_norm_item(p) for p in m.group(2).split("/")]
-            items = [i for i in items if i]
-            if not items:
-                return {}, f"{num}-savol uchun javob ko'rsatilmagan."
-            key[num] = items
+        if _STARTS_WRITTEN.match(line):
+            entries, status = _split_written_line(line)
+            if status == "ambiguous":
+                return {}, _AMBIGUOUS.get(lang, _AMBIGUOUS["uz"])
+            if status == "empty":
+                return {}, "Har bir savol uchun javob yozing (bo'sh javob bor)."
+            key.update(entries)
         else:
             leftover.append(line)
 
     if leftover:
-        letters, reason = _parse_letters("\n".join(leftover))
+        joined = "\n".join(leftover)
+        # A letter-path line that still hides a written entry ("1A 2B 3: cat")
+        # would silently drop the word — warn instead.
+        if _WRITTEN_ON_LETTER_LINE.search(joined):
+            return {}, _AMBIGUOUS.get(lang, _AMBIGUOUS["uz"])
+        letters, reason = _parse_letters(joined)
         if reason:
             return {}, reason
         for num, letter in letters.items():

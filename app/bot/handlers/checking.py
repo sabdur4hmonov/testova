@@ -725,7 +725,7 @@ async def handle_manual_key(
     message: Message, state: FSMContext, db_user: User
 ) -> None:
     lang = db_user.language.value
-    key, reason = parse_answer_key(message.text)
+    key, reason = parse_answer_key(message.text, lang)
     if not key:
         # Stay in the same state — let the teacher retype.
         await message.answer("❌ " + reason)
