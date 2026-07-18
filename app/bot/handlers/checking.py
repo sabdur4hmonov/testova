@@ -21,6 +21,7 @@ from app.bot.keyboards.inline import (
     check_again_keyboard,
     check_mode_keyboard,
     check_project_keyboard,
+    confirm_answer_keyboard,
     group_copy_keyboard,
     key_confirm_keyboard,
     variant_pick_keyboard,
@@ -34,7 +35,7 @@ from app.services import storage
 from app.services.ai_analyzer import AIAnalyzer
 from app.services.answer_checker import check_answers
 from app.services.answer_key_parser import parse_answer_key
-from app.services.checker import compare_with_unclear, grade_for
+from app.services.checker import accepted_list, compare_with_unclear, grade_for
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
 from app.services.variant_match import resolve_variant
@@ -70,6 +71,21 @@ _STUDENT_NAME_PROMPT = {
     "uz": "👤 Ism o'qilmadi. O'quvchi ismini kiriting (yoki /skip):",
     "en": "👤 Couldn't read the name. Enter the student's name (or /skip):",
     "ru": "👤 Имя не распознано. Введите имя ученика (или /skip):",
+}
+
+# Shown when a name WAS read but the AI is unsure of it (name_unclear).
+_NAME_CONFIRM_PROMPT = {
+    "uz": "👤 Ismni aniq o'qib bo'lmadi. Iltimos, o'quvchi ismini yozing (yoki /skip):",
+    "en": "👤 The name wasn't read clearly. Please type the student's name (or /skip):",
+    "ru": "👤 Имя распознано неточно. Введите имя ученика (или /skip):",
+}
+
+# One unsure written answer: show the CORRECT answer (never the AI's guess) and
+# ask the teacher to check the paper.
+_CONFIRM_Q = {
+    "uz": "❓ {q}-savol — to'g'ri javob: {correct}\nO'quvchi to'g'ri javob berganmi?",
+    "en": "❓ Question {q} — correct answer: {correct}\nDid the student answer correctly?",
+    "ru": "❓ Вопрос {q} — правильный ответ: {correct}\nУченик ответил правильно?",
 }
 
 _CHECKING = {
@@ -916,16 +932,6 @@ async def handle_manual_sheet(
         return
     await thinking.delete()
 
-    # TEMP DEBUG v0.14 — remove after flag testing
-    logger.info(
-        "DEBUG_FLAGS",
-        name_unclear=read.get("name_unclear"),
-        low_confidence=read.get("low_confidence"),
-        unclear=read.get("unclear"),
-        student_name=read.get("student_name"),
-        texts=read.get("texts"),
-    )
-
     # A sheet of only WRITTEN answers is readable too — count texts as detected.
     if len(read["answers"]) + len(read["texts"]) + len(read["unclear"]) == 0:
         await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
@@ -940,18 +946,76 @@ async def handle_manual_sheet(
         manual_unclear=read["unclear"],
         manual_variant=variant,
         student_name=name,
-        # v0.14 confidence flags — cached for the future confirm step (Build 2b).
-        manual_low_confidence=read.get("low_confidence") or [],
         manual_name_unclear=bool(read.get("name_unclear")),
+        # DEAD since Design B: the answer confirm now triggers on WRONG WRITTEN
+        # answers (after scoring), not on Gemini's self-reported low_confidence.
+        # This cache write + the answer-side "unsure" flagging in sheet_reader.py
+        # are now unused — kept (not removed) pending live proof of Design B.
+        manual_low_confidence=read.get("low_confidence") or [],
     )
 
-    # Name fallback: caption → OCR → optional prompt (type or /skip).
-    if not name:
+    # NAME confirm stays up front (unchanged): blank OR unclear name → ask/confirm.
+    needs_name = (name is None) or bool(read.get("name_unclear"))
+    if needs_name:
         await state.set_state(CheckingStates.waiting_for_manual_name)
-        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
+        prompt = _NAME_CONFIRM_PROMPT if name else _STUDENT_NAME_PROMPT
+        await message.answer(prompt.get(lang, prompt["uz"]))
         return
 
-    await _grade_manual_cached(message, state, db_user, name)
+    # Name is settled → score, and confirm any WRONG WRITTEN answers.
+    await _score_and_maybe_confirm(message, state, db_user, name)
+
+
+async def _score_and_maybe_confirm(
+    target, state: FSMContext, db_user: User, name: str | None
+) -> None:
+    """After the name is settled: score once. If any WRITTEN answer is wrong, ask
+    the teacher to confirm those (one at a time) before the final result. No wrong
+    written answers → straight to the final result (byte-for-byte the clean path).
+    `target` supports .answer() (a Message or callback.message)."""
+    data = await state.get_data()
+    key_int = {int(k): v for k, v in (data.get("manual_key") or {}).items()}
+    answers = data.get("manual_answers") or {}
+    texts = data.get("manual_texts") or {}
+    unclear = data.get("manual_unclear") or []
+
+    student = {int(k): v for k, v in answers.items()}
+    student.update({int(k): v for k, v in texts.items()})
+    res = compare_with_unclear(student, key_int, unclear)
+
+    # Wrong answers whose question was WRITTEN (in manual_texts). Excludes wrong
+    # A/B/C/D (marked options are reliable) and all correct answers. res["wrong"]
+    # is already in ascending question order, so this list is too.
+    text_qs = {int(k) for k in texts}
+    wrong_written = [w["q"] for w in res["wrong"] if w["q"] in text_qs]
+
+    if not wrong_written:
+        await _grade_manual_cached(target, state, db_user, name)   # clean path
+        return
+
+    await state.update_data(confirm_pending=wrong_written, confirm_overrides={})
+    await _advance_confirm(target, state, db_user)
+
+
+async def _advance_confirm(target, state: FSMContext, db_user: User) -> None:
+    """Answer-confirm loop: ask each wrong WRITTEN answer in order (correct answer
+    shown, never the AI's read); when the queue empties, grade with overrides."""
+    lang = db_user.language.value
+    data = await state.get_data()
+
+    pending = list(data.get("confirm_pending") or [])
+    if pending:
+        q = pending[0]
+        correct = " / ".join(accepted_list((data.get("manual_key") or {}).get(str(q)))) or "—"
+        await state.set_state(CheckingStates.waiting_for_confirm)
+        await target.answer(
+            _CONFIRM_Q.get(lang, _CONFIRM_Q["en"]).format(q=q, correct=correct),
+            reply_markup=confirm_answer_keyboard(q, lang),
+        )
+        return
+
+    # Everything confirmed: grade with the teacher's overrides applied.
+    await _grade_manual_cached(target, state, db_user, data.get("student_name"))
 
 
 @router.message(CheckingStates.waiting_for_manual_name, F.text)
@@ -967,7 +1031,35 @@ async def handle_manual_student_name(
         await message.answer(_SHEET_PROMPT.get(lang, _SHEET_PROMPT["uz"]))
         return
     await state.update_data(student_name=name)
-    await _grade_manual_cached(message, state, db_user, name)
+    # Name settled → score, then confirm any wrong written answers (or finalize).
+    await _score_and_maybe_confirm(message, state, db_user, name)
+
+
+@router.callback_query(
+    CheckingStates.waiting_for_confirm, F.data.startswith("chk:conf:")
+)
+async def handle_confirm_answer(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """Teacher tapped To'g'ri/Xato for one unsure question."""
+    await callback.answer()
+    parts = callback.data.split(":")  # ["chk","conf","{q}","ok"|"no"]
+    try:
+        q = int(parts[2])
+        verdict = parts[3]
+    except (IndexError, ValueError):
+        return
+
+    data = await state.get_data()
+    pending = list(data.get("confirm_pending") or [])
+    # Only accept the question currently being asked — ignore stale/double taps.
+    if not pending or pending[0] != q:
+        return
+
+    overrides = dict(data.get("confirm_overrides") or {})
+    overrides[str(q)] = (verdict == "ok")
+    await state.update_data(confirm_pending=pending[1:], confirm_overrides=overrides)
+    await _advance_confirm(callback.message, state, db_user)
 
 
 async def _grade_manual_cached(
@@ -993,6 +1085,16 @@ async def _grade_manual_cached(
     key_int = {int(k): v for k, v in key_raw.items()}
     student = {int(k): v for k, v in answers.items()}
     student.update({int(k): v for k, v in texts.items()})
+
+    # Apply the teacher's To'g'ri/Xato overrides (Build 2b). "To'g'ri" forces a
+    # match (use an accepted answer); "Xato" forces a clean miss (None → shown as
+    # "—", never the AI's misread). checker.py is untouched — we only shape the
+    # student dict it receives.
+    overrides = data.get("confirm_overrides") or {}
+    for q_str, is_ok in overrides.items():
+        q = int(q_str)
+        accepted = accepted_list(key_int.get(q))
+        student[q] = accepted[0] if (is_ok and accepted) else None
     res = compare_with_unclear(student, key_int, unclear)
 
     name_line = _name_line(name, variant, lang)
@@ -1003,6 +1105,7 @@ async def _grade_manual_cached(
     await state.update_data(
         manual_answers=None, manual_texts=None, manual_unclear=None,
         manual_variant=None, manual_low_confidence=None, manual_name_unclear=None,
+        confirm_pending=None, confirm_overrides=None, confirm_name_done=None,
     )
 
     percent = round(res["score"] / res["total"] * 100) if res["total"] else 0

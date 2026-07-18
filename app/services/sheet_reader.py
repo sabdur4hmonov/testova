@@ -49,12 +49,16 @@ Rules:
   scripts (Latin stays Latin, Cyrillic stays Cyrillic), do NOT expand
   abbreviations. If a single letter is genuinely illegible, choose the most
   likely letter for THAT letter — never invent a different word.
-- CONFIDENCE for WRITTEN answers: still give your best-guess transcription, but
-  in the "unsure" list put the question number of ANY written answer you are not
-  fully confident about. Flag on ANY doubt — messy or cursive handwriting, a
-  smudge, an ambiguous letter, or anything a human might read differently — not
-  only when it is totally illegible. When in doubt, FLAG it: a flag costs the
-  teacher one tap to confirm, but a wrong unflagged answer becomes a wrong grade.
+- CONFIDENCE for WRITTEN answers: still give your best-guess transcription. Add
+  a question number to the "unsure" list ONLY when the handwriting is GENUINELY
+  ambiguous — a letter that could realistically be misread, messy or cursive
+  writing, or strokes that could spell a DIFFERENT word. Do NOT flag an answer
+  that is clearly legible, even if the word is unusual or misspelled: if you can
+  read it cleanly, leave it OFF the list. Most clean answers should NOT be
+  flagged.
+  Examples: a clearly-printed "BANANA" -> do NOT flag; a "game" whose middle
+  letters could just as easily read "gone" -> flag; a messy or cursive "purple"
+  that is hard to make out -> flag.
   Marked A/B/C/D options do NOT go in "unsure" (use the "?" rule below for them).
 - If a mark is ambiguous, erased, crossed-out, or the student marked TWO or more
   options for the same question, output "?" for that question. NEVER guess a
@@ -71,10 +75,25 @@ Rules:
   Cyrillic, Latin as Latin). If a single letter is genuinely illegible, choose
   the most likely letter for THAT letter — never invent a different name. If the
   name area is blank or completely unreadable, use null (do NOT guess a name).
-- CONFIDENCE for the NAME: set "name_unsure" to true if you are not fully
-  confident you read the name correctly (messy/cursive handwriting, an ambiguous
-  letter, anything a human might read differently); otherwise false. Same rule:
-  when in doubt, flag it. If the name is null, "name_unsure" must be false.
+- CONFIDENCE for the NAME — bias HEAVILY toward flagging. Still return your
+  best-guess name string, but ALSO set "name_unsure" to true whenever ANYTHING
+  about the name is less than crisp, clearly-printed block capitals. Best guess
+  and flag are NOT in conflict: give the guess AND flag it. Set "name_unsure" to
+  true if ANY of these apply to ANY part of the name:
+    * any letter is ambiguous or could be read as more than one letter;
+    * letters could MERGE or SPLIT — e.g. "AI" vs "AT", "cl" vs "d", or two
+      letters that run together and could read as one (or one that could split
+      into two);
+    * spacing is odd, or a word-break is unclear (e.g. it could be one name or
+      two);
+    * the handwriting is cursive, messy, faint, or not clean block capitals.
+  Examples: strokes read as "SATDAR BAR" but could be "SAIDAKBAR" -> flag;
+  "AXMND" where the 4th letter could be A or E -> flag; clearly printed "ALIYEV"
+  with every letter unmistakable -> do NOT flag.
+  A student name is hard to verify later and a wrong name on a graded sheet is a
+  real error, while a false flag costs the teacher only one tap — so when in ANY
+  doubt, flag it. Only set "name_unsure" to false when every letter is
+  unmistakable. If the name is null, "name_unsure" must be false.
 
 Return ONLY valid JSON, no markdown, no explanation. Question 22 below is a
 written answer flagged as unsure; the rest are marked options:

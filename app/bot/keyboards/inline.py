@@ -193,6 +193,21 @@ def variant_pick_keyboard(numbers, lang: str = "uz") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def confirm_answer_keyboard(q: int, lang: str = "uz") -> InlineKeyboardMarkup:
+    """[✅ To'g'ri] [❌ Xato] for ONE unsure question. The question number rides
+    in the callback data so the handler knows which one is being confirmed."""
+    ok, no = {
+        "uz": ("✅ To'g'ri", "❌ Xato"),
+        "en": ("✅ Correct", "❌ Wrong"),
+        "ru": ("✅ Верно", "❌ Неверно"),
+    }.get(lang, ("✅ Correct", "❌ Wrong"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text=ok, callback_data=f"chk:conf:{q}:ok")
+    builder.button(text=no, callback_data=f"chk:conf:{q}:no")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def check_mode_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """Pick how to grade: against a saved project, or by a typed answer key."""
     labels = {

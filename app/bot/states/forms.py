@@ -24,6 +24,8 @@ class CheckingStates(StatesGroup):
     # Optional per-sheet student-name prompt when the photo has no caption.
     waiting_for_saved_name = State()   # saved flow: student name before grading
     waiting_for_manual_name = State()  # manual flow: student name before grading
+    # Per-question To'g'ri/Xato confirmation for reads the AI was unsure about.
+    waiting_for_confirm = State()      # manual flow: confirm an unsure answer
 
 
 class BuilderStates(StatesGroup):
