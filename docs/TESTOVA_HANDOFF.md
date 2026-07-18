@@ -1,6 +1,6 @@
 # TESTOVA — PROJECT HANDOFF (continue from here)
 
-> **Handoff updated: 17 July 2026 — reconciled through v0.12.** Supersedes the previous handoff. Reconciled against the real git log through the block-letters tip commit. Since the v0.9 reconciliation three more features shipped: **v0.10 exam timer** (in-process APScheduler, restart-safe, proactive warnings), **v0.11 answer-sheet auto-detect** (variant + student name read straight off the photo), and **v0.12 name-prompt tuning** + a **block-letters** UX tip. **Generate AND grade is real, timed, and auto-identified.** The next big piece is still **VPS deployment** — see NEXT.
+> **Handoff updated: 18 July 2026 — reconciled through v0.17.** Supersedes the previous handoff. Reconciled against the real git log (now pushed to GitHub: `github.com/sabdur4hmonov/testova`). Since v0.12, grading got a lot smarter: **v0.13 short-answer grading** (word/number answers + multiple accepted answers), **v0.14 uncertainty flagging**, **v0.15 flag-caching fix**, **v0.16 To'g'ri/Xato confirm buttons + aggressive name flagging + DESIGN B** (the key architectural call — see its section), and **v0.17** removing the now-dead answer-side flagging. **Generate AND grade is real, timed, auto-identified, and now self-correcting** (the teacher confirms wrong written answers). The next big piece is still **VPS deployment** — see NEXT. Two known bugs are queued (one-line parser + E/C letters) — see KNOWN-OPEN ITEMS.
 
 ## CONTEXT
 
@@ -22,9 +22,9 @@ I work with **Claude Code in the terminal**. I'm a beginner — I need **exact c
 
 ## ✅ COMPLETED (all committed & tagged)
 
-**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format` → `v0.6-grader` → `v0.7-names` → `v0.8-naming` → `v0.9-name-first` → `v0.10-timer` → `v0.11-autodetect` → `v0.12-name-prompt`
+**Tags:** `v0.1-math-quality` → `v0.2-compact` → `v0.3-compact-optimized` → `v0.4-cost-tracking` → `v0.5-multisource-format` → `v0.6-grader` → `v0.7-names` → `v0.8-naming` → `v0.9-name-first` → `v0.10-timer` → `v0.11-autodetect` → `v0.12-name-prompt` → `v0.13` → `v0.14` → `v0.15` → `v0.16` → `v0.17`. (v0.13–v0.17 are **lightweight** tags; earlier ones are annotated — cosmetic only.)
 
-**418 tests green.** (3 errors in `test_subscription.py` are the same pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.) Run with `venv311/Scripts/python.exe -m pytest -q`.
+**470 tests green.** (3 errors in `test_subscription.py` are the same pre-existing asyncpg `InvalidPasswordError` — environmental, ignore.) Run with `venv311/Scripts/python.exe -m pytest -q`.
 
 ### Extraction & cleaning
 16-bug audit, token truncation fix (8192 + salvage parser), two-column PDF support, gap recovery, isotope/math verbatim guarantee, OCR confusion dictionary, [Rasm] policy, crop sanity checks, suspicious-question flagging, regression tests.
@@ -135,6 +135,38 @@ Removes the manual variant-typing step in **Saqlangan** mode and reads the stude
 - **Prompt-wording only** in `sheet_reader.ANSWER_SHEET_PROMPT` (name portion): transcribe the handwritten Uzbek name **letter-by-letter**, keep **Latin/Cyrillic script as written** (no transliteration), do NOT correct into a dictionary word, scope any uncertainty to a single letter (never invent a different name), blank → null. Fixed mangling like "Səyyarəbəf" for "Sanjarbek". Return shape unchanged; variant/answer reading untouched.
 - **Block-letters finding (measured):** **cursive** handwritten names read unreliably even after tuning; **BLOCK LETTERS read accurately.** A 💡 tip was added to the answer-sheet photo prompts (`_PHOTO_PROMPTS`, `_SHEET_PROMPT`) telling teachers to have students write names in BLOCK LETTERS. **The photo caption remains the 100% path** — if the teacher captions the photo with the name, OCR is bypassed entirely.
 
+### v0.13 — Short-answer grading in manual "Javob orqali" (words/numbers + multiple accepted)
+A test can now MIX A/B/C/D and WRITTEN short answers (e.g. `BANANA`, `TOSHKENT`, `5`). Manual flow only (see KNOWN-OPEN #3 for saved-flow).
+- **Answer key stores a LIST per question** in `manual_check_sessions.correct_answers` JSONB — a letter is a one-item list (`["A"]`), so one matching rule covers both kinds. **No migration** (JSONB already held it).
+- `answer_key_parser.parse_answer_key` returns `{q: [accepted, ...]}`. Accepts legacy `1A 2B` / bare `ABCD`, plus written `5: TOSHKENT` and multi `22: PHONE / TELEPHONE / SMARTPHONE` (slash-separated = any one is correct). Line-oriented for written entries; a colon marks a written answer.
+- **Cyrillic folding applies ONLY to single-letter answers, NEVER to words** — `ТОШКЕНТ` stays Cyrillic (folding a word would mangle it into mixed script). See principle #14.
+- **Matching is done in PYTHON, never by Gemini** — `checker.is_correct` / `normalize` = casefold + whitespace-collapse, **no punctuation stripping** (so `-5` ≠ `5`, `x=5` stays intact — respects principle #1). `checker.grade_for` unchanged (principle #10). See principle #13.
+- `sheet_reader.read_answer_sheet` gained a `texts` return channel for written answers (letters stay in `answers`); the two ride the SAME single vision call. `_norm_letter` now requires the WHOLE value be one letter, so `"APPLE"` is never read as option `"A"`.
+- Grading stays FREE (no `decrement_use`).
+
+### v0.14 — Uncertainty flagging in the sheet reader (self-reported, one call)
+- `ANSWER_SHEET_PROMPT` asked Gemini to ALSO flag what it was unsure about, in the same single call: `name_unsure` (bool) and an `unsure` list for written answers → returned as `name_unclear` + `low_confidence`. `_as_bool` guards the `bool("false")` trap.
+- **Foundation only — nothing consumed the flags yet.** The name flag survives (see below); the answer-side `low_confidence` was later removed (v0.17).
+
+### v0.15 — Cache the flags through to grading
+- The v0.14 flags were being discarded before the grading step. Fixed: `handle_manual_sheet` caches them in FSM, and `_grade_manual_cached` clears the cache AFTER scoring (not before), so a confirm step can read the cached read. Pure plumbing, no behavior change.
+
+### v0.16 — To'g'ri/Xato confirm buttons + aggressive NAME flagging + **DESIGN B**
+When the read is uncertain, ask the teacher ONE AT A TIME before showing the score — reusing the same button UI (`confirm_answer_keyboard` → `chk:conf:{q}:ok|no`, `handle_confirm_answer`, head-of-queue guard). Override scoring uses **option (a)**: To'g'ri sets the student answer to an accepted value (forces a match), Xato sets it to `None` (clean miss, shown as "—"); `compare_with_unclear` then runs UNCHANGED (`checker.py` never touched). New state `CheckingStates.waiting_for_confirm`.
+
+**🟢 DESIGN B — the key architectural decision (record this):**
+The answer-confirm step triggers on **WRONG WRITTEN ANSWERS after scoring**, NOT on Gemini's self-reported confidence. **Why:** Gemini's answer-confidence proved unreliable — it confidently misread `BANAN`→`BRVAN` and `PEANK`→`PEAVK` **without flagging**, and when the prompt was tuned aggressive it **over-flagged clean answers** like `BANANA`. The deterministic score is reliable: a wrong written answer is EITHER a real mistake OR a misread — **both deserve a teacher check.** Rules:
+- Ask about each **WRONG WRITTEN** answer (question order), showing the **CORRECT** answer — never Gemini's read.
+- Do **NOT** ask about wrong **A/B/C/D** (marked-option reads are reliable).
+- Do **NOT** ask about correct answers.
+- Distinguish written vs letter by **"question is in `manual_texts`"** (deterministic).
+- **Verified live:** a sheet that scored 6/8 from misreads scored **8/8** after confirmation.
+
+**🟢 NAME flagging is the ONE exception that STAYS aggressive.** `name_unclear` is still used and deliberately biased toward flagging (correctly caught `SAIDAKBAR` misread as `SATDAR BAR`). It drives the name-confirm (blank OR unclear name → ask/confirm, wording branches). See principle #15. Structure: name confirm up front → `_score_and_maybe_confirm` (score → derive wrong-written → confirm or finalize) → `_grade_manual_cached` (unchanged finalizer, applies overrides + re-scores).
+
+### v0.17 — Remove the dead answer-side low_confidence flagging
+Since Design B triggers on wrong-written (not `low_confidence`), the answer-side flag became dead. Removed: the WRITTEN-answer confidence prompt bullet, the `low_confidence` return key + `unsure` routing, `_coerce_qnums`, and both `manual_low_confidence` cache lines. **NAME flagging fully preserved** (`name_unclear`, `name_unsure`, `_as_bool`, the aggressive NAME prompt bullet). Pure deletion (−67 lines), no behavior change.
+
 ### Earlier work (unchanged, still true)
 
 **THE T-108 MATH QUALITY WAR (won):** tested against a real 2-column, 30-question Uzbek math exam (T-108, code 8000008). `app/services/math_render.py` — tokenizer → recursive-descent parser → AST → LaTeX → cached matplotlib mathtext PNG, inlined as ReportLab `<img>`. LaTeX-quality output: stacked fractions, radicals with vinculum, `log₂`, `2²¹`, `x₁`, `3½`, real number-line image.
@@ -188,18 +220,43 @@ APScheduler runs inside the bot process — **do NOT wire up Celery** to run it 
 ### 12. (v0.11) Auto-detect never guesses, and grading stays FREE
 Read the sheet ONCE and cache it (one Gemini call per sheet). A variant is used ONLY if it exactly matches the project's real variants (`resolve_variant`); otherwise show the picker — **never guess a variant.** The handwritten name is returned RAW (no spelling correction). And **`checking.py` must never call `decrement_use`** — grading is free by design (the `can_check` gate ignores `uses_left`). If you ever add charging, it belongs in generation (`upload.py`), never here.
 
+### 13. (v0.13) Short-answer matching is PYTHON, never Gemini — and never strips meaning
+Correctness is decided in `checker.is_correct` (casefold + whitespace-collapse ONLY). **Never** ask Gemini to judge if an answer is right (unreliable — see Design B), and **never** strip punctuation in `normalize`: `-5` must stay ≠ `5` and `x=5` must stay intact (this is principle #1 applied to short answers). A wrong written answer is caught by the score and confirmed by the teacher (Design B), not by fuzzy matching. Multiple accepted answers are the escape hatch — the teacher lists variants (`PHONE / TELEPHONE`), the code never guesses spelling.
+
+### 14. (v0.13) Cyrillic folding is for LETTERS ONLY, never words
+`А В С Д Е → A B C D E` folding applies only to a single-letter answer (a multiple-choice option). A WORD is never transliterated: Cyrillic `ТОШКЕНТ` stays Cyrillic. Folding a word would mangle a real answer into mixed script. Same rule as the v0.12 name transcription.
+
+### 15. (v0.16) Answer-confirm triggers on WRONG-WRITTEN (Design B); NAME flagging stays aggressive
+Do NOT resurrect Gemini's answer-confidence to decide what to confirm — it's unreliable (confident misreads `BRVAN`/`PEAVK`, and over-flags clean answers when tuned up). The answer-confirm queue is built AFTER scoring from **wrong WRITTEN answers only** (in `manual_texts`), never wrong A/B/C/D, never correct answers. **The NAME flag (`name_unclear`) is the deliberate exception — keep it aggressive** (it catches confident name misreads like `SATDAR BAR`). Override scoring uses option (a) (force match / clean miss); `checker.py` stays untouched.
+
+---
+
+## 🐞 KNOWN-OPEN ITEMS (queued bugs — a future session should pick these up)
+
+### 1. ONE-LINE PARSER BUG (next task — small but fiddly)
+In the short-answer key parser, `"1:x 2:y 3:z"` all on ONE line swallows answers 2+ into question 1 (they get treated as part of q1's answer). **Separate lines work fine** (`1: x` / `2: y` on their own lines). Tricky because a written answer can legitimately contain spaces AND digits: `5: SMART PHONE`, `24: 1000 g, 400 g` — so you cannot naively split on whitespace or numbers. The fix needs a smarter line/entry boundary rule that a multi-word, multi-number answer survives. Manual "Javob orqali" only.
+
+### 2. E/C LETTER-PRESERVATION BUG (big — needs migration 007)
+The DB has only `option_a..option_d` (`questions` table), so a test with options **A, B, D, E** gets silently **relabelled to A, B, C, D** at extraction/persistence (option E is dropped; the printed "(bor: A, B, C, D)" is the tell). **Accepting a typed `E` WITHOUT fixing storage would grade against the WRONG option — worse than the current bug.** Full fix needs: VISION_PROMPT changes (guarded — principles #1–#4), an `option_e` column, **migration 007**, `letters_by_num` in `upload.py`, and both `_VALID` sets (`answer_key_parser`, `sheet_reader`). Do NOT half-fix by loosening validation alone.
+
+### 3. Short answers are manual "Javob orqali" ONLY
+The **Saqlangan** (saved-test) flow can't grade written answers yet — its key rides `questions.correct_answer` which is `String(4)`, so it needs **migration 007** too (this was "Option B" in the v0.13 investigation). Same migration as #2 — do them together.
+
+### 4. Lightweight tags (cosmetic)
+`v0.13`–`v0.17` are lightweight tags; `v0.1`–`v0.12` are annotated. Harmless; re-tag with `-a` if you want uniformity.
+
 ---
 
 ## ⏭️ NEXT — VPS DEPLOYMENT (now the biggest unbuilt piece)
 
-The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, test naming, an **exam timer** (v0.10), and **auto-detect of variant + student name off the photo** (v0.11–v0.12). Grading is free and ignores `uses_left` by design.
+The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, test naming, an **exam timer** (v0.10), **auto-detect of variant + student name off the photo** (v0.11–v0.12), **short-answer grading** (v0.13, manual only), and **teacher-confirm of wrong written answers** (v0.16 Design B). Grading is free and ignores `uses_left` by design.
 
 The remaining gate before any real teacher touches this is deployment:
 
 **VPS deployment** — kills the Telegram block permanently, bot online 24/7. ~$5/mo (Hetzner/Contabo/DigitalOcean). On deploy:
 - `.env` with `ADMIN_IDS=[8206475760]` (JSON list), `ADMIN_USERNAME=testova_admin`, `GEMINI_MODEL=gemini-2.5-flash`, Gemini price vars if non-default (`GEMINI_PRICE_IN_PER_M`, `GEMINI_PRICE_OUT_PER_M`, `UZS_PER_USD`), Postgres connection string.
 - `pip install -r requirements.txt` (incl. matplotlib==3.11.0 **and APScheduler==3.10.4** for the exam timer).
-- `alembic upgrade head` — schema is **still at migration 006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming). The exam timer reused 006's reserved columns, so v0.10–v0.12 added NO migration.
+- `alembic upgrade head` — schema is **still at migration 006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming). v0.10–v0.17 added NO migration (timer reused 006's reserved columns; short-answer keys ride the existing `manual_check_sessions.correct_answers` JSONB). **Migration 007 is still owed** for the E/C letters + saved-flow short answers — see KNOWN-OPEN #2/#3.
 - Set Gemini Prepay auto-reload so nobody hits a $0 balance mid-exam.
 
 Suggested opening prompt for the deployment session:
@@ -226,7 +283,7 @@ Suggested opening prompt for the deployment session:
 - Main menu is currently Row 1 `[📤 Variant yaratish] [✅ Test tekshirish]`, Row 2 `[📚 Ko'p manbadan test yaratish]`, Row 3 `[projects] [pricing]`, Row 4 `[language] [support]`. File: `app/bot/keyboards/main_menu.py`.
 - `ADMIN_IDS` should accept bare `123` or `123,456` via validator, or document JSON format in `.env.example`.
 - `admin_log.target` vs `target_user_id` naming; `blocked_text()` has no lang param — deliberately skipped.
-- **No git remote is configured yet** — `git remote -v` is empty, so nothing is backed up off-machine. Add a remote (`git remote add origin <url>`) then `git push -u origin master && git push --tags` when you want an off-machine backup.
+- **Git remote is configured** — `origin` → `github.com/sabdur4hmonov/testova` (`autoUpdates` off; push with `git push origin master && git push origin --tags`). History + all tags are backed up there through v0.17.
 - Exam timer is **single-upload only** — the "Ko'p manbadan" (multi-source) flow doesn't offer it yet. Auto-detect covers both grading modes; timer does not yet cover both generation flows.
 
 ---
@@ -234,6 +291,7 @@ Suggested opening prompt for the deployment session:
 ## MY FIRST QUESTION IN THE NEW CHAT
 
 [PICK ONE:]
-- "Walk me through deploying to a VPS." (recommended — the last gate before real teachers)
+- "Investigation only — fix the ONE-LINE PARSER BUG (KNOWN-OPEN #1): `1:x 2:y 3:z` on one line swallows answers 2+ into q1." (small, queued as next task)
+- "Investigation only — the E/C letter bug + saved-flow short answers (KNOWN-OPEN #2/#3): plan migration 007 end-to-end." (big)
+- "Walk me through deploying to a VPS." (the last gate before real teachers)
 - "Let's design pricing / monetization now that generate-and-grade both ship."
-- "Investigation only — should the grade-and-finish flow be inline on Variant yaratish, or is the separate Test tekshirish button better?"
