@@ -53,7 +53,7 @@ async def test_malformed_safe_failure(patched):
     res = await SR.read_answer_sheet(b"x", 10)
     assert res == {
         "variant": None, "student_name": None, "name_unclear": False,
-        "answers": {}, "texts": {}, "low_confidence": [], "unclear": [],
+        "answers": {}, "texts": {}, "unclear": [],
     }
 
 
@@ -146,45 +146,15 @@ async def test_name_unsure_string_false_is_false(patched):
     assert res["name_unclear"] is False
 
 
-async def test_written_answer_flagged_low_confidence(patched):
-    patched('{"answers": {"22": "SMARTPHONE"}, "unsure": [22]}')
-    res = await SR.read_answer_sheet(b"x", 22)
-    assert res["low_confidence"] == [22]
-    assert res["texts"] == {22: "SMARTPHONE"}   # best guess still returned
-
-
-async def test_written_answer_not_flagged(patched):
-    patched('{"answers": {"22": "SMARTPHONE"}}')
-    res = await SR.read_answer_sheet(b"x", 22)
-    assert res["low_confidence"] == []
-    assert res["texts"] == {22: "SMARTPHONE"}
-
-
-async def test_unsure_string_numbers_coerced(patched):
-    patched('{"answers": {"22": "PHONE"}, "unsure": ["22"]}')
-    res = await SR.read_answer_sheet(b"x", 22)
-    assert res["low_confidence"] == [22]
-
-
-async def test_unsure_marked_letter_is_ignored(patched):
-    # A flagged MARKED-letter question is NOT low_confidence (letters use "?").
-    patched('{"answers": {"1": "A"}, "unsure": [1]}')
-    res = await SR.read_answer_sheet(b"x", 1)
-    assert res["low_confidence"] == []
-    assert res["answers"] == {1: "A"}
-
-
-async def test_unclear_not_regressed_by_flags(patched):
-    # The "?" marked-letter path is untouched by the new confidence fields.
-    patched('{"answers": {"1":"?","2":"B"}, "unsure": [], "name_unsure": false}')
+async def test_unclear_not_regressed_by_name_flag(patched):
+    # The "?" marked-letter path is untouched by the name confidence field.
+    patched('{"answers": {"1":"?","2":"B"}, "name_unsure": false}')
     res = await SR.read_answer_sheet(b"x", 2)
     assert res["unclear"] == [1]
     assert res["answers"] == {2: "B"}
-    assert res["low_confidence"] == []
 
 
-async def test_flags_ride_one_gemini_call(patched):
-    patched('{"student_name": "X", "name_unsure": true, '
-            '"answers": {"22": "PHONE"}, "unsure": [22]}')
+async def test_name_flag_rides_one_gemini_call(patched):
+    patched('{"student_name": "X", "name_unsure": true, "answers": {"22": "PHONE"}}')
     await SR.read_answer_sheet(b"x", 22)
-    assert len(patched.calls) == 1   # name + answer flags from the SAME call
+    assert len(patched.calls) == 1   # name flag + reads from the SAME call

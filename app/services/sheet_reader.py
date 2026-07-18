@@ -49,17 +49,6 @@ Rules:
   scripts (Latin stays Latin, Cyrillic stays Cyrillic), do NOT expand
   abbreviations. If a single letter is genuinely illegible, choose the most
   likely letter for THAT letter — never invent a different word.
-- CONFIDENCE for WRITTEN answers: still give your best-guess transcription. Add
-  a question number to the "unsure" list ONLY when the handwriting is GENUINELY
-  ambiguous — a letter that could realistically be misread, messy or cursive
-  writing, or strokes that could spell a DIFFERENT word. Do NOT flag an answer
-  that is clearly legible, even if the word is unusual or misspelled: if you can
-  read it cleanly, leave it OFF the list. Most clean answers should NOT be
-  flagged.
-  Examples: a clearly-printed "BANANA" -> do NOT flag; a "game" whose middle
-  letters could just as easily read "gone" -> flag; a messy or cursive "purple"
-  that is hard to make out -> flag.
-  Marked A/B/C/D options do NOT go in "unsure" (use the "?" rule below for them).
 - If a mark is ambiguous, erased, crossed-out, or the student marked TWO or more
   options for the same question, output "?" for that question. NEVER guess a
   single letter in that case.
@@ -96,8 +85,8 @@ Rules:
   unmistakable. If the name is null, "name_unsure" must be false.
 
 Return ONLY valid JSON, no markdown, no explanation. Question 22 below is a
-written answer flagged as unsure; the rest are marked options:
-{{"variant": 3, "student_name": "Ali Valiyev", "name_unsure": false, "answers": {{"1": "A", "2": "?", "3": null, "4": "C", "22": "SMARTPHONE"}}, "unsure": [22]}}"""
+written answer; the rest are marked options:
+{{"variant": 3, "student_name": "Ali Valiyev", "name_unsure": false, "answers": {{"1": "A", "2": "?", "3": null, "4": "C", "22": "SMARTPHONE"}}}}"""
 
 
 _model: genai.GenerativeModel | None = None
@@ -210,20 +199,6 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
-def _coerce_qnums(value: Any) -> set[int]:
-    """A Gemini 'unsure' list → a set of ints. Accepts ints or '22' strings;
-    ignores junk. Missing/None → empty set."""
-    out: set[int] = set()
-    if not isinstance(value, (list, tuple, set)):
-        return out
-    for item in value:
-        try:
-            out.add(int(str(item).strip()))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
 def _clean_name(value: Any) -> str | None:
     """
     Return the handwritten name RAW — only trim whitespace and cap length. No
@@ -251,23 +226,22 @@ async def read_answer_sheet(
         "name_unclear": bool,        # True = name read is doubtful — ask to confirm
         "answers": {int: "A".."D"},  # confidently-read MARKED options
         "texts": {int: str},         # WRITTEN short answers, RAW (unnormalized)
-        "low_confidence": [int],     # questions whose WRITTEN answer is doubtful
         "unclear": [int],            # questions marked "?" (ambiguous/blank-mark)
       }
 
-    `name_unclear` / `low_confidence` are the reader's self-reported uncertainty
-    (Part 1 foundation for teacher-confirm buttons). `texts`/`student_name` still
-    hold the best-guess transcription — a flag never withholds the value.
+    `name_unclear` is the reader's self-reported uncertainty about the NAME (it
+    drives the teacher name-confirm). `student_name`/`texts` still hold the
+    best-guess transcription — the flag never withholds the value.
 
-    Marked options and written answers (and their confidence flags) come from the
-    SAME single vision call — there is no second Gemini request.
+    Marked options and written answers come from the SAME single vision call —
+    there is no second Gemini request.
 
     On any Gemini/parse failure returns an empty read (the caller treats an empty
     read as "unreadable — ask for a clearer photo"). NEVER raises.
     """
     empty = {
         "variant": None, "student_name": None, "name_unclear": False,
-        "answers": {}, "texts": {}, "low_confidence": [], "unclear": [],
+        "answers": {}, "texts": {}, "unclear": [],
     }
     try:
         pages = image_to_pages(image_bytes)
@@ -317,12 +291,9 @@ async def read_answer_sheet(
             if txt:
                 texts[q] = txt           # a written short answer
 
-    # Confidence flags (additive — classification above is unchanged). Only
-    # WRITTEN answers use low_confidence; a flagged marked-letter is ignored
-    # (letters express doubt via the "?"/unclear path). A missing name is not
-    # "unclear" — only a present-but-doubtful name is worth confirming.
+    # NAME confidence flag. A missing name is not "unclear" — only a
+    # present-but-doubtful name is worth asking the teacher to confirm.
     name = _clean_name(data.get("student_name"))
-    low_confidence = _coerce_qnums(data.get("unsure")) & set(texts.keys())
     name_unclear = _as_bool(data.get("name_unsure")) and name is not None
 
     return {
@@ -331,6 +302,5 @@ async def read_answer_sheet(
         "name_unclear": name_unclear,
         "answers": answers,
         "texts": texts,
-        "low_confidence": sorted(low_confidence),
         "unclear": sorted(unclear),
     }

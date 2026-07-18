@@ -114,7 +114,7 @@ def reader(monkeypatch):
 def _read(**over):
     base = {
         "variant": None, "student_name": "ALI", "name_unclear": False,
-        "answers": {}, "texts": {}, "low_confidence": [], "unclear": [],
+        "answers": {}, "texts": {}, "unclear": [],
     }
     base.update(over)
     return base

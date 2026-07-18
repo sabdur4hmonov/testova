@@ -947,11 +947,6 @@ async def handle_manual_sheet(
         manual_variant=variant,
         student_name=name,
         manual_name_unclear=bool(read.get("name_unclear")),
-        # DEAD since Design B: the answer confirm now triggers on WRONG WRITTEN
-        # answers (after scoring), not on Gemini's self-reported low_confidence.
-        # This cache write + the answer-side "unsure" flagging in sheet_reader.py
-        # are now unused — kept (not removed) pending live proof of Design B.
-        manual_low_confidence=read.get("low_confidence") or [],
     )
 
     # NAME confirm stays up front (unchanged): blank OR unclear name → ask/confirm.
@@ -1104,7 +1099,7 @@ async def _grade_manual_cached(
     # Cache no longer needed — clear it so the next photo starts clean.
     await state.update_data(
         manual_answers=None, manual_texts=None, manual_unclear=None,
-        manual_variant=None, manual_low_confidence=None, manual_name_unclear=None,
+        manual_variant=None, manual_name_unclear=None,
         confirm_pending=None, confirm_overrides=None, confirm_name_done=None,
     )
 
