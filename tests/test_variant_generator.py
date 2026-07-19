@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import pytest
 
+from app.services.answer_checker import check_answers
+from app.services.option_letters import canonical_letter
 from app.services.variant_generator import generate_variants, validate_questions
 
 
@@ -109,6 +111,59 @@ def test_correct_answer_e_never_becomes_none():
         assert key is not None
         # key value is a one-item list now → unwrap; must still point at E content
         assert v["questions_data"][0]["options"][key[0]] == "e"
+
+
+# ── Stage 4.5: multi-accept MC keys survive shuffle (no silent drop) ─────────
+
+def test_multi_accept_mc_key_maps_both_letters_through_shuffle():
+    # Teacher keyed an MC question as "A / B" → correct_answers=["A","B"], and
+    # correct_answer=None (Stage 4 stores None for a non-single key). Both
+    # accepted options must survive shuffling into the variant's answer key.
+    qs = [{
+        "question_id": "q1", "question_number": 1, "question_text": "t",
+        "options": {"A": "TA", "B": "TB", "C": "TC", "D": "TD"},
+        "correct_answer": None, "correct_answers": ["A", "B"],
+    }]
+    for v in generate_variants(qs, count=8, seed=5):
+        qd = v["questions_data"][0]
+        accepted = v["answer_key"]["1"]
+        assert isinstance(accepted, list) and len(accepted) == 2
+        # the two accepted labels point at the ORIGINAL A/B option texts
+        texts = {qd["options"][L] for L in qd["options"]
+                 if canonical_letter(L) in {canonical_letter(a) for a in accepted}}
+        assert texts == {"TA", "TB"}
+
+
+def test_multi_accept_mc_round_trip_either_answer_scores():
+    qs = [{
+        "question_id": "q1", "question_number": 1, "question_text": "t",
+        "options": {"A": "TA", "B": "TB", "C": "TC", "D": "TD"},
+        "correct_answer": None, "correct_answers": ["A", "B"],
+    }]
+    for v in generate_variants(qs, count=6, seed=2):
+        qd = v["questions_data"][0]
+        accepted = v["answer_key"]["1"]
+        # a student marking EITHER accepted option scores 100%; a third option fails
+        for label, text in qd["options"].items():
+            student = {"1": canonical_letter(label)}
+            res = check_answers(student, v["answer_key"])
+            assert res.correct == (1 if text in {"TA", "TB"} else 0)
+
+
+def test_single_letter_mc_key_still_one_item_list():
+    # Regression: the common single-answer case is unchanged (new_correct path).
+    qs = [{
+        "question_id": "q1", "question_number": 1, "question_text": "t",
+        "options": {"A": "TA", "B": "TB", "C": "TC"},
+        "correct_answer": "B", "correct_answers": ["B"],
+    }]
+    for v in generate_variants(qs, count=5, seed=1):
+        qd = v["questions_data"][0]
+        accepted = v["answer_key"]["1"]
+        assert isinstance(accepted, list) and len(accepted) == 1
+        real = next(L for L in qd["options"]
+                    if canonical_letter(L) == accepted[0])
+        assert qd["options"][real] == "TB"
 
 
 # ── Bug #5: pre-export validation ─────────────────────────────────────────────
