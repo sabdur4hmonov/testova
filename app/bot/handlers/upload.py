@@ -34,7 +34,7 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import access, storage
-from app.services.answer_key_parser import parse_answer_key
+from app.services.answer_key_parser import parse_answer_key, _to_colon_written
 from app.services.option_letters import (
     OPTION_LETTER_CLASS, canonical_letter, is_option_letter,
 )
@@ -487,8 +487,10 @@ async def apply_key_text(
 
     Returns (reply_parts, complete, updated_answers, to_delete).
     """
-    # Explicit dash markers ("47-") first, then parse the REST with the shared
-    # key parser (letters + written short answers + multi-accept "22: A / B").
+    # A non-colon numeric written answer ("19- 8,23") must become "19: 8,23"
+    # BEFORE skip extraction, or _SKIP_RE would read the "19-" as a skip and eat
+    # the value. Normalise first, THEN pull the real "47-" skip/delete markers.
+    text = _to_colon_written(text)
     skips = {int(m) for m in _SKIP_RE.findall(text) if 1 <= int(m) <= key_max}
     text_wo_skips = _SKIP_RE.sub(" ", text)
     parsed: dict[int, list[str]] = {}

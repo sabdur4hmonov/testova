@@ -55,6 +55,28 @@ _BOUNDARY_RE = re.compile(r"\s+(\d+)\s*:(?!\d)")
 # — number, colon, then 2+ non-digit/non-space chars = a word. Warn, never drop.
 _WRITTEN_ON_LETTER_LINE = re.compile(r"\d+\s*:\s*[^\d\s]{2,}")
 
+# BUG A (silent loss): a written NUMERIC answer typed WITHOUT a colon —
+# "19 8,23", "19- 1/2", "19-8,23", "19. 8,23", "19) 8,23" — used to fall through
+# to the letter parser (its value "8,23" has no letter) and be dropped. Detect a
+# single leading number, a space/dash/dot/paren separator, then a value whose
+# FIRST char is a DIGIT (a written numeric answer — never an MC letter, whose
+# value would be a letter), and normalise it to colon form so the tested written
+# path handles it. Letter answers ("19 a", "1-A 2-B"), colon lines and a bare
+# "19-" skip are left exactly as typed; a written WORD still needs the colon.
+_WRITTEN_NONCOLON = re.compile(r"^(\s*)(\d+)[\s.\-)]+(\d.*?)\s*$")
+
+
+def _to_colon_written(text: str) -> str:
+    """Rewrite non-colon numeric written answers to '<num>: <value>' (see
+    _WRITTEN_NONCOLON). Idempotent — colon lines already match nothing."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = _WRITTEN_NONCOLON.match(line)
+        out.append(
+            f"{m.group(1)}{m.group(2)}: {m.group(3).strip()}" if m else line
+        )
+    return "\n".join(out)
+
 _MAX_ITEM = 100  # matches CheckResult.student_name / display_name width
 
 # Trilingual "put each answer on its own line" — the ONLY per-lang message
@@ -202,6 +224,10 @@ def parse_answer_key(text: str, lang: str = "uz") -> tuple[dict[int, list[str]],
     """
     if not text or not text.strip():
         return {}, "Javob kaliti bo'sh."
+
+    # Normalise non-colon numeric written answers ("19 8,23") to colon form so a
+    # teacher who separates with a space/dash/dot/paren doesn't silently lose them.
+    text = _to_colon_written(text)
 
     key: dict[int, list[str]] = {}
     leftover: list[str] = []
