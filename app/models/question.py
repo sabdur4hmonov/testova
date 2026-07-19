@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -25,15 +25,22 @@ class Question(Base):
     question_number: Mapped[int] = mapped_column(Integer, nullable=False)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # Answer options — stored as plain text
+    # Answer options — LEGACY 4 fixed Latin slots. Kept for old rows + fallback;
+    # new rows write `options` (below) instead and leave these NULL.
     option_a: Mapped[str | None] = mapped_column(Text, nullable=True)
     option_b: Mapped[str | None] = mapped_column(Text, nullable=True)
     option_c: Mapped[str | None] = mapped_column(Text, nullable=True)
     option_d: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Real, label-preserving options (migration 007): an ORDERED list of
+    # {"letter": <as printed>, "text": <as written>}. Preserves the paper's
+    # actual labels — Latin OR Cyrillic, any gaps (a,b,d,e), any count. NULL for
+    # rows created before 007 (read via `options_ordered` fallback).
+    options: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     correct_answer: Mapped[str | None] = mapped_column(
         String(4), nullable=True
-    )  # "A" | "B" | "C" | "D"
+    )  # a single option LABEL, e.g. "A" | "D" | "Д" (Latin or Cyrillic; 1 char)
 
     # Image support
     has_image: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -54,17 +61,37 @@ class Question(Base):
     # Relationships
     project: Mapped["Project"] = relationship(back_populates="questions")  # type: ignore[name-defined]
 
+    @property
+    def options_ordered(self) -> list[dict]:
+        """Real options as an ORDERED list of {"letter","text"}.
+
+        Prefers the label-preserving `options` JSON (new rows). Falls back to the
+        legacy option_a..d columns for rows created before migration 007 — so old
+        rows read exactly as before and nothing needs backfilling. Blank entries
+        are dropped; labels are preserved verbatim (never folded here).
+        """
+        if self.options:
+            return [
+                {"letter": str(o["letter"]), "text": o["text"]}
+                for o in self.options
+                if isinstance(o, dict) and o.get("letter") and o.get("text")
+            ]
+        legacy = [("A", self.option_a), ("B", self.option_b),
+                  ("C", self.option_c), ("D", self.option_d)]
+        return [{"letter": L, "text": v} for L, v in legacy if v and str(v).strip()]
+
+    @property
+    def options_dict(self) -> dict:
+        """Ordered {label: text} view of `options_ordered` (Python dicts keep
+        insertion order, so display/shuffle order is preserved)."""
+        return {o["letter"]: o["text"] for o in self.options_ordered}
+
     def to_dict(self) -> dict:
         return {
             "question_id": str(self.id),
             "question_number": self.question_number,
             "question_text": self.question_text,
-            "options": {
-                "A": self.option_a,
-                "B": self.option_b,
-                "C": self.option_c,
-                "D": self.option_d,
-            },
+            "options": self.options_dict,
             "correct_answer": self.correct_answer,
             "has_image": self.has_image,
             "image_path": self.image_path,
