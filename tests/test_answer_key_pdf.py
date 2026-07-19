@@ -7,8 +7,11 @@ answers) to prove it composes without error.
 """
 from __future__ import annotations
 
+import pytest
+
 from app.services.pdf_generator import (
-    _format_answer, _key_column_lines, _OPEN_MARKER, build_answer_key_pdf,
+    _format_answer, _key_column_lines, _OPEN_LEGEND, _OPEN_MARKER,
+    build_answer_key_pdf,
 )
 
 
@@ -78,3 +81,34 @@ def test_layout_single_variant_builds():
 def test_layout_many_variants_builds():
     # 10 variants must wrap into multiple side-by-side blocks without error.
     assert build_answer_key_pdf([_variant(i) for i in range(1, 11)], "Many")[:4] == b"%PDF"
+
+
+# ── Bug C: the marker is a clean write-in glyph, explained by a legend ───────
+def test_marker_is_writein_not_old_wording():
+    assert _OPEN_MARKER not in ("ochiq", "-", "")           # not the old error-ish text
+    assert all(_OPEN_MARKER in msg for msg in _OPEN_LEGEND.values())
+
+
+def test_all_answered_key_omits_legend_but_open_key_shows_it():
+    # Rendered text check (real proof). Skips cleanly if PyMuPDF isn't installed.
+    fitz = pytest.importorskip("fitz")
+
+    def _text(variant):
+        pdf = build_answer_key_pdf([variant], "T")
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        return "".join(p.get_text() for p in doc)
+
+    all_answered = {"variant_number": 1,
+                    "answer_key": {"1": ["A"], "2": ["B"]},
+                    "questions_data": [{"position_in_variant": 1},
+                                       {"position_in_variant": 2}]}
+    with_open = {"variant_number": 1,
+                 "answer_key": {"1": ["A"], "2": None},
+                 "questions_data": [{"position_in_variant": 1},
+                                    {"position_in_variant": 2}]}
+
+    t_closed = _text(all_answered)
+    t_open = _text(with_open)
+    assert "ochiq savol" not in t_closed and _OPEN_MARKER not in t_closed  # no legend
+    assert "ochiq savol" in t_open and _OPEN_MARKER in t_open              # legend shown
+    assert "['A']" not in t_open and "['B']" not in t_open                # Bug B stays fixed

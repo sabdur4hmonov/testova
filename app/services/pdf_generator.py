@@ -716,9 +716,15 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
 
 
 # Answer with no key (open + unanswered, or skipped) → a clean marker instead of
-# raw "-"/"ochiq". Bug C refines the on-page legend; the glyph is em dash (in the
-# bundled UniFont, unlike an emoji which would render as a box).
-_OPEN_MARKER = "—"
+# the old "ochiq" wording, which read like an error. "✍" (U+270D, present in the
+# bundled DejaVu font as a plain glyph — NOT the colour-emoji form) reads as
+# "write-in, no key: check by hand". A page legend spells it out.
+_OPEN_MARKER = "✍"
+_OPEN_LEGEND = {
+    "uz": "✍ — javob kaliti yo'q (ochiq savol, qo'lda tekshiriladi)",
+    "en": "✍ — no answer key (open question, check by hand)",
+    "ru": "✍ — нет ключа (открытый вопрос, проверяется вручную)",
+}
 
 
 def _format_answer(accepted) -> str:
@@ -763,6 +769,23 @@ def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> byte
         HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a237e")),
         Spacer(1, 4 * mm),
     ]
+
+    # Legend for the write-in marker — shown ONLY when some question actually has
+    # no key, so a teacher always knows which ones can't be auto-graded (Bug C:
+    # visible, never hidden), without cluttering keys that are fully answered.
+    has_open = any(
+        _format_answer(v) == _OPEN_MARKER
+        for variant in variants
+        for v in variant.get("answer_key", {}).values()
+    )
+    if has_open:
+        legend_style = ParagraphStyle(
+            "key_legend", parent=STYLES["key_header"],
+            fontSize=9, alignment=TA_CENTER, fontName=_FONT,
+            textColor=colors.HexColor("#e65100"), spaceAfter=4,
+        )
+        story.append(Paragraph(_esc(_OPEN_LEGEND["uz"]), legend_style))
+        story.append(Spacer(1, 2 * mm))
 
     avail_w = PAGE_WIDTH - 2 * MARGIN
     COL_GAP = 0.35 * cm
