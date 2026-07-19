@@ -99,8 +99,11 @@ def test_empty_word_body_rejected():
     assert reason
 
 
-def test_bad_letter_line_alongside_word_still_rejected():
-    key, reason = parse_answer_key("5: TOSHKENT\n1A 2E")
+def test_invalid_letter_line_alongside_word_still_rejected():
+    # A genuinely invalid letter (X) on a letter line rejects the whole key,
+    # even next to a valid written answer. (E is now a valid option letter, so
+    # this uses X to exercise rejection.)
+    key, reason = parse_answer_key("5: TOSHKENT\n1A 2X")
     assert key == {}
     assert "A, B, C, D" in reason
 

@@ -29,18 +29,21 @@ from __future__ import annotations
 
 import re
 
-# Cyrillic letters that look identical to Latin option letters. Folded BEFORE
-# validation so a teacher typing on a Cyrillic keyboard is not rejected.
+from app.services.option_letters import canonical_letter, is_option_letter
+
+# Cyrillic → Latin uppercasing used only to make the letter-path regex match a
+# teacher typing look-alikes on a Cyrillic keyboard. The STORED letter value is
+# canonicalised via the shared option_letters helper (one source of truth).
 _CYRILLIC_MAP = {
     "А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E",
     "а": "A", "в": "B", "с": "C", "д": "D", "е": "E",
 }
 
-_VALID = {"A", "B", "C", "D"}
-
-# A labelled token: a question number followed by its letter, e.g. "12A",
-# "12) A", "12 - a". Separators between number and letter are optional.
-_LABELLED_RE = re.compile(r"(\d+)\s*[).\-:]?\s*([A-E])", re.IGNORECASE)
+# A labelled token: a question number followed by ONE letter, e.g. "12A",
+# "12) A", "12 - a", "12Б". Separators are optional. Matches ANY single letter
+# (Latin or Cyrillic) so an invalid one is REJECTED by is_option_letter below —
+# never silently skipped (a [A-E]-only regex used to drop F, X, Б, Г quietly).
+_LABELLED_RE = re.compile(r"(\d+)\s*[).\-:]?\s*([^\W\d_])", re.UNICODE)
 
 # A WRITTEN line starts with "<number>:" (that routes it to the written path).
 _STARTS_WRITTEN = re.compile(r"^\s*(\d+)\s*:")
@@ -83,7 +86,9 @@ def _norm_item(s: str) -> str:
     """
     s = " ".join(s.split()).upper()
     if len(s) == 1:
-        s = _CYRILLIC_MAP.get(s, s)
+        # A single-letter answer is a multiple-choice label → canonicalise for
+        # matching (shared helper). Multi-char answers are never folded.
+        s = canonical_letter(s)
     return s[:_MAX_ITEM]
 
 
@@ -98,10 +103,10 @@ def _parse_letters(text: str) -> tuple[dict[int, str], str]:
         key: dict[int, str] = {}
         bad: list[str] = []
         for num_s, letter in labelled:
-            if letter not in _VALID:
+            if not is_option_letter(letter):
                 bad.append(f"{num_s}{letter}")
                 continue
-            key[int(num_s)] = letter
+            key[int(num_s)] = canonical_letter(letter)
         if bad:
             return {}, (
                 "Faqat A, B, C, D javoblari qabul qilinadi. "
@@ -116,13 +121,13 @@ def _parse_letters(text: str) -> tuple[dict[int, str], str]:
     if not letters_only:
         return {}, "Javob kaliti aniqlanmadi. Masalan: 1A 2B 3C yoki ABCD"
 
-    bad_letters = sorted({c for c in letters_only if c not in _VALID})
+    bad_letters = sorted({c for c in letters_only if not is_option_letter(c)})
     if bad_letters:
         return {}, (
             "Faqat A, B, C, D javoblari qabul qilinadi. "
             "Xato harf(lar): " + ", ".join(bad_letters)
         )
-    return {i + 1: c for i, c in enumerate(letters_only)}, ""
+    return {i + 1: canonical_letter(c) for i, c in enumerate(letters_only)}, ""
 
 
 def _items(segment: str) -> list[str]:

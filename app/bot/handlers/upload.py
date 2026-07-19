@@ -34,6 +34,7 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import access, storage
+from app.services.option_letters import OPTION_LETTER_CLASS, canonical_letter
 from app.services.ai_analyzer import (
     AIAnalyzer,
     export_lint,
@@ -257,8 +258,9 @@ def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     text = text.strip().upper()
-    # Cyrillic look-alikes teachers commonly type on ru/uz keyboards
-    text = text.translate(str.maketrans("АВСДЕ", "ABCDE"))
+    # Preserve the REAL letter (Latin A–E OR Cyrillic А–Е incl. Б,Г). The label
+    # is validated + canonicalised later against the question's real options, so
+    # a Latin "A" and a look-alike Cyrillic "А" both resolve correctly.
 
     # Skip markers first ("47-" with no letter after the dash) —
     # an explicit number+letter later in the input overrides a skip.
@@ -267,7 +269,7 @@ def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
         if 1 <= n <= question_count:
             result[str(n)] = "-"
 
-    pairs = re.findall(r'(\d+)\s*[-–—).:]?\s*([ABCDE])', text)
+    pairs = re.findall(r'(\d+)\s*[-–—).:]?\s*([' + OPTION_LETTER_CLASS + r'])', text)
     if pairs:
         for num_str, letter in pairs:
             n = int(num_str)
@@ -277,7 +279,7 @@ def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
     if result:
         return result
 
-    letters = re.findall(r'[ABCDE]', text)
+    letters = re.findall(r'[' + OPTION_LETTER_CLASS + r']', text)
     for i, letter in enumerate(letters, start=1):
         if i <= question_count:
             result[str(i)] = letter
@@ -397,19 +399,17 @@ async def apply_key_text(
         )
         rows = res.scalars().all()
 
-        letters_by_num: dict[int, set[str]] = {
-            r.question_number: {
-                L for L, v in zip(
-                    "ABCD", (r.option_a, r.option_b, r.option_c, r.option_d)
-                ) if v and str(v).strip()
-            }
+        # REAL option labels per question (any script, gaps preserved) from the
+        # label-preserving options JSON; old rows fall back to option_a..d.
+        labels_by_num: dict[int, list[str]] = {
+            r.question_number: [o["letter"] for o in r.options_ordered]
             for r in rows
         }
 
         good: dict[str, str] = {}
         bad_lines: list[str] = []
         for num_str, letter in updates.items():
-            avail = letters_by_num.get(int(num_str))
+            avail = labels_by_num.get(int(num_str))
             if avail is None:
                 bad_lines.append(_key_reason(
                     "no_question", lang, n=num_str,
@@ -419,13 +419,19 @@ async def apply_key_text(
                 good[num_str] = "-"  # explicit skip for an existing question
             elif not avail:
                 bad_lines.append(_key_reason("open", lang, n=num_str, L=letter))
-            elif letter not in avail:
-                bad_lines.append(_key_reason(
-                    "bad_letter", lang, n=num_str, L=letter,
-                    avail=", ".join(sorted(avail)),
-                ))
             else:
-                good[num_str] = letter
+                # Match the typed letter to a REAL label by canonical fold (so a
+                # Latin "A" matches Cyrillic "А" etc.), then STORE the real label
+                # so it lines up with the option keys at shuffle time.
+                canon_to_real = {canonical_letter(L): L for L in avail}
+                real = canon_to_real.get(canonical_letter(letter))
+                if real is None:
+                    bad_lines.append(_key_reason(
+                        "bad_letter", lang, n=num_str, L=letter,
+                        avail=", ".join(avail),
+                    ))
+                else:
+                    good[num_str] = real
 
         for r in rows:
             val = good.get(str(r.question_number))
@@ -440,7 +446,7 @@ async def apply_key_text(
         reply_parts.append(t("key_bad", lang, bad="\n".join(bad_lines)))
 
     still_missing = [
-        str(n) for n, avail in sorted(letters_by_num.items())
+        str(n) for n, avail in sorted(labels_by_num.items())
         if avail and not answers.get(str(n))
     ]
     if still_missing:
@@ -501,8 +507,7 @@ async def _maybe_start_dup_resolution(
             "question_number": r.question_number,
             "section": 1,
             "question_text": r.question_text,
-            "options": {"A": r.option_a, "B": r.option_b,
-                        "C": r.option_c, "D": r.option_d},
+            "options": r.options_dict,
             "image_description": r.image_description,
         }
         for r in rows
@@ -776,10 +781,11 @@ async def handle_reextract(
                 continue
             opts = item.get("options", {})
             r.question_text = item.get("question_text", r.question_text)
-            r.option_a = opts.get("A")
-            r.option_b = opts.get("B")
-            r.option_c = opts.get("C")
-            r.option_d = opts.get("D")
+            # Re-extract re-writes the label-preserving options JSON.
+            r.options = [
+                {"letter": str(k), "text": v}
+                for k, v in opts.items() if v and str(v).strip()
+            ]
         await session.commit()
 
     await status.edit_text(t(
@@ -968,12 +974,8 @@ async def _generate_and_send(
             "question_id":      str(q.id),
             "question_number":  q.question_number,
             "question_text":    q.question_text,
-            "options": {
-                "A": q.option_a,
-                "B": q.option_b,
-                "C": q.option_c,
-                "D": q.option_d,
-            },
+            # Real, ordered labels (new rows) with legacy-column fallback.
+            "options":          q.options_dict,
             "correct_answer":   q.correct_answer,
             "has_image":        q.has_image,
             "image_path":       q.image_path,

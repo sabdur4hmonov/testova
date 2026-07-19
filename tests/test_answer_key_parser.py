@@ -55,10 +55,21 @@ def test_out_of_order_labelled_preserves_numbers():
 
 
 def test_invalid_letter_labelled_rejected():
+    # E is a valid option letter now; F is not — and F must be REJECTED with a
+    # message, never silently skipped (the old [A-E] regex dropped it quietly).
     key, reason = parse_answer_key("1A 2E 3F")
     assert key == {}
     assert reason  # non-empty explanation
     assert "A, B, C, D" in reason
+
+
+def test_silent_drop_of_invalid_letter_is_rejected():
+    # KNOWN-OPEN #2 hardening: a genuinely invalid labelled letter must reject
+    # the whole key with a clear message — never parse the rest and drop it.
+    for bad in ("1A 2X", "1A 2Z 3B", "5F"):
+        key, reason = parse_answer_key(bad)
+        assert key == {}, f"{bad!r} should be rejected, got {key}"
+        assert reason
 
 
 def test_invalid_letter_bare_rejected():

@@ -289,8 +289,8 @@ async def _load_pool(session_id: str) -> tuple[list[dict], list[list], list[list
                     "question_id": str(r.id),
                     "question_number": r.question_number,
                     "question_text": r.question_text,
-                    "options": {"A": r.option_a, "B": r.option_b,
-                                "C": r.option_c, "D": r.option_d},
+                    # Real, ordered labels (new rows) with legacy-column fallback.
+                    "options": r.options_dict,
                     "correct_answer": r.correct_answer,
                     "has_image": r.has_image,
                     "image_path": r.image_path,
