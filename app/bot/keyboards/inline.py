@@ -44,6 +44,27 @@ def _two_button_kb(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def delete_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Confirm deleting the question(s) the teacher marked with a bare dash."""
+    labels = {
+        "uz": [("✅ Ha, o'chirish", "qdel:yes"), ("❌ Yo'q, qoldirish", "qdel:no")],
+        "en": [("✅ Yes, delete", "qdel:yes"), ("❌ No, keep it", "qdel:no")],
+        "ru": [("✅ Да, удалить", "qdel:yes"), ("❌ Нет, оставить", "qdel:no")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
+def key_finish_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """[🏁 Yakunlash] escape for the persistent missing-answer loop — proceed
+    even if some questions still lack an answer (they stay ungraded)."""
+    labels = {
+        "uz": [("🏁 Yakunlash", "qkey:finish")],
+        "en": [("🏁 Finish", "qkey:finish")],
+        "ru": [("🏁 Завершить", "qkey:finish")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
 def builder_next_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     labels = {
         "uz": [("✅ Yana test qo'shish", "bld:add"), ("🏁 Yakunlash", "bld:finish")],

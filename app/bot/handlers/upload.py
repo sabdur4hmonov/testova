@@ -13,8 +13,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from app.bot.keyboards.inline import (
-    dup_resolution_keyboard, exam_timer_offer_keyboard, format_choice_keyboard,
-    reextract_keyboard,
+    delete_confirm_keyboard, dup_resolution_keyboard, exam_timer_offer_keyboard,
+    format_choice_keyboard, key_finish_keyboard, reextract_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
 from app.bot.states.forms import ExamTimerStates, UploadStates
@@ -154,9 +154,35 @@ T = {
         "ru": "❌ Эти ответы не подходят (нет такого вопроса или варианта):\n{bad}\nОтправьте заново:",
     },
     "key_incomplete": {
-        "uz": "⚠️ Hali javobsiz savollar: {missing}\nQolganini yuboring yoki o'tkazib yuborish: <code>-</code>",
-        "en": "⚠️ Still unanswered: {missing}\nSend the rest, or skip: <code>-</code>",
-        "ru": "⚠️ Ещё без ответа: {missing}\nОтправьте остальные или пропустите: <code>-</code>",
+        "uz": "⚠️ Hali javobsiz savollar: {missing}\nJavoblarini yuboring. Savolni o'chirish uchun: <code>23: -</code>",
+        "en": "⚠️ Still unanswered: {missing}\nSend their answers. To DELETE a question: <code>23: -</code>",
+        "ru": "⚠️ Ещё без ответа: {missing}\nОтправьте их ответы. Чтобы УДАЛИТЬ вопрос: <code>23: -</code>",
+    },
+    # ── Question deletion ("23: -" in the single-file key-entry step) ─────────
+    "del_confirm": {
+        "uz": "🗑 Quyidagi savollarni <b>o'chirasizmi</b>? {nums}\nBu savollar imtihondan butunlay chiqariladi.",
+        "en": "🗑 <b>Delete</b> these questions? {nums}\nThey will be removed from the exam entirely.",
+        "ru": "🗑 <b>Удалить</b> эти вопросы? {nums}\nОни будут полностью убраны из экзамена.",
+    },
+    "del_done": {
+        "uz": "🗑 O'chirildi: {nums}. Qolgan savollar qayta raqamlanmaydi — javob kaliti variant yaratishda tuziladi.",
+        "en": "🗑 Deleted: {nums}. Remaining questions are NOT renumbered — the answer key is built at variant generation.",
+        "ru": "🗑 Удалено: {nums}. Остальные вопросы НЕ перенумеровываются — ключ строится при генерации вариантов.",
+    },
+    "del_cancelled": {
+        "uz": "↩️ O'chirish bekor qilindi. Savollar qoldirildi.",
+        "en": "↩️ Deletion cancelled. The questions were kept.",
+        "ru": "↩️ Удаление отменено. Вопросы оставлены.",
+    },
+    "del_blocked": {
+        "uz": "⚠️ Variantlar allaqachon yaratilgan — endi savol o'chirib bo'lmaydi.\nSavollarni o'zgartirish uchun testni qaytadan yuklab, variantlarni qayta yarating.",
+        "en": "⚠️ Variants already exist — questions can't be deleted now.\nTo change questions, re-upload the test and regenerate the variants.",
+        "ru": "⚠️ Варианты уже созданы — удалить вопрос сейчас нельзя.\nЧтобы изменить вопросы, загрузите тест заново и пересоздайте варианты.",
+    },
+    "key_finish_hint": {
+        "uz": "Barcha savollarga javob berilmadi. Qolganlarini yuboring, o'chiring (<code>23: -</code>) yoki tugmani bosing:",
+        "en": "Not every question has an answer. Send the rest, delete them (<code>23: -</code>), or tap the button:",
+        "ru": "Не на все вопросы есть ответ. Отправьте остальные, удалите (<code>23: -</code>) или нажмите кнопку:",
     },
     "siblings_info": {
         "uz": "ℹ️ O'xshash savollar (matni bir xil, variantlari/sxemasi har xil): {groups}",
@@ -443,15 +469,25 @@ async def apply_key_text(
     key_max: int,
     answers: dict,
     lang: str,
-) -> tuple[list[str], bool, dict]:
+    *,
+    delete_mode: bool = False,
+) -> tuple[list[str], bool, dict, list[int]]:
     """
     Shared answer-key entry core (single-file flow AND Multi-Source Builder):
     parse → per-entry validation → PARTIAL save (every good line applies) →
     completeness by the project's own question numbers.
 
-    Returns (reply_parts, complete, updated_answers).
+    A bare dash on a number ("23: -") is parsed the same way in both flows, but
+    INTERPRETED differently:
+      * delete_mode=True  (single-file): the dashed numbers are returned as
+        `to_delete` DELETE CANDIDATES — the caller confirms, then soft-deletes.
+        They are NOT folded into `answers` (an unanswered, not "handled").
+      * delete_mode=False (Multi-Source, until Piece 3b): OLD skip behaviour —
+        the dash marks the question as skipped/handled and is folded in.
+
+    Returns (reply_parts, complete, updated_answers, to_delete).
     """
-    # Explicit skip markers ("47-") first, then parse the REST with the shared
+    # Explicit dash markers ("47-") first, then parse the REST with the shared
     # key parser (letters + written short answers + multi-accept "22: A / B").
     skips = {int(m) for m in _SKIP_RE.findall(text) if 1 <= int(m) <= key_max}
     text_wo_skips = _SKIP_RE.sub(" ", text)
@@ -459,9 +495,9 @@ async def apply_key_text(
     if text_wo_skips.strip():
         parsed, reason = parse_answer_key(text_wo_skips, lang)
         if reason:
-            return [t("key_bad", lang, bad=reason)], False, answers
+            return [t("key_bad", lang, bad=reason)], False, answers, []
     if not parsed and not skips:
-        return [t("key_bad", lang, bad=text[:60])], False, answers
+        return [t("key_bad", lang, bad=text[:60])], False, answers, []
 
     async with async_session_factory() as session:
         from sqlalchemy import select
@@ -499,7 +535,17 @@ async def apply_key_text(
                 )
         await session.commit()
 
-    answers = {**answers, **good}
+    # Bare-dash numbers that map to a REAL (non-deleted) question.
+    dashed = sorted(int(n) for n, v in good.items() if v == "-")
+
+    if delete_mode:
+        to_delete = dashed
+        # Pending-delete questions are NOT folded into answers — until the
+        # teacher confirms, they are simply unanswered.
+        answers = {**answers, **{k: v for k, v in good.items() if v != "-"}}
+    else:
+        to_delete = []
+        answers = {**answers, **good}  # OLD: dash folded in as skip-and-keep
 
     reply_parts: list[str] = []
     if bad_lines:
@@ -509,12 +555,15 @@ async def apply_key_text(
         str(n) for n, avail in sorted(labels_by_num.items())
         if avail and not answers.get(str(n))
     ]
-    if still_missing:
+    # Don't nag about a question the teacher just asked to delete — the caller
+    # shows the delete confirmation first.
+    shown_missing = [n for n in still_missing if int(n) not in to_delete]
+    if shown_missing:
         reply_parts.append(t(
-            "key_incomplete", lang, missing=", ".join(still_missing),
+            "key_incomplete", lang, missing=", ".join(shown_missing),
         ))
     complete = not still_missing and not bad_lines
-    return reply_parts, complete, answers
+    return reply_parts, complete, answers, to_delete
 
 
 def _dup_answers_match(group: dict) -> bool:
@@ -866,6 +915,61 @@ async def handle_reextract(
     ))
 
 
+async def _variants_exist(project_id: str) -> bool:
+    """True if this project already has generated variants. Deletion is BLOCKED
+    once variants exist — their self-contained answer keys were built from the
+    question set at generation time, and deleting now would desync them."""
+    async with async_session_factory() as session:
+        from sqlalchemy import select, func as _func
+        res = await session.execute(
+            select(_func.count(Variant.id)).where(
+                Variant.project_id == uuid.UUID(project_id)
+            )
+        )
+        return (res.scalar() or 0) > 0
+
+
+async def _proceed_after_key(
+    message: Message, state: FSMContext, lang: str, project_id: str
+) -> None:
+    """Key entry finished → duplicates to the teacher, else ask variant count."""
+    if await _maybe_start_dup_resolution(message, state, lang, project_id):
+        return
+    await state.set_state(UploadStates.waiting_for_variant_count)
+    await message.answer(t("ask_count", lang))
+
+
+async def _reask_or_proceed(
+    message: Message, state: FSMContext, lang: str, project_id: str
+) -> None:
+    """Persistent missing-answer loop: if any MC question still lacks an answer,
+    re-ask (with a 🏁 Yakunlash escape) and STAY; otherwise proceed."""
+    data = await state.get_data()
+    answers: dict = data.get("answers", {})
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),
+            )
+        )
+        rows = res.scalars().all()
+    still_missing = [
+        str(r.question_number) for r in sorted(rows, key=lambda x: x.question_number)
+        if r.options_ordered and not answers.get(str(r.question_number))
+    ]
+    if still_missing:
+        await state.set_state(UploadStates.waiting_for_answers)
+        await message.answer(
+            t("key_incomplete", lang, missing=", ".join(still_missing)),
+            parse_mode="HTML",
+            reply_markup=key_finish_keyboard(lang),
+        )
+        return
+    await _proceed_after_key(message, state, lang, project_id)
+
+
 @router.message(UploadStates.waiting_for_answers, F.text)
 async def handle_answers_input(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
@@ -876,28 +980,124 @@ async def handle_answers_input(message: Message, state: FSMContext, db_user: Use
     answers: dict[str, str | None] = data.get("answers", {})
 
     text = message.text.strip()
-    skip = text in ("-", "—", "skip", "o'tkazib", "otkazib", "пропустить")
+    # Whole-message word-skip still proceeds. A bare "-" no longer skips all — in
+    # single-file it belongs to the per-question delete syntax ("23: -").
+    proceed_all = text.lower() in ("skip", "o'tkazib", "otkazib", "пропустить")
 
-    if not skip and text:
-        # CHANGE 2: every original number is a real DB row at this point —
-        # no remapping, no duplicate special cases. Duplicates are resolved
-        # by the teacher AFTER the key completes.
+    if not proceed_all and text:
         key_max = data.get("key_max") or question_count
-        reply_parts, complete, answers = await apply_key_text(
-            project_id, text, key_max, answers, lang
+        reply_parts, complete, answers, to_delete = await apply_key_text(
+            project_id, text, key_max, answers, lang, delete_mode=True
         )
         await state.update_data(answers=answers)
         if reply_parts:
             await message.answer("\n\n".join(reply_parts), parse_mode="HTML")
+
+        # A bare-dash on a number requests DELETION → confirm first.
+        if to_delete:
+            if await _variants_exist(project_id):
+                await message.answer(t("del_blocked", lang), parse_mode="HTML")
+                # Questions are kept; fall through to the missing-answer loop.
+            else:
+                await state.update_data(pending_delete=to_delete)
+                await state.set_state(UploadStates.waiting_for_delete_confirm)
+                await message.answer(
+                    t("del_confirm", lang, nums=", ".join(map(str, to_delete))),
+                    parse_mode="HTML",
+                    reply_markup=delete_confirm_keyboard(lang),
+                )
+                return
+
         if not complete:
+            # Persistent loop: re-ask the still-missing with a 🏁 Yakunlash escape.
+            await message.answer(
+                t("key_finish_hint", lang), parse_mode="HTML",
+                reply_markup=key_finish_keyboard(lang),
+            )
             return
 
-    # ── CHANGE 2: key complete → duplicates go to the teacher ────────────────
-    if await _maybe_start_dup_resolution(message, state, lang, project_id):
+    await _proceed_after_key(message, state, lang, project_id)
+
+
+@router.callback_query(UploadStates.waiting_for_answers, F.data == "qkey:finish")
+async def handle_key_finish(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    """🏁 Yakunlash — proceed even if some MC questions are still unanswered
+    (they stay ungraded: answer_key None at generation)."""
+    await callback.answer()
+    data = await state.get_data()
+    project_id = data.get("project_id", "")
+    await _proceed_after_key(callback.message, state, db_user.language.value, project_id)
+
+
+@router.callback_query(UploadStates.waiting_for_delete_confirm, F.data == "qdel:yes")
+async def handle_delete_confirm_yes(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    project_id = data.get("project_id", "")
+    to_delete: list[int] = data.get("pending_delete") or []
+    answers: dict = data.get("answers", {})
+    await callback.answer()
+
+    if not to_delete:
+        await state.set_state(UploadStates.waiting_for_answers)
         return
 
-    await state.set_state(UploadStates.waiting_for_variant_count)
-    await message.answer(t("ask_count", lang))
+    # Guard again at commit time — never delete once variants exist.
+    if await _variants_exist(project_id):
+        await callback.message.edit_text(t("del_blocked", lang), parse_mode="HTML")
+        await state.update_data(pending_delete=[])
+        await _reask_or_proceed(callback.message, state, lang, project_id)
+        return
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),
+                Question.question_number.in_(to_delete),
+            )
+        )
+        removed = 0
+        for r in res.scalars().all():
+            r.is_deleted = True
+            removed += 1
+        pres = await session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+        p = pres.scalar_one_or_none()
+        if p:
+            p.question_count = max(0, p.question_count - removed)
+        await session.commit()
+
+    answers = {k: v for k, v in answers.items() if int(k) not in to_delete}
+    await state.update_data(
+        answers=answers,
+        pending_delete=[],
+        question_count=max(0, data.get("question_count", 0) - len(to_delete)),
+    )
+    logger.info("question_soft_deleted", project_id=project_id, nums=to_delete)
+    await callback.message.edit_text(
+        t("del_done", lang, nums=", ".join(map(str, to_delete))), parse_mode="HTML"
+    )
+    await _reask_or_proceed(callback.message, state, lang, project_id)
+
+
+@router.callback_query(UploadStates.waiting_for_delete_confirm, F.data == "qdel:no")
+async def handle_delete_confirm_no(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    project_id = data.get("project_id", "")
+    await callback.answer()
+    await state.update_data(pending_delete=[])
+    await callback.message.edit_text(t("del_cancelled", lang))
+    await _reask_or_proceed(callback.message, state, lang, project_id)
 
 
 @router.callback_query(UploadStates.waiting_for_dup_resolution, F.data.startswith("dupres:"))

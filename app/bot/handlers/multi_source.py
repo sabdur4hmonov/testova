@@ -578,8 +578,13 @@ async def handle_builder_answers(message: Message, state: FSMContext, db_user: U
 
     if not skip and text:
         key_max = data.get("key_max") or data.get("question_count", 0)
-        reply_parts, complete, answers = await apply_key_text(
-            project_id, text, key_max, answers, lang
+        # NOTE: Multi-Source still uses the OLD skip semantics for "23: -" (skip
+        # and keep, folded into answers) — delete_mode stays False here. The
+        # single-file flow uses delete_mode=True (delete-with-confirmation).
+        # Wiring delete into Multi-Source is the outstanding Piece 3b; until then
+        # the two flows deliberately differ and "-" means SKIP here.
+        reply_parts, complete, answers, _to_delete = await apply_key_text(
+            project_id, text, key_max, answers, lang, delete_mode=False
         )
         await state.update_data(answers=answers)
         if reply_parts:
