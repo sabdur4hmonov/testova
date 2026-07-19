@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, false, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -57,6 +57,14 @@ class Question(Base):
     # Reading-comprehension group support
     group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     group_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Soft-delete (migration 009): a deleted question is filtered out of EVERY
+    # read site (generation, key entry, PDFs, grading, summaries) but its row is
+    # kept so nothing renumbers. SEPARATE concept — never conflated with active
+    # or status. Deletion is blocked once variants exist.
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     # Source location
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
