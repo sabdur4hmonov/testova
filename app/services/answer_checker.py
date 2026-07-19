@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.checker import accepted_list, is_correct
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -100,7 +101,11 @@ def check_answers(
     """
     Compare student answers against the variant's answer key.
 
-    Both dicts are keyed by question position (as str): "1", "2", ...
+    The answer key value per position is a LIST of accepted answers (a single
+    letter is a one-item list); a legacy scalar value is accepted too. Matching
+    uses the SHARED checker.is_correct (casefold + collapse, no punctuation
+    stripping) so a written answer / multiple accepted answers work identically
+    to the manual flow. Letters grade exactly as before (one-item list).
     """
     total = max(
         (int(k) for k in answer_key if answer_key[k] is not None),
@@ -111,15 +116,16 @@ def check_answers(
 
     for pos in range(1, total + 1):
         pos_str = str(pos)
-        student_ans = (student_answers.get(pos_str) or "").strip().upper() or None
-        correct_ans = (answer_key.get(pos_str) or "").strip().upper() or None
+        student_ans = (student_answers.get(pos_str) or "").strip() or None
+        accepted = accepted_list(answer_key.get(pos_str))
+        correct_display = " / ".join(accepted) if accepted else None
 
         is_skipped = student_ans is None
-        is_correct = (not is_skipped) and (student_ans == correct_ans)
+        correct_flag = (not is_skipped) and is_correct(student_ans, accepted)
 
         if is_skipped:
             skipped += 1
-        elif is_correct:
+        elif correct_flag:
             correct += 1
         else:
             wrong += 1
@@ -128,8 +134,8 @@ def check_answers(
             QuestionResult(
                 position=pos,
                 student_answer=student_ans,
-                correct_answer=correct_ans,
-                is_correct=is_correct,
+                correct_answer=correct_display,
+                is_correct=correct_flag,
                 is_skipped=is_skipped,
             )
         )
