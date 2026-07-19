@@ -715,110 +715,130 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     return buf.getvalue()
 
 
+# Answer with no key (open + unanswered, or skipped) → a clean marker instead of
+# raw "-"/"ochiq". Bug C refines the on-page legend; the glyph is em dash (in the
+# bundled UniFont, unlike an emoji which would render as a box).
+_OPEN_MARKER = "—"
+
+
+def _format_answer(accepted) -> str:
+    """One answer-key cell as CLEAN human text (Bug B) — never a Python list repr.
+
+    * None / empty      → the open marker (ungraded / write-in).
+    * one accepted value → the value itself ("E", "TEMURBEK", "1000 g, 400 g, 600 g").
+    * several accepted   → "A / B" (multi-accept, joined for display only).
+    A legacy scalar (pre-Stage-3 rows) is rendered as-is.
+    """
+    if accepted is None:
+        return _OPEN_MARKER
+    if isinstance(accepted, (list, tuple)):
+        vals = [str(a) for a in accepted if str(a).strip()]
+        return " / ".join(vals) if vals else _OPEN_MARKER
+    text = str(accepted).strip()
+    return text or _OPEN_MARKER
+
+
+def _key_column_lines(variant: dict) -> tuple[str, list[str]]:
+    """A variant's heading + its "N. answer" lines, in printed-position order."""
+    key = variant.get("answer_key", {})
+    heading = f"{variant['variant_number']}-Variant"
+    lines = [f"{pos}. {_format_answer(key[pos])}" for pos in sorted(key, key=int)]
+    return heading, lines
+
+
 def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
+    """Answer key as NARROW VERTICAL COLUMNS placed SIDE BY SIDE: reading DOWN a
+    column gives one variant's full answer list. Column width adapts to the real
+    content (letters stay narrow, long written answers widen) and as many columns
+    as fit the page width sit in one row-block, wrapping to a new block below —
+    so cells never overlap regardless of answer length or variant count."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
         topMargin=MARGIN, bottomMargin=BOTTOM_MARGIN,
     )
-    story = []
+    story = [
+        Paragraph(f"{_esc(exam_title)} — Javob kaliti", STYLES["key_header"]),
+        HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a237e")),
+        Spacer(1, 4 * mm),
+    ]
 
-    story.append(Paragraph(f"{_esc(exam_title)} — Javob kaliti", STYLES["key_header"]))
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a237e")))
-    story.append(Spacer(1, 6 * mm))
+    avail_w = PAGE_WIDTH - 2 * MARGIN
+    COL_GAP = 0.35 * cm
+    MIN_COL = 1.9 * cm
+    CELL_FS, HEAD_FS = 9, 10
+    PAD = 14  # cell insets + a little slack so text never touches the border
 
+    head_style = ParagraphStyle(
+        "keycol_head", parent=STYLES["key_header"],
+        fontSize=HEAD_FS, alignment=TA_CENTER, textColor=colors.white,
+        spaceBefore=0, spaceAfter=0, leading=HEAD_FS + 2,
+    )
+    cell_style = ParagraphStyle(
+        "keycol_cell", parent=STYLES["option"],
+        fontSize=CELL_FS, leftIndent=0, spaceBefore=1, spaceAfter=1,
+        leading=CELL_FS + 3,
+    )
+
+    # 1) Build each variant's column and its adaptive width.
+    columns: list[tuple[str, list[str], float]] = []
     for variant in variants:
-        vnum  = variant["variant_number"]
-        key   = variant.get("answer_key", {})
-        story.append(Paragraph(f"Variant {vnum}", STYLES["question"]))
+        heading, lines = _key_column_lines(variant)
+        w = pdfmetrics.stringWidth(heading, _FONT_BOLD, HEAD_FS)
+        for ln in lines:
+            w = max(w, pdfmetrics.stringWidth(ln, _FONT, CELL_FS))
+        col_w = max(MIN_COL, min(w + PAD, avail_w))
+        columns.append((heading, lines, col_w))
 
-        items = sorted(key.items(), key=lambda x: int(x[0]))
-        COLS  = 5
-        rows  = []
+    # 2) Greedily pack columns into side-by-side blocks that fit the page width.
+    blocks: list[list[tuple[str, list[str], float]]] = []
+    cur: list[tuple[str, list[str], float]] = []
+    cur_w = 0.0
+    for col in columns:
+        add = col[2] + (COL_GAP if cur else 0)
+        if cur and cur_w + add > avail_w:
+            blocks.append(cur)
+            cur, cur_w = [], 0.0
+            add = col[2]
+        cur.append(col)
+        cur_w += add
+    if cur:
+        blocks.append(cur)
 
-        header_row = []
-        for _ in range(COLS):
-            header_row.extend(["#", "Javob"])
-        rows.append(header_row)
-
-        for chunk_start in range(0, len(items), COLS):
-            chunk = items[chunk_start:chunk_start + COLS]
-            row = []
-            for pos, ans in chunk:
-                # BUG FIX: open-ended questions have no letter answer.
-                # Show "(ochiq)" instead of "-" so teacher understands
-                # this question requires manual checking.
-                if ans is None:
-                    # Check if this position corresponds to an open-ended question
-                    q_data = _find_question_by_pos(variant, str(pos))
-                    if q_data and q_data.get("is_open_ended"):
-                        display_ans = "ochiq"
-                    else:
-                        display_ans = "-"
-                else:
-                    display_ans = str(ans)
-                row.extend([str(pos), display_ans])
-            while len(row) < COLS * 2:
-                row.extend(["", ""])
-            rows.append(row)
-
-        col_widths = []
-        for _ in range(COLS):
-            col_widths.extend([1.2 * cm, 1.5 * cm])
-
-        tbl = Table(rows, colWidths=col_widths, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0),  (-1, 0),  colors.HexColor("#1a237e")),
-            ("TEXTCOLOR",  (0, 0),  (-1, 0),  colors.white),
-            # BUG FIX: use _FONT_BOLD/_FONT instead of hardcoded "Helvetica-Bold".
-            # Hardcoded names ignored the UniFont loaded above, so Uzbek text
-            # (like "Javob", "ochiq") rendered as "?" boxes in Docker/Linux.
-            ("FONTNAME",   (0, 0),  (-1, 0),  _FONT_BOLD),
-            ("FONTSIZE",   (0, 0),  (-1, -1), 9),
-            ("ALIGN",      (0, 0),  (-1, -1), "CENTER"),
-            ("VALIGN",     (0, 0),  (-1, -1), "MIDDLE"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.white, colors.HexColor("#e8eaf6")]),
-            ("GRID",       (0, 0),  (-1, -1), 0.5, colors.grey),
-            ("FONTNAME",   (1, 1),  (-1, -1), _FONT_BOLD),
-            ("TEXTCOLOR",  (1, 1),  (-1, -1), colors.HexColor("#1a237e")),
-            # BUG FIX: "ochiq" answers in a different color so teacher notices them
-            # (This is handled per-cell below via _style_open_ended_cells)
+    # 3) Render each block as one outer table row of variant columns.
+    for block in blocks:
+        cells = []
+        for heading, lines, col_w in block:
+            inner_rows = [[Paragraph(_esc(heading), head_style)]]
+            for ln in lines:
+                inner_rows.append([Paragraph(_esc(ln), cell_style)])
+            inner = Table(inner_rows, colWidths=[col_w])
+            inner.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#1a237e")),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c5cae9")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                 [colors.white, colors.HexColor("#eef0fa")]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]))
+            cells.append(inner)
+        outer = Table([cells], colWidths=[c[2] for c in block], hAlign="LEFT")
+        outer.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            # inter-column gap on every column except the last
+            ("RIGHTPADDING", (0, 0), (-2, -1), COL_GAP),
+            ("RIGHTPADDING", (-1, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
         ]))
-
-        # BUG FIX: color "ochiq" cells orange so teacher immediately sees
-        # which questions need manual review
-        _style_open_ended_cells(tbl, rows)
-
-        story.append(tbl)
-        story.append(Spacer(1, 8 * mm))
+        story.append(outer)
+        story.append(Spacer(1, 6 * mm))
 
     doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)
     logger.info("answer_key_pdf_built", variants=len(variants))
     return buf.getvalue()
-
-
-def _find_question_by_pos(variant: dict, pos: str) -> dict | None:
-    """Find a question in variant data by its position string."""
-    for q in variant.get("questions_data", []):
-        if str(q.get("position_in_variant", q.get("question_number", ""))) == pos:
-            return q
-    return None
-
-
-def _style_open_ended_cells(tbl: Table, rows: list) -> None:
-    """
-    BUG FIX: Apply orange color to answer cells that contain 'ochiq'
-    so the teacher immediately knows which questions need manual checking.
-    Row 0 is the header, data starts at row 1.
-    """
-    for row_idx, row in enumerate(rows[1:], start=1):  # skip header
-        for col_idx, cell_val in enumerate(row):
-            if str(cell_val).strip().lower() == "ochiq":
-                tbl.setStyle(TableStyle([
-                    ("TEXTCOLOR",  (col_idx, row_idx), (col_idx, row_idx),
-                     colors.HexColor("#e65100")),
-                    ("FONTNAME",   (col_idx, row_idx), (col_idx, row_idx),
-                     _FONT_BOLD),
-                ]))
