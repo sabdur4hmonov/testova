@@ -111,7 +111,10 @@ def test_correct_answer_e_never_becomes_none():
 
 # ── Bug #5: pre-export validation ─────────────────────────────────────────────
 
-def test_validate_rejects_single_option_and_compacts_blanks():
+def test_validate_drops_blanks_preserving_labels():
+    # Letter preservation (KNOWN-OPEN #2): blanks are dropped but the REAL labels
+    # and gaps are kept — a blank C leaves A, B, D (NOT relabelled to A, B, C),
+    # and the correct answer keeps its real label D.
     qs = [
         {
             "question_id": "q1",
@@ -132,9 +135,9 @@ def test_validate_rejects_single_option_and_compacts_blanks():
     assert [r["question_number"] for r in rejected] == [1]
     assert len(valid) == 1
     q2 = valid[0]
-    assert list(q2["options"].keys()) == ["A", "B", "C"]
-    assert q2["correct_answer"] == "C"
-    assert q2["options"]["C"] == "d"
+    assert list(q2["options"].keys()) == ["A", "B", "D"]   # gap at C preserved
+    assert q2["correct_answer"] == "D"                      # real label kept
+    assert q2["options"]["D"] == "d"
 
 
 def test_validate_marks_open_ended():

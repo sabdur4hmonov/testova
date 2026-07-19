@@ -17,11 +17,6 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# BUG FIX (#9): include E — previously a 5-option question had its E option
-# silently dropped by the shuffle, and if E was the correct answer the
-# variant's answer key became None.
-OPTION_LETTERS = ["A", "B", "C", "D", "E"]
-
 
 # ── Pre-export validation ───────────────────────────────────────────────────────
 
@@ -79,18 +74,11 @@ def validate_questions(
             rejected.append({"question_number": num, "reason": "blank_correct_option"})
             continue
 
-        # Drop blank strings AND compact the remaining letters so the printed
-        # question never shows a gap (A, B, D → A, B, C). The correct-answer
-        # letter is remapped alongside its content.
-        source_order = [k for k in "ABCDE" if k in filled]
-        compact: dict[str, str] = {}
-        remap: dict[str, str] = {}
-        for new_letter, old_letter in zip("ABCDE", source_order):
-            compact[new_letter] = filled[old_letter]
-            remap[old_letter] = new_letter
-        q["options"] = compact
-        if ca and ca in remap:
-            q["correct_answer"] = remap[ca]
+        # Drop blank options but PRESERVE the real labels and order — never
+        # renumber or fill gaps (letter preservation, KNOWN-OPEN #2). "a,b,d,e"
+        # stays "a,b,d,e"; Cyrillic stays Cyrillic. correct_answer already names
+        # a real, non-blank label (checked above), so it is left as-is.
+        q["options"] = dict(filled)
         q["is_open_ended"] = False
         valid.append(q)
 
@@ -109,7 +97,9 @@ def _shuffle_options(
     question: dict[str, Any], rng: random.Random
 ) -> tuple[dict[str, str], str | None]:
     original = question.get("options", {})
-    available = [k for k in OPTION_LETTERS if original.get(k) is not None]
+    # REAL labels in printed order (any script, any gaps). Shuffling permutes the
+    # TEXTS across these fixed labels; the labels themselves never change.
+    available = [k for k in original if original.get(k) is not None]
 
     if len(available) < 2:
         return original, question.get("correct_answer")
