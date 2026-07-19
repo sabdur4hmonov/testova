@@ -13,7 +13,30 @@ Matching is done HERE, in Python — Gemini is never asked to judge correctness.
 """
 from __future__ import annotations
 
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+# A PLAIN number: optional sign, digits, and ONE decimal separator (comma OR dot).
+# A slash ("2/3"), a second comma ("1,2,3"), letters or spaces make it NOT plain,
+# so fractions/ratios/lists/words stay literal text and match exactly.
+_NUM_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
+
+
+def _as_number(s: str) -> Decimal | None:
+    """Decimal value of a PLAIN number (comma OR dot decimal), else None.
+
+    Used ONLY for the safe notation-equivalence in is_correct: when BOTH sides
+    are plain numbers, compare their Decimal values so "2,3" == "2.3" == "2,30"
+    and "5" == "5.0". Sign is meaning-bearing (Decimal(-5) != Decimal(5)), so
+    -5 never equals 5. NOT a math evaluator: no fractions, no rounding policy.
+    """
+    if not _NUM_RE.match(s):
+        return None
+    try:
+        return Decimal(s.replace(",", "."))
+    except InvalidOperation:
+        return None
 
 
 def grade_for(percent: float) -> int:
@@ -53,11 +76,27 @@ def normalize(value: Any) -> str:
 
 
 def is_correct(student: Any, accepted: list[str]) -> bool:
-    """True if the student's answer matches ANY accepted answer."""
+    """True if the student's answer matches ANY accepted answer.
+
+    Exact (casefold + whitespace) match first. If that fails and BOTH sides are
+    plain numbers, they match on Decimal value — so comma/dot decimals and
+    trailing zeros are equal ("2,3" == "2.3" == "2,30", "5" == "5.0"). Anything
+    that isn't a plain number (fractions "2/3", lists "1000 g, 400 g, 600 g",
+    words, "-5" vs "5") stays exact-match-only.
+    """
     s = normalize(student)
     if not s:
         return False
-    return any(s == normalize(a) for a in accepted)
+    s_num = _as_number(s)
+    for a in accepted:
+        a_norm = normalize(a)
+        if s == a_norm:
+            return True
+        if s_num is not None:
+            a_num = _as_number(a_norm)
+            if a_num is not None and s_num == a_num:
+                return True
+    return False
 
 
 def _display(accepted: list[str]) -> str:

@@ -111,3 +111,18 @@ def test_sign_still_meaning_bearing():
     # -5 must not equal 5 (checker.normalize does not strip punctuation).
     assert check_answers({"1": "-5"}, {"1": ["5"]}).wrong == 1
     assert check_answers({"1": "-5"}, {"1": ["-5"]}).correct == 1
+
+
+# ── Saved flow gets numeric normalization too (shared is_correct) ────────────
+def test_saved_flow_comma_dot_decimals_match():
+    # The live-test bug: student wrote 8.23 (dot), key has 8,23 (comma). The saved
+    # flow grades via check_answers -> is_correct, so it must now score correct.
+    res = check_answers({"1": "8.23", "2": "2,3", "3": "5.0"},
+                        {"1": ["8,23"], "2": ["2.3"], "3": ["5"]})
+    assert res.correct == 3 and res.wrong == 0
+
+
+def test_saved_flow_numeric_guards():
+    assert check_answers({"1": "2,3"}, {"1": ["2/3"]}).wrong == 1     # comma ≠ fraction
+    assert check_answers({"1": "0.67"}, {"1": ["2/3"]}).wrong == 1    # decimal ≠ fraction
+    assert check_answers({"1": "-5"}, {"1": ["5"]}).wrong == 1        # sign preserved

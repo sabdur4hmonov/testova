@@ -195,6 +195,33 @@ def test_sign_is_meaning_bearing():
     assert is_correct("-5", ["-5"])
 
 
+# ── Safe numeric-notation equivalence (comma/dot + trailing zeros ONLY) ──────
+def test_comma_dot_decimals_are_equal():
+    assert is_correct("8.23", ["8,23"])      # the live-test case (dot vs comma)
+    assert is_correct("8,23", ["8.23"])
+    assert is_correct("2,3", ["2.3"])
+    assert is_correct("2.3", ["2,3"])
+
+
+def test_trailing_zeros_are_equal():
+    assert is_correct("2,30", ["2.3"])
+    assert is_correct("2.300", ["2,3"])
+    assert is_correct("5.0", ["5"])
+    assert is_correct("5", ["5,00"])
+
+
+def test_numeric_normalization_guards_hold():
+    # A fraction is NOT a plain number → stays literal, never equals a decimal.
+    assert not is_correct("2,3", ["2/3"])
+    assert not is_correct("0.67", ["2/3"])
+    assert is_correct("2/3", ["2/3"])            # exact fraction still matches
+    # Sign stays meaning-bearing under numeric compare.
+    assert not is_correct("-5", ["5"])
+    # A comma-separated LIST (not a plain number) stays exact-match only.
+    assert is_correct("1000 g, 400 g, 600 g", ["1000 g, 400 g, 600 g"])
+    assert not is_correct("1000 g, 400 g, 600 g", ["1000"])
+
+
 def test_equation_answer_kept_intact():
     assert is_correct("x=5", ["x=5"])
     assert not is_correct("x=5", ["x=-5"])
