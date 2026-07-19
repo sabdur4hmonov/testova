@@ -34,7 +34,10 @@ from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
 from app.services import access, storage
-from app.services.option_letters import OPTION_LETTER_CLASS, canonical_letter
+from app.services.answer_key_parser import parse_answer_key
+from app.services.option_letters import (
+    OPTION_LETTER_CLASS, canonical_letter, is_option_letter,
+)
 from app.services.ai_analyzer import (
     AIAnalyzer,
     export_lint,
@@ -260,6 +263,52 @@ def _labels_hint(questions: list[dict]) -> str:
     return " · ".join(parts)
 
 
+_SKIP_RE = re.compile(r'(\d+)\s*[-–—](?=\s|$)')
+
+
+def _resolve_saved_key(
+    parsed: dict[int, list[str]],
+    skips: set[int],
+    labels_by_num: dict[int, list[str]],
+) -> tuple[dict[str, list[str] | str], list[tuple[int, str]]]:
+    """PURE validation of a parsed saved-flow key against each question's type.
+
+    * MC question (has options): every accepted item must be a real option
+      letter — canonical-matched to the paper's real label (a word is rejected).
+    * OPEN question (no options): the written answer(s) are accepted as-is.
+    * skip ("47-"): stored as "-".
+    Returns (good, bad) where good maps num_str -> list[accepted] (real labels for
+    MC, text for written) or "-"; bad is [(num, reason_kind)].
+    """
+    good: dict[str, list[str] | str] = {}
+    bad: list[tuple[int, str]] = []
+    for n in skips:
+        if n in labels_by_num:
+            good[str(n)] = "-"
+    for num, accepted in parsed.items():
+        avail = labels_by_num.get(num)
+        if avail is None:
+            bad.append((num, "no_question"))
+            continue
+        if avail:  # multiple-choice — items must be real option letters
+            canon_to_real = {canonical_letter(L): L for L in avail}
+            reals: list[str] = []
+            ok = True
+            for item in accepted:
+                real = canon_to_real.get(canonical_letter(item)) if is_option_letter(item) else None
+                if real is None:
+                    ok = False
+                    break
+                reals.append(real)
+            if ok and reals:
+                good[str(num)] = reals
+            else:
+                bad.append((num, "bad_letter"))
+        else:  # open-ended — accept the written answer(s) verbatim
+            good[str(num)] = list(accepted)
+    return good, bad
+
+
 def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
     """
     Parse a teacher's answer key. Tolerated formats, freely mixable and
@@ -402,8 +451,16 @@ async def apply_key_text(
 
     Returns (reply_parts, complete, updated_answers).
     """
-    updates = _parse_answer_input(text, key_max)
-    if not updates:
+    # Explicit skip markers ("47-") first, then parse the REST with the shared
+    # key parser (letters + written short answers + multi-accept "22: A / B").
+    skips = {int(m) for m in _SKIP_RE.findall(text) if 1 <= int(m) <= key_max}
+    text_wo_skips = _SKIP_RE.sub(" ", text)
+    parsed: dict[int, list[str]] = {}
+    if text_wo_skips.strip():
+        parsed, reason = parse_answer_key(text_wo_skips, lang)
+        if reason:
+            return [t("key_bad", lang, bad=reason)], False, answers
+    if not parsed and not skips:
         return [t("key_bad", lang, bad=text[:60])], False, answers
 
     async with async_session_factory() as session:
@@ -414,43 +471,29 @@ async def apply_key_text(
         rows = res.scalars().all()
 
         # REAL option labels per question (any script, gaps preserved) from the
-        # label-preserving options JSON; old rows fall back to option_a..d.
+        # label-preserving options JSON; old rows fall back to option_a..d. An
+        # OPEN question (no options) has an empty list → written answer accepted.
         labels_by_num: dict[int, list[str]] = {
             r.question_number: [o["letter"] for o in r.options_ordered]
             for r in rows
         }
 
-        good: dict[str, str] = {}
-        bad_lines: list[str] = []
-        for num_str, letter in updates.items():
-            avail = labels_by_num.get(int(num_str))
-            if avail is None:
-                bad_lines.append(_key_reason(
-                    "no_question", lang, n=num_str,
-                    L="" if letter == "-" else letter,
-                ))
-            elif letter == "-":
-                good[num_str] = "-"  # explicit skip for an existing question
-            elif not avail:
-                bad_lines.append(_key_reason("open", lang, n=num_str, L=letter))
-            else:
-                # Match the typed letter to a REAL label by canonical fold (so a
-                # Latin "A" matches Cyrillic "А" etc.), then STORE the real label
-                # so it lines up with the option keys at shuffle time.
-                canon_to_real = {canonical_letter(L): L for L in avail}
-                real = canon_to_real.get(canonical_letter(letter))
-                if real is None:
-                    bad_lines.append(_key_reason(
-                        "bad_letter", lang, n=num_str, L=letter,
-                        avail=", ".join(avail),
-                    ))
-                else:
-                    good[num_str] = real
+        good, bad = _resolve_saved_key(parsed, skips, labels_by_num)
+        bad_lines = [
+            _key_reason(kind, lang, n=str(num), L="",
+                        avail=", ".join(labels_by_num.get(num) or []))
+            for num, kind in bad
+        ]
 
         for r in rows:
             val = good.get(str(r.question_number))
             if val and val != "-":
-                r.correct_answer = val
+                # Accepted answers list (008). Keep the legacy single-letter
+                # column in sync when it's one MC letter (fits String(4)).
+                r.correct_answers = list(val)
+                r.correct_answer = (
+                    val[0] if len(val) == 1 and is_option_letter(val[0]) else None
+                )
         await session.commit()
 
     answers = {**answers, **good}
