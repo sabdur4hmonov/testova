@@ -89,11 +89,11 @@ def wired(monkeypatch):
             return set(valid), expected
         monkeypatch.setattr(C, "_project_variants", fake_project_variants)
 
-    def set_read(variant, student_name, answers, unclear=None):
+    def set_read(variant, student_name, answers, unclear=None, texts=None):
         async def fake_read(content, expected_count):
             return {
                 "variant": variant, "student_name": student_name,
-                "answers": answers, "unclear": unclear or [],
+                "answers": answers, "texts": texts or {}, "unclear": unclear or [],
             }
         monkeypatch.setattr(C, "read_answer_sheet", fake_read)
 
@@ -197,6 +197,30 @@ async def test_unreadable_sheet_asks_retake(wired):
     st = FakeState({"project_id": "p1"})
     await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
     assert graded == []  # can't grade an unreadable sheet
+
+
+# ── Stage 5: a WRITTEN-only sheet (no marked options) still auto-grades ───────
+async def test_written_only_sheet_autogrades(wired):
+    set_project, set_read, graded = wired
+    set_project([1, 2, 3], 4)
+    # all answers came through the written channel — none marked as options
+    set_read(variant=2, student_name="Ali", answers={}, texts={1: "8,23", 2: "temurbek"})
+
+    st = FakeState({"project_id": "p1"})
+    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
+
+    assert graded == [{"variant": 2, "name": "Ali"}]  # readable via texts, graded
+
+
+# ── Stage 5: nothing on the sheet (no options, no texts, no unclear) → retake ──
+async def test_fully_blank_sheet_asks_retake(wired):
+    set_project, set_read, graded = wired
+    set_project([1, 2, 3], 4)
+    set_read(variant=2, student_name="Ali", answers={}, texts={}, unclear=[])
+
+    st = FakeState({"project_id": "p1"})
+    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
+    assert graded == []  # truly unreadable → no grade
 
 
 # ── No variants for the project → clear message, no crash ─────────────────────

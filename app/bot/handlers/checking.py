@@ -398,7 +398,11 @@ async def handle_answer_sheet_upload(
     await thinking.delete()
 
     # Keyed by position STRING to match check_answers / the stored answer key.
+    # Written short answers (texts) grade the same as marked options — a question
+    # is EITHER multiple-choice (answers) OR open (texts), so the two never
+    # collide; is_correct normalises the raw text at match time.
     answers_str = {str(k): v for k, v in read["answers"].items()}
+    answers_str.update({str(k): v for k, v in read["texts"].items()})
     name = name_cap or read["student_name"]
     candidate = var_cap if var_cap is not None else read["variant"]
     await state.update_data(
@@ -409,7 +413,7 @@ async def handle_answer_sheet_upload(
         student_name=name,
     )
 
-    if len(read["answers"]) + len(read["unclear"]) == 0:
+    if len(read["answers"]) + len(read["texts"]) + len(read["unclear"]) == 0:
         await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
         return  # unreadable sheet — stay and let them retake
 
