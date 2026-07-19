@@ -46,8 +46,10 @@ def test_answer_key_has_correct_length():
 def test_answer_key_letters_are_valid():
     variants = generate_variants(SAMPLE_QUESTIONS, count=5, seed=42)
     for v in variants:
-        for pos, letter in v["answer_key"].items():
-            assert letter in {"A", "B", "C", "D"}, f"Invalid answer letter: {letter}"
+        for pos, accepted in v["answer_key"].items():
+            # answer_key values are one-item lists for MC (migration 008)
+            assert accepted == [accepted[0]] and accepted[0] in {"A", "B", "C", "D"}, \
+                f"Invalid answer entry: {accepted}"
 
 
 def test_options_are_shuffled_or_same():
@@ -105,8 +107,8 @@ def test_correct_answer_e_never_becomes_none():
     for v in variants:
         key = v["answer_key"]["1"]
         assert key is not None
-        # The key must still point at the original E content
-        assert v["questions_data"][0]["options"][key] == "e"
+        # key value is a one-item list now → unwrap; must still point at E content
+        assert v["questions_data"][0]["options"][key[0]] == "e"
 
 
 # ── Bug #5: pre-export validation ─────────────────────────────────────────────

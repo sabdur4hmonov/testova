@@ -994,6 +994,7 @@ async def _generate_and_send(
             # Real, ordered labels (new rows) with legacy-column fallback.
             "options":          q.options_dict,
             "correct_answer":   q.correct_answer,
+            "correct_answers":  q.correct_answers_ordered,   # accepted list (008)
             "has_image":        q.has_image,
             "image_path":       q.image_path,
             "image_description": q.image_description,

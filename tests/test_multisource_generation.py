@@ -65,14 +65,14 @@ def test_1_colliding_pool_round_trip_100_percent():
 
         for q in qd:
             pos = str(q["position_in_variant"])
-            key_letter = v["answer_key"][pos]
+            key_letter = v["answer_key"][pos][0]   # key values are lists now
             # the key must point at the ORIGINAL correct option's text,
             # proving grading tracks correctness through pooling + shuffle
             assert q["options"][key_letter] == f"{q['question_id']}-CORRECT"
             seen_ids.add(q["question_id"])
 
         # a perfect student answering per the key scores 100%
-        student = dict(v["answer_key"])
+        student = {k: a[0] for k, a in v["answer_key"].items() if a}
         assert check_answers(student, v["answer_key"]).score_percent == 100.0
 
     # both sources' questions were exercised across the variants

@@ -118,7 +118,9 @@ def test_generate_pool_variants_round_trip():
     assert [v["variant_number"] for v in variants] == [1, 2, 3]
     for v in variants:
         assert len(v["answer_key"]) == 8
-        result = check_answers(dict(v["answer_key"]), v["answer_key"])
+        # perfect student = one accepted answer per position (key values are lists)
+        _key = v["answer_key"]
+        result = check_answers({k: a[0] for k, a in _key.items() if a}, _key)
         assert result.score_percent == 100.0
 
 
