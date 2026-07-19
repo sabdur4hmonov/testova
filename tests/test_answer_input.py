@@ -45,11 +45,28 @@ def test_pair_overrides_earlier_skip():
     assert _parse_answer_input("5-\n5C", 10) == {"5": "C"}
 
 
-def test_cyrillic_letters_mapped():
-    # Teachers on ru/uz keyboards type Cyrillic А В С Д Е
-    assert _parse_answer_input("1А 2В 3С 4Д 5Е", 10) == {
-        "1": "A", "2": "B", "3": "C", "4": "D", "5": "E",
-    }
+def test_cyrillic_letters_preserved():
+    # Letter preservation (KNOWN-OPEN #2): the REAL Cyrillic label is kept, not
+    # force-mapped to Latin. Validation + canonical-matching against the
+    # question's real options resolves it at grade time. Explicit codepoints
+    # avoid the source-ambiguity between Cyrillic С (U+0421) and Latin C.
+    cyr = {"1": "А", "2": "В", "3": "С", "4": "Д", "5": "Е"}
+    text = " ".join(f"{n}{L}" for n, L in cyr.items())
+    assert _parse_answer_input(text, 10) == cyr
+
+
+def test_cyrillic_key_validates_via_canonical():
+    # A Cyrillic label canonicalises to match a Cyrillic-labelled question's
+    # real options (the letters_by_num check in the handler uses this).
+    from app.services.option_letters import canonical_letter
+    real_labels = ["А", "Б", "Д", "Е"]  # А Б Д Е (gap at В,Г)
+    canon_to_real = {canonical_letter(L): L for L in real_labels}
+    # teacher types Cyrillic Д → canonical D → resolves to the real Cyrillic Д
+    assert canon_to_real.get(canonical_letter("Д")) == "Д"
+    # a Latin "A" also resolves to the Cyrillic А (look-alike)
+    assert canon_to_real.get(canonical_letter("A")) == "А"
+    # a letter not on this question (В) does not resolve
+    assert canon_to_real.get(canonical_letter("В")) is None
 
 
 def test_lowercase_input():

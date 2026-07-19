@@ -22,16 +22,12 @@ import google.generativeai as genai
 
 from app.config import settings
 from app.services.file_processor import image_to_pages, preprocess_image
+from app.services.option_letters import canonical_letter, is_option_letter
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
-
-# Cyrillic look-alikes → Latin, same folding the key parser uses. A student may
-# have marked А/В/С/Д on a Cyrillic form.
-_CYRILLIC_MAP = {"А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E"}
-_VALID = {"A", "B", "C", "D"}
 
 # NEW prompt — do NOT reuse VISION_PROMPT. Reads MARKED answers, never guesses.
 ANSWER_SHEET_PROMPT = """You are reading a photo of a student's exam ANSWER SHEET.
@@ -144,23 +140,24 @@ def _parse_response(raw: str) -> dict[str, Any]:
 
 def _norm_letter(value: Any) -> str | None:
     """
-    Fold a raw answer to 'A'..'D', '?' (unclear), or None.
+    A marked option → its CANONICAL letter (for matching), '?' (unclear), or None.
 
-    The WHOLE value must be a single letter to count as a marked option — a
-    written answer like "APPLE" must NOT be read as "A". None here means "not a
-    bare letter", i.e. it may be a written short answer (see _clean_text).
+    The WHOLE value must be a single option letter — Latin (A–E) or Cyrillic
+    (А Б В Г Д Е) — to count as a marked option; a written answer like "APPLE"
+    must NOT be read as "A". None here means "not a bare option letter", i.e. it
+    may be a written short answer (see _clean_text). Canonicalisation unifies
+    cross-script look-alikes so grading matches the key; both sides canonicalise.
     """
     if value is None:
         return None
-    s = str(value).strip().upper()
+    s = str(value).strip()
     if not s:
         return None
     if s[0] == "?":
         return "?"
-    if len(s) != 1:
-        return None  # a written word is not an option letter
-    ch = _CYRILLIC_MAP.get(s, s)
-    return ch if ch in _VALID else None
+    if not is_option_letter(s):
+        return None  # a written word (or non-option char) is not a marked option
+    return canonical_letter(s)
 
 
 def _clean_text(value: Any) -> str | None:

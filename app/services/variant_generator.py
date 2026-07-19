@@ -13,6 +13,7 @@ import random
 import uuid
 from typing import Any
 
+from app.services.option_letters import canonical_letter
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -236,7 +237,9 @@ def _generate_one_variant(
                         break
 
             option_mapping[q_id] = fwd_map
-            answer_key[str(pos)] = new_correct
+            # The printed variant shows the REAL label (from options); the key is
+            # stored CANONICAL so grading matches the canonical sheet read.
+            answer_key[str(pos)] = canonical_letter(new_correct) if new_correct else None
 
             resolved.append({
                 **q,
