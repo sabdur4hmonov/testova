@@ -48,10 +48,7 @@ Format:
   {
     "n": 1,
     "q": "full question text exactly as written",
-    "A": "option A text exactly as written",
-    "B": "option B text exactly as written",
-    "C": "option C text exactly as written",
-    "D": "option D text exactly as written",
+    "opts": {"A": "option A text exactly as written", "B": "option B text exactly as written", "C": "option C text exactly as written", "D": "option D text exactly as written"},
     "ans": null,
     "img": false,
     "img_desc": null,
@@ -68,9 +65,16 @@ CRITICAL RULES:
 3. Copy ALL text EXACTLY as written - do not change +/- signs, do not modify equations
 4. For equations: copy character by character. If you see 3(x+1) write 3(x+1), NOT 3(x-1)
 5. If a question has an image/diagram/table: set img=true, describe it in img_desc
-6. For answer options: if options ARE on this page, copy them exactly
-7. If answer options are NOT visible on this page (cut off), leave A/B/C/D as empty string ""
-8. Do NOT invent or guess missing options - leave them as ""
+6. For answer options ("opts"): use the EXACT label printed before each option
+   as the key, in the order printed. Labels may be Latin (A, B, C, D, E) OR
+   Cyrillic (А, Б, В, Г, Д, Е). Copy each option's TEXT exactly as written.
+   - Do NOT renumber or relabel. Do NOT convert Cyrillic labels to Latin.
+   - Do NOT fill gaps: a paper printed "a) b) d) e)" returns keys "a","b","d","e"
+     with NO "c". A paper with five options returns five keys.
+   - "ans" (if you can see the marked/correct option) must be one of these exact
+     labels.
+7. If answer options are NOT visible on this page (cut off), return "opts": {}
+8. Do NOT invent or guess missing options - return "opts": {} when there are none
 9. Do NOT use LaTeX or $ symbols. Use ONE consistent plain-text notation for
    ALL formulas (never mix styles inside a document):
    - Fractions: write as (a)/(b) example: (1)/(2)
@@ -1631,16 +1635,23 @@ class AIAnalyzer:
                     logger.warning("stitch_orphan_dropped", page=page_num)
                     continue
 
-                opts = prev_last.setdefault("options", {})
+                # Options may be keyed "opts" (new, real labels) or "options"
+                # (legacy). Stitch by the REAL label, any script.
+                opts = prev_last.get("opts")
+                if not isinstance(opts, dict):
+                    opts = prev_last.get("options")
+                    if not isinstance(opts, dict):
+                        opts = {}
+                    prev_last["opts"] = opts
                 complete_before = sum(
                     1 for v in opts.values() if v and str(v).strip()
                 ) >= 4
 
-                frag_opts = frag.get("options", {})
+                frag_opts = frag.get("opts") or frag.get("options") or {}
                 filled: list[str] = []
-                for letter in "ABCDE":
-                    if not opts.get(letter) and frag_opts.get(letter):
-                        opts[letter] = frag_opts[letter]
+                for letter, val in frag_opts.items():
+                    if not opts.get(letter) and val:
+                        opts[letter] = val
                         filled.append(letter)
 
                 frag_text = str(frag.get("question_text") or "").strip()
@@ -1743,14 +1754,23 @@ class AIAnalyzer:
             primary = qs[0]
 
             # BUG FIX: Merge options from ALL subsequent occurrences, not just one.
-            # This handles questions whose options span pages 2 AND 3.
+            # This handles questions whose options span pages 2 AND 3. Label-
+            # agnostic: merges by the REAL printed label (any script), reading the
+            # new "opts" key (with legacy "options" fallback).
+            def _raw_opts(item):
+                o = item.get("opts")
+                if not isinstance(o, dict):
+                    o = item.get("options") if isinstance(item.get("options"), dict) else {}
+                return o
+
             for subsequent in qs[1:]:
-                sub_opts = subsequent.get("options", {})
-                for letter in "ABCD":
-                    existing_val = primary.get("options", {}).get(letter, "")
-                    new_val = sub_opts.get(letter, "")
-                    if not existing_val and new_val:
-                        primary.setdefault("options", {})[letter] = new_val
+                prim_opts = primary.get("opts")
+                if not isinstance(prim_opts, dict):
+                    prim_opts = _raw_opts(primary)
+                    primary["opts"] = prim_opts
+                for letter, new_val in _raw_opts(subsequent).items():
+                    if not prim_opts.get(letter) and new_val:
+                        prim_opts[letter] = new_val
                         logger.info(
                             "merged_option",
                             question=n,
@@ -1895,18 +1915,27 @@ class AIAnalyzer:
                 or ""
             )
 
-            opts_raw = q.get("options") or {}
-            if isinstance(opts_raw, dict):
-                options = {k: v for k, v in opts_raw.items() if k in "ABCDE" and v}
-            else:
-                options = {}
-            for letter in "ABCDE":
-                if not options.get(letter) and q.get(letter):
-                    options[letter] = q[letter]
+            # Options keyed by their REAL printed label (Latin or Cyrillic), in
+            # order. Accept the new "opts" key, then legacy shapes ("options" /
+            # flat "A".."E") so old cached payloads still parse. Labels are NEVER
+            # folded here — preservation is the whole point.
+            opts_raw = q.get("opts")
+            if not isinstance(opts_raw, dict):
+                opts_raw = q.get("options") if isinstance(q.get("options"), dict) else {}
+            options = {
+                str(k).strip(): v for k, v in opts_raw.items()
+                if str(k).strip() and v and str(v).strip()
+            }
+            if not options:                       # legacy flat A..E fallback
+                for letter in "ABCDE":
+                    if q.get(letter) and str(q[letter]).strip():
+                        options[letter] = q[letter]
 
+            # Correct-answer LABEL: keep it verbatim (single char, any script);
+            # only accept it if it names one of this question's real options.
             ca = q.get("correct_answer") or q.get("ans") or q.get("answer")
-            ca = str(ca).strip().upper()[:1] if ca else None
-            if ca not in ("A", "B", "C", "D", "E"):
+            ca = str(ca).strip()[:1] if ca else None
+            if ca not in options:
                 ca = None
 
             has_img = bool(

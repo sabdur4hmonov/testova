@@ -78,23 +78,18 @@ async def persist_questions(project_id: str, questions: list[dict]) -> None:
     async with async_session_factory() as session:
         for rq in questions:
             opts = rq.get("options", {})
-            if opts.get("E"):
-                # BUG FIX (#9): the questions table only has option_a..option_d
-                # columns, so a 5th option cannot be persisted. Don't lose it
-                # silently — full E support needs an option_e column/migration.
-                logger.warning(
-                    "option_e_dropped_at_persistence",
-                    project_id=project_id,
-                    question=rq.get("question_number"),
-                )
+            # Store the REAL labels/order (migration 007). No E-drop, no
+            # relabelling — a,b,d,e or Cyrillic А,Б,Д,Е are preserved exactly.
+            options_json = [
+                {"letter": str(k), "text": v}
+                for k, v in opts.items() if v and str(v).strip()
+            ]
             session.add(Question(
                 project_id=uuid.UUID(project_id),
                 question_number=rq.get("question_number", 0),
                 question_text=rq.get("question_text", ""),
-                option_a=opts.get("A"),
-                option_b=opts.get("B"),
-                option_c=opts.get("C"),
-                option_d=opts.get("D"),
+                options=options_json,
+                # Legacy columns left NULL for new rows (readers use `options`).
                 correct_answer=rq.get("correct_answer"),
                 has_image=rq.get("has_image", False),
                 image_path=rq.get("image_path"),

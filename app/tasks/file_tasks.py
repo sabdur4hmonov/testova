@@ -88,14 +88,16 @@ def process_uploaded_file(
                 # Persist questions
                 for rq in raw_questions:
                     opts = rq.get("options", {})
+                    # Label-preserving JSON (migration 007), same as pipeline.py.
+                    options_json = [
+                        {"letter": str(k), "text": v}
+                        for k, v in opts.items() if v and str(v).strip()
+                    ]
                     q = Question(
                         project_id=uuid.UUID(project_id),
                         question_number=rq.get("question_number", 0),
                         question_text=rq.get("question_text", ""),
-                        option_a=opts.get("A"),
-                        option_b=opts.get("B"),
-                        option_c=opts.get("C"),
-                        option_d=opts.get("D"),
+                        options=options_json,
                         correct_answer=rq.get("correct_answer"),
                         has_image=rq.get("has_image", False),
                         image_path=rq.get("image_path"),
