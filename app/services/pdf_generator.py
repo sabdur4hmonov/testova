@@ -390,9 +390,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                     spaceAfter=2 * mm,
                 ))
             else:
-                # Answer options (multiple-choice only)
-                for letter in ["A", "B", "C", "D", "E"]:
-                    opt_text = options.get(letter)
+                # Answer options (multiple-choice only). Iterate the REAL labels
+                # in printed order (Latin or Cyrillic, gaps preserved) — never a
+                # fixed A..E list, which would drop Cyrillic labels.
+                for letter, opt_text in options.items():
                     if opt_text:
                         story.append(Paragraph(
                             f"{letter}) {render_to_markup(opt_text)}", STYLES["option"]
@@ -696,8 +697,8 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                                         color=colors.HexColor("#aaaaaa"),
                                         dash=(2, 4), spaceAfter=1.5 * mm))
             else:
-                for letter in ["A", "B", "C", "D", "E"]:
-                    opt_text = options.get(letter)
+                # Real labels in printed order (any script, gaps preserved).
+                for letter, opt_text in options.items():
                     if opt_text:
                         mk = _fit_imgs(render_to_markup(opt_text), opt_max_w)
                         block.extend(_compact_flowables(
