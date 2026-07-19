@@ -466,7 +466,10 @@ async def apply_key_text(
     async with async_session_factory() as session:
         from sqlalchemy import select
         res = await session.execute(
-            select(Question).where(Question.project_id == uuid.UUID(project_id))
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: invisible everywhere
+            )
         )
         rows = res.scalars().all()
 
@@ -555,7 +558,10 @@ async def _maybe_start_dup_resolution(
     async with async_session_factory() as session:
         from sqlalchemy import select
         res = await session.execute(
-            select(Question).where(Question.project_id == uuid.UUID(project_id))
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: invisible everywhere
+            )
         )
         rows = res.scalars().all()
 
@@ -793,7 +799,10 @@ async def handle_reextract(
         )
         project = pres.scalar_one_or_none()
         qres = await session.execute(
-            select(Question).where(Question.project_id == uuid.UUID(project_id))
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: invisible everywhere
+            )
         )
         rows = qres.scalars().all()
 
@@ -833,7 +842,10 @@ async def handle_reextract(
     async with async_session_factory() as session:
         from sqlalchemy import select
         qres = await session.execute(
-            select(Question).where(Question.project_id == uuid.UUID(project_id))
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: invisible everywhere
+            )
         )
         for r in qres.scalars().all():
             item = fresh.get(r.question_number)
@@ -913,7 +925,10 @@ async def handle_dup_resolution(
         async with async_session_factory() as session:
             from sqlalchemy import select
             res = await session.execute(
-                select(Question).where(Question.project_id == uuid.UUID(project_id))
+                select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: invisible everywhere
+            )
             )
             removed = 0
             for r in res.scalars().all():
@@ -1024,7 +1039,10 @@ async def _generate_and_send(
         from sqlalchemy import select
         res = await session.execute(
             select(Question)
-            .where(Question.project_id == uuid.UUID(project_id))
+            .where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),  # soft-delete: excluded from generation
+            )
             .order_by(Question.question_number)
         )
         questions = res.scalars().all()

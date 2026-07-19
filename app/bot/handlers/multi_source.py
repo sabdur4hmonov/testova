@@ -282,7 +282,10 @@ async def _load_pool(session_id: str) -> tuple[list[dict], list[list], list[list
         from sqlalchemy import select
         for src in sources:
             res = await session.execute(
-                select(Question).where(Question.project_id == src.project_id)
+                select(Question).where(
+                    Question.project_id == src.project_id,
+                    Question.is_deleted.is_(False),  # soft-delete: excluded from pool
+                )
                 .order_by(Question.question_number)
             )
             questions_by_source.append([

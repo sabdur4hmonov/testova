@@ -156,7 +156,10 @@ def generate_variant_pdfs(
 
             q_result = await session.execute(
                 select(Question)
-                .where(Question.project_id == uuid.UUID(project_id))
+                .where(
+                    Question.project_id == uuid.UUID(project_id),
+                    Question.is_deleted.is_(False),  # soft-delete: excluded from generation
+                )
                 .order_by(Question.question_number)
             )
             questions = q_result.scalars().all()
