@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from app.bot.handlers.upload import (
+    _labels_hint,
     _summary_message,
     apply_key_text,
     run_pipeline_with_heartbeat,
@@ -106,9 +107,9 @@ BT = {
         "ru": "⚠️ Этот файл уже добавлен в сессию ({filename}). Повторное добавление удвоит каждый вопрос.",
     },
     "file_added": {
-        "uz": "✅ {i}-fayl qo'shildi: {n} ta savol.\nEndi SHU fayl uchun javoblar kalitini yuboring (masalan: <code>1A 2B 3C</code>, o'tkazish: <code>5-</code>):",
-        "en": "✅ File {i} added: {n} questions.\nNow send THIS file's answer key (e.g. <code>1A 2B 3C</code>, skip: <code>5-</code>):",
-        "ru": "✅ Файл {i} добавлен: {n} вопросов.\nТеперь отправьте ключ ответов ЭТОГО файла (напр. <code>1A 2B 3C</code>, пропуск: <code>5-</code>):",
+        "uz": "✅ {i}-fayl qo'shildi: {n} ta savol.\nEndi SHU fayl uchun javoblar kalitini yuboring.\n\n📋 Har bir savol variantlari (aynan shu harflarni kiriting):\n{labels}\n\nMasalan: <code>1a 2b</code>. O'tkazib yuborish: <code>5-</code>",
+        "en": "✅ File {i} added: {n} questions.\nNow send THIS file's answer key.\n\n📋 Each question's real options (type exactly these letters):\n{labels}\n\nExample: <code>1a 2b</code>. Skip: <code>5-</code>",
+        "ru": "✅ Файл {i} добавлен: {n} вопросов.\nТеперь отправьте ключ ответов ЭТОГО файла.\n\n📋 Реальные варианты каждого вопроса (введите именно эти буквы):\n{labels}\n\nНапример: <code>1a 2b</code>. Пропустить: <code>5-</code>",
     },
     "key_done": {
         "uz": "✅ Kalit qabul qilindi. Sessiyada: {files} ta fayl, {questions} ta savol.",
@@ -547,7 +548,8 @@ async def _process_builder_file(
     await state.set_state(BuilderStates.waiting_for_answers)
 
     await status_msg.edit_text(
-        bt("file_added", lang, i=file_index, n=len(result.questions)),
+        bt("file_added", lang, i=file_index, n=len(result.questions),
+           labels=_labels_hint(result.questions)),
         parse_mode="HTML",
     )
     await message.answer(_summary_message(result.sections[0], result.quality, lang))

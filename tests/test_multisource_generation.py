@@ -162,6 +162,20 @@ class _User:
     language = type("L", (), {"value": "uz"})()
 
 
+# ── Stage 4.5b: the per-file key prompt shows REAL labels, not "1A 2B 3C" ─────
+
+def test_file_added_prompt_shows_real_gapped_labels():
+    from app.bot.handlers.multi_source import bt
+    from app.bot.handlers.upload import _labels_hint
+
+    qs = [{"question_number": 1, "options": {"a": "x", "b": "y", "d": "z", "e": "w"}},
+          {"question_number": 19, "options": {}}]   # gapped MC + open
+    for lang in ("uz", "en", "ru"):
+        msg = bt("file_added", lang, i=1, n=2, labels=_labels_hint(qs))
+        assert "1) abde" in msg and "19) ✍️" in msg   # real labels rendered
+        assert "1A 2B 3C" not in msg                  # stale static hint gone
+
+
 def test_4_generation_error_code_and_retry(monkeypatch):
     from app.bot.handlers import multi_source as ms
 
