@@ -99,6 +99,34 @@ def test_empty_word_body_rejected():
     assert reason
 
 
+# ── Bug A: a bare slash/comma inside a value is LITERAL, not a separator ──────
+def test_fraction_stays_single_literal():
+    # "1/2" must NOT split into ["1","2"] — it's the fraction, one accepted answer.
+    key, reason = parse_answer_key("20: 1/2")
+    assert reason == "" and key == {20: ["1/2"]}
+
+
+def test_ratio_slash_stays_literal():
+    key, reason = parse_answer_key("7: a/b")
+    assert reason == "" and key == {7: ["a/b".upper()]}   # normalised, still one item
+
+
+def test_comma_answer_stays_single_literal():
+    key, reason = parse_answer_key("19: 8,23")
+    assert reason == "" and key == {19: ["8,23"]}
+
+
+def test_comma_list_answer_stays_single_literal():
+    key, reason = parse_answer_key("24: 1000 g, 400 g, 600 g")
+    assert reason == "" and key == {24: ["1000 G, 400 G, 600 G"]}
+
+
+def test_spaced_slash_still_multi_accepts():
+    # The documented multi-accept form (spaces around /) is unchanged.
+    key, reason = parse_answer_key("22: PHONE / TELEPHONE")
+    assert reason == "" and key == {22: ["PHONE", "TELEPHONE"]}
+
+
 def test_invalid_letter_line_alongside_word_still_rejected():
     # A genuinely invalid letter (X) on a letter line rejects the whole key,
     # even next to a valid written answer. (E is now a valid option letter, so

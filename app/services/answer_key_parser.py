@@ -131,8 +131,19 @@ def _parse_letters(text: str) -> tuple[dict[int, str], str]:
 
 
 def _items(segment: str) -> list[str]:
-    """One answer segment → accepted list (split on '/', normalised, non-empty)."""
-    return [i for i in (_norm_item(p) for p in segment.split("/")) if i]
+    """One answer segment → accepted list.
+
+    Multi-accept splits ONLY on a SPACED slash (" / "), matching the documented
+    "PHONE / TELEPHONE" format. A bare slash inside a token — a fraction "1/2", a
+    ratio "a/b" — is NOT a separator, so the answer stays a single literal value
+    (this is the Bug-A fix: "1/2" used to silently become ["1","2"]). An item that
+    is only punctuation/slashes (no alphanumerics) is dropped, so "5: /" is still
+    an EMPTY answer and gets rejected rather than stored as "/"."""
+    parts = re.split(r"\s+/\s+", segment)
+    return [
+        i for i in (_norm_item(p) for p in parts)
+        if i and any(ch.isalnum() for ch in i)
+    ]
 
 
 def _split_written_line(line: str) -> tuple[dict[int, list[str]] | None, str]:
