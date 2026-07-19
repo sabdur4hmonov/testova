@@ -70,14 +70,14 @@ T = {
     "analyzing":  {"uz": "⏳ Tahlil qilinmoqda... (bir oz kuting)", "en": "⏳ Analysing... (please wait)", "ru": "⏳ Анализирую... (подождите)"},
     "no_q":       {"uz": "❌ Hech qanday savol topilmadi.\n\nFayl aniq va o'qilishi oson bo'lishi kerak.", "en": "❌ No questions found.\n\nMake sure the file is clear and readable.", "ru": "❌ Вопросы не найдены.\n\nУбедитесь, что файл чёткий и читаемый."},
     "ans_missing": {
-        "uz": "✅ <b>{n} ta savol</b> topildi!\n\n⚠️ Quyidagi savollarda to'g'ri javob aniqlanmadi:\n<code>{missing}</code>\n\nTo'g'ri javoblarni kiriting:\n<i>Masalan: <code>1A 2B 5C 10D</code></i>\n\nYoki o'tkazib yuborish: <code>-</code>",
-        "en": "✅ <b>{n} questions</b> found!\n\n⚠️ Correct answers not detected for:\n<code>{missing}</code>\n\nEnter correct answers:\n<i>Example: <code>1A 2B 5C 10D</code></i>\n\nOr skip: <code>-</code>",
-        "ru": "✅ Найдено <b>{n} вопросов</b>!\n\n⚠️ Правильные ответы не определены для:\n<code>{missing}</code>\n\nВведите правильные ответы:\n<i>Пример: <code>1A 2B 5C 10D</code></i>\n\nИли пропустить: <code>-</code>",
+        "uz": "✅ <b>{n} ta savol</b> topildi!\n\n⚠️ Bu savollarda javob aniqlanmadi: <code>{missing}</code>\n\n📋 Har bir savol variantlari (aynan shu harflarni kiriting):\n{labels}\n\nMasalan: <code>1a 2b</code>. O'tkazib yuborish: <code>-</code>",
+        "en": "✅ <b>{n} questions</b> found!\n\n⚠️ Correct answers not detected for: <code>{missing}</code>\n\n📋 Each question's real options (type exactly these letters):\n{labels}\n\nExample: <code>1a 2b</code>. Skip: <code>-</code>",
+        "ru": "✅ Найдено <b>{n} вопросов</b>!\n\n⚠️ Ответы не определены для: <code>{missing}</code>\n\n📋 Реальные варианты каждого вопроса (введите именно эти буквы):\n{labels}\n\nНапример: <code>1a 2b</code>. Пропустить: <code>-</code>",
     },
     "ans_all": {
-        "uz": "✅ <b>{n} ta savol</b> topildi!\n\nBarcha to'g'ri javoblar avtomatik aniqlandi.\n\nJavoblarni o'zgartirish uchun kiriting (<code>1A 2B 3C</code>)\nYoki o'tkazib yuborish: <code>-</code>",
-        "en": "✅ <b>{n} questions</b> found!\n\nAll correct answers were auto-detected.\n\nTo change any, enter them (e.g. <code>1A 2B 3C</code>)\nOr skip: <code>-</code>",
-        "ru": "✅ Найдено <b>{n} вопросов</b>!\n\nВсе правильные ответы определены автоматически.\n\nЧтобы изменить, введите (напр. <code>1A 2B 3C</code>)\nИли пропустить: <code>-</code>",
+        "uz": "✅ <b>{n} ta savol</b> topildi!\n\nBarcha javoblar avtomatik aniqlandi.\n\n📋 Har bir savol variantlari:\n{labels}\n\nO'zgartirish uchun kiriting (<code>1a 2b</code>). O'tkazish: <code>-</code>",
+        "en": "✅ <b>{n} questions</b> found!\n\nAll answers were auto-detected.\n\n📋 Each question's real options:\n{labels}\n\nTo change any, enter them (<code>1a 2b</code>). Skip: <code>-</code>",
+        "ru": "✅ Найдено <b>{n} вопросов</b>!\n\nВсе ответы определены автоматически.\n\n📋 Реальные варианты вопросов:\n{labels}\n\nЧтобы изменить, введите (<code>1a 2b</code>). Пропустить: <code>-</code>",
     },
     "ask_count":  {"uz": "✏️ Nechta variant kerak? (1 dan 100 gacha son kiriting):", "en": "✏️ How many variants do you need? (enter 1–100):", "ru": "✏️ Сколько вариантов? (введите число 1–100):"},
     "bad_count":  {"uz": "❌ 1 dan 100 gacha son kiriting.", "en": "❌ Enter a number between 1 and 100.", "ru": "❌ Введите число от 1 до 100."},
@@ -244,6 +244,20 @@ KEY_REASONS = {
 
 def _key_reason(kind: str, lang: str, **kw) -> str:
     return KEY_REASONS[kind].get(lang, KEY_REASONS[kind]["en"]).format(**kw)
+
+
+def _labels_hint(questions: list[dict]) -> str:
+    """Compact per-question option-label hint, e.g. "1) abde · 2) abcd · 19) ✍️".
+
+    Shows each question's REAL option labels (which may skip letters, like a,b,d,e)
+    so the teacher types the actual letters instead of guessing contiguous A-D.
+    Open-ended (no options) questions are marked ✍️ (write-in)."""
+    parts = []
+    for q in sorted(questions, key=lambda x: (x.get("question_number") or 0)):
+        num = q.get("question_number")
+        labels = [str(k) for k in (q.get("options") or {}).keys()]
+        parts.append(f"{num}) {''.join(labels)}" if labels else f"{num}) ✍️")
+    return " · ".join(parts)
 
 
 def _parse_answer_input(text: str, question_count: int) -> dict[str, str]:
@@ -679,13 +693,16 @@ async def _run_extraction(
     await state.set_state(UploadStates.waiting_for_answers)
 
     n = len(result.questions)
+    labels = _labels_hint(result.questions)
     if result.missing_nums:
         await status_msg.edit_text(
-            t("ans_missing", lang, n=n, missing=", ".join(result.missing_nums)),
+            t("ans_missing", lang, n=n,
+              missing=", ".join(result.missing_nums), labels=labels),
             parse_mode="HTML",
         )
     else:
-        await status_msg.edit_text(t("ans_all", lang, n=n), parse_mode="HTML")
+        await status_msg.edit_text(
+            t("ans_all", lang, n=n, labels=labels), parse_mode="HTML")
 
     await message.answer(
         _summary_message(result.sections[0], result.quality, lang),
