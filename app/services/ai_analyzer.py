@@ -71,6 +71,11 @@ CRITICAL RULES:
    - Do NOT renumber or relabel. Do NOT convert Cyrillic labels to Latin.
    - Do NOT fill gaps: a paper printed "a) b) d) e)" returns keys "a","b","d","e"
      with NO "c". A paper with five options returns five keys.
+   - Options may run INLINE on one line, and an option's TEXT may itself contain
+     inner numbering like "1)...2)..." (e.g. "a) 1)14sm,2)48sm; b) 1)15sm...").
+     That inner numbering is part of the option TEXT — it is NOT a label. Key
+     each option by its printed marker (a, b, d, e...) exactly, and NEVER
+     renumber them into a fresh A,B,C,D sequence.
    - "ans" (if you can see the marked/correct option) must be one of these exact
      labels.
 7. If answer options are NOT visible on this page (cut off), return "opts": {}
@@ -256,6 +261,10 @@ Return ONLY a JSON array, one item per question number:
 
 CRITICAL RULES:
 - Copy option text EXACTLY as printed; keep math symbols (∈ ∅ π √ ...) as real Unicode
+- Use the EXACT printed marker as each option's label — keep gaps (a,b,d,e stays
+  a,b,d,e, no "c") and keep Cyrillic labels as-is. Inner numbering inside an
+  option's text ("1)...2)...") is part of the TEXT, not a label. NEVER renumber
+  the options into a fresh A,B,C,D sequence.
 - If a question genuinely has NO printed options anywhere on these pages,
   return "" for all its letters
 - NEVER invent, guess or complete options that are not printed on the pages
