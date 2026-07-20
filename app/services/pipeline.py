@@ -29,6 +29,7 @@ from app.services.ai_analyzer import (
     summarize_sections,
 )
 from app.services.file_processor import (
+    attach_docx_inline_images,
     attach_images_to_questions,
     compute_page_infos,
     docx_to_images,
@@ -183,6 +184,15 @@ async def process_file(
         col_map,
         src_pages,
     )
+
+    # DOCX has no page geometry to crop from, so figures are attached here
+    # instead: pair the document's ordered inline images with the flagged
+    # questions, count-guarded (never a wrong figure). PDF/image sources are
+    # unaffected — attach_images_to_questions already handled them above.
+    if file_type == "docx":
+        await asyncio.to_thread(
+            attach_docx_inline_images, all_questions, content
+        )
 
     # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
     scheme_failed = await analyzer.ensure_scheme_content(

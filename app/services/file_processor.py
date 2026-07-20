@@ -1395,6 +1395,90 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
     return pages, text_content
 
 
+def _save_docx_image(pic: Image.Image) -> str | None:
+    """Save one decoded DOCX inline image as PNG in IMAGE_SAVE_DIR.
+
+    The `docximg_` filename prefix is a deliberate marker: the PDF renderer
+    reads it to size the image fit-to-column. A CROP_DPI crop has a known
+    physical size (pixels / CROP_DPI inches); a DOCX-embedded image does NOT —
+    it is arbitrary pixels — so the two must be sized differently.
+    """
+    try:
+        save_dir = _ensure_image_dir()
+        path = save_dir / f"docximg_{uuid.uuid4().hex[:10]}.png"
+        pic.save(str(path), format="PNG")
+        logger.info(
+            "docx_image_saved", path=str(path), size=f"{pic.width}x{pic.height}"
+        )
+        return str(path)
+    except Exception as e:
+        logger.warning("docx_image_save_failed", error=str(e))
+        return None
+
+
+def docx_extract_ordered_images(docx_bytes: bytes) -> list[Image.Image]:
+    """Every inline image in the DOCX, IN DOCUMENT (reading) ORDER.
+
+    Kept SEPARATE from docx_to_images (whose 2-tuple return other callers rely
+    on). Best-effort: a malformed document or an undecodable picture is
+    skipped, never raised. The a:blip -> r:embed -> media lookup lives in
+    _para_inline_images and is reused verbatim.
+    """
+    out: list[Image.Image] = []
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception as e:
+        logger.warning("docx_open_failed", error=str(e))
+        return out
+    try:
+        for block in _iter_docx_blocks(doc):
+            if isinstance(block, _DocxParagraph):
+                out.extend(_para_inline_images(doc, block))
+            elif isinstance(block, _DocxTable):
+                # images inside table cells, cell-by-cell in reading order
+                for row in block.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            out.extend(_para_inline_images(doc, para))
+    except Exception as e:
+        logger.warning("docx_ordered_images_failed", error=str(e))
+    return out
+
+
+def attach_docx_inline_images(questions: list[dict], docx_bytes: bytes) -> int:
+    """Attach a DOCX's embedded images to the questions Gemini flagged.
+
+    DOCX has no page geometry, so figures can't be cropped by rect like a PDF.
+    Instead we pair the ordered inline images with the flagged questions IN
+    QUESTION ORDER — but ONLY when the two counts match EXACTLY. A mismatch
+    attaches nothing and the description box still renders, mirroring the PDF
+    rule (principle: never attach a WRONG figure). Only fills questions that
+    have has_image=True and no image_path yet. Returns the count attached.
+    """
+    images = docx_extract_ordered_images(docx_bytes)
+    if not images:
+        return 0
+    flagged = sorted(
+        (q for q in questions
+         if q.get("has_image") and not q.get("image_path")),
+        key=lambda q: q.get("question_number", 0),
+    )
+    if len(flagged) != len(images):
+        logger.info(
+            "docx_image_count_mismatch",
+            images=len(images), flagged=len(flagged),
+        )
+        return 0
+    attached = 0
+    for q, pic in zip(flagged, images):
+        path = _save_docx_image(pic)
+        if path:
+            q["image_path"] = path
+            attached += 1
+    logger.info("docx_images_attached", count=attached)
+    return attached
+
+
 def docx_extract_text(docx_bytes: bytes) -> str:
     doc = Document(io.BytesIO(docx_bytes))
     lines: list[str] = []

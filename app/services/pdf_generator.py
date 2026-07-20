@@ -240,14 +240,23 @@ def _load_image_rl(image_path: str, max_width: float = 10 * cm) -> RLImage | Non
         # BUG FIX: keep buf alive — attach it to the object so GC won't collect it
         rl_img._buf_ref = buf
 
-        # DPI-aware sizing: crops are rendered at CROP_DPI, so their true
-        # physical size is pixels/CROP_DPI inches. Cap at the column width,
-        # NEVER upscale a small crop past its natural print size.
-        from app.services.file_processor import CROP_DPI
-        natural_w_pt = rl_img.imageWidth * 72.0 / CROP_DPI
         aspect = rl_img.imageHeight / rl_img.imageWidth
-        rl_img.drawWidth  = min(max_width, natural_w_pt)
-        rl_img.drawHeight = rl_img.drawWidth * aspect
+
+        # Two image kinds need different sizing:
+        #  - PDF figure CROPS are rendered at CROP_DPI, so their true physical
+        #    size is pixels/CROP_DPI inches — cap at the column, NEVER upscale
+        #    a sharp crop past its natural print size.
+        #  - DOCX EMBEDDED images (filename prefix "docximg_") are arbitrary
+        #    pixels with no fixed render DPI, so a CROP_DPI reading would print
+        #    them postage-stamp small. Fit them TO the column width instead.
+        if Path(image_path).name.startswith("docximg_"):
+            rl_img.drawWidth  = max_width
+            rl_img.drawHeight = max_width * aspect
+        else:
+            from app.services.file_processor import CROP_DPI
+            natural_w_pt = rl_img.imageWidth * 72.0 / CROP_DPI
+            rl_img.drawWidth  = min(max_width, natural_w_pt)
+            rl_img.drawHeight = rl_img.drawWidth * aspect
 
         # Cap height so it never overflows a page
         max_height = PAGE_HEIGHT - 2 * MARGIN - 4 * cm
