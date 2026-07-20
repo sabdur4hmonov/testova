@@ -587,16 +587,24 @@ def _expand_with_labels(
     xlo, xhi = x0 - 12, x1 + 12
     margin = max(union.height * 1.6, 18.0)
     win_top = max(y_top, union.y0 - margin)
-    win_bot = min(y_bottom, union.y1 + margin)
 
-    # never expand into the options block: stop just above the first option
-    # marker sitting below the figure
+    # Downward window: a thin diagram (a bare line/segment) prints its labels
+    # ("A", "B", "c") a little BELOW the strokes — often further than the fixed
+    # `margin`, which was tuned for labels hugging the figure. So when there is
+    # an options block below, extend the window DOWN to just above the first
+    # option line (capped at the question's band) and let those labels in. The
+    # option markers and question numbers are still excluded from the figure box
+    # below, and the crop is re-checked by the garbage detector afterwards, so
+    # this never swallows the stem or the options. Open-ended questions (no
+    # option line below) keep the original fixed-margin fallback.
     opt_below = [
         w[1] for w in words
         if _OPTION_MARKER_RE.match(str(w[4]).strip()) and (w[1] + w[3]) / 2 > union.y1
     ]
     if opt_below:
-        win_bot = min(win_bot, min(opt_below) - 2)
+        win_bot = min(y_bottom, min(opt_below) - 2)
+    else:
+        win_bot = min(y_bottom, union.y1 + margin)
 
     fig = fitz.Rect(union)
     for w in words:
@@ -686,8 +694,11 @@ def _find_drawing_figure_rect(
 
 # ── Crop sanity check (FIX 1: garbage detector) ──────────────────────────────
 
-# Option marker word: "A)" .. "E)" (Latin or Cyrillic), possibly glued ("A)2")
-_OPTION_MARKER_RE = re.compile(r'^[A-EА-Е]\)')
+# Option marker word: "A)" .. "E)" (Latin or Cyrillic), possibly glued ("A)2").
+# Case-INSENSITIVE: a paper may label its options lowercase (a), b), d), e)) —
+# those must be recognised as the options boundary too, otherwise a figure crop
+# can run straight through them and the garbage/recrop guards can't stop at them.
+_OPTION_MARKER_RE = re.compile(r'^[A-Ea-eА-Еа-е]\)')
 # Question-number word: "12." / "12)" but NOT decimals like "0.5"
 _QNUM_WORD_RE = re.compile(r'^(\d{1,2})[.)](?!\d)')
 
