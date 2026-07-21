@@ -204,6 +204,11 @@ T = {
         "en": "🔍 Suspicious questions — compare with the source file: {nums}",
         "ru": "🔍 Подозрительные вопросы — сверьте с исходным файлом: {nums}",
     },
+    "label_doubt_info": {
+        "uz": "🔤 Variant harflarini (a, b, d, e...) asl fayl bilan solishtiring: {nums}",
+        "en": "🔤 Check the option letters (a, b, d, e...) against the source file: {nums}",
+        "ru": "🔤 Сверьте буквы вариантов (a, b, d, e...) с исходным файлом: {nums}",
+    },
     "reextracting": {
         "uz": "🔁 Shubhali savollar qayta o'qilmoqda...",
         "en": "🔁 Re-reading the suspicious questions...",
@@ -420,6 +425,12 @@ def _summary_message(meta: dict, quality: dict, lang: str) -> str:
         lines.append(t(
             "suspicious_info", lang,
             nums=", ".join(str(s[1]) for s in susp),
+        ))
+    doubt = [d for d in quality.get("label_doubt", []) if d[0] == sec]
+    if doubt:
+        lines.append(t(
+            "label_doubt_info", lang,
+            nums=", ".join(str(d[1]) for d in doubt),
         ))
     unans = [u for u in quality.get("unanswerable", []) if u[0] == sec]
     if unans:

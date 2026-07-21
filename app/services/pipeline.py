@@ -273,6 +273,14 @@ async def process_file(
         "suspicious": [list(s) for s in suspicious],
         "unanswerable": [[u[0], u[1], ",".join(u[2])] for u in unanswerable],
         "ocr_fixes": [[sec, n] for sec, n in sorted(ocr_by_sec.items())],
+        # Option-label backstop couldn't confirm these from the text layer — the
+        # teacher should eyeball the labels against the source. Kept SEPARATE
+        # from "suspicious" on purpose: it must NOT drive the Gemini re-read (a
+        # re-read wouldn't fix labels and would burn quota).
+        "label_doubt": [
+            [q.get("section", 1), q.get("question_number", 0)]
+            for q in all_questions if q.get("label_doubt")
+        ],
     }
 
     # CHANGE 2: NOTHING is removed at extraction time.
