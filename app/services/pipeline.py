@@ -28,6 +28,7 @@ from app.services.ai_analyzer import (
     sections_confident,
     summarize_sections,
 )
+from app.services.option_label_recovery import recover_pdf_option_labels
 from app.services.file_processor import (
     attach_docx_inline_images,
     attach_images_to_questions,
@@ -192,6 +193,16 @@ async def process_file(
     if file_type == "docx":
         await asyncio.to_thread(
             attach_docx_inline_images, all_questions, content
+        )
+
+    # Deterministic option-label backstop (PDF text layer): correct Gemini's
+    # non-deterministic per-page relabelling (a,b,d,e -> A,B,C,D) by reading the
+    # ACTUAL printed markers. Count-guarded; unconfirmed questions get
+    # label_doubt (surfaced in the suspicious report below). PDF only — DOCX and
+    # scanned PDFs fall through untouched.
+    if _pdf_bytes_for_crop:
+        await asyncio.to_thread(
+            recover_pdf_option_labels, _pdf_bytes_for_crop, all_questions
         )
 
     # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
