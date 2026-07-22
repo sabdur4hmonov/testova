@@ -119,6 +119,15 @@ class _RecLogger:
         pass
 
 
+# ── (0) the per-file prompt describes "5-" as DELETE, not skip ───────────────
+def test_file_added_prompt_says_delete_not_skip():
+    for lang in ("uz", "en", "ru"):
+        msg = ms.bt("file_added", lang, i=1, n=10, labels="1) abde")
+        assert "5-" in msg
+        assert any(w in msg.lower() for w in ("o'chir", "delete", "удал"))
+    assert "skip" not in ms.bt("file_added", "en", i=1, n=10, labels="x").lower()
+
+
 # ── (1) "23: -" pins project + filename and names the file ───────────────────
 async def test_dash_number_pins_and_names_file(monkeypatch):
     async def fake_apply(project_id, text, key_max, answers, lang, delete_mode):

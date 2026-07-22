@@ -108,9 +108,9 @@ BT = {
         "ru": "⚠️ Этот файл уже добавлен в сессию ({filename}). Повторное добавление удвоит каждый вопрос.",
     },
     "file_added": {
-        "uz": "✅ {i}-fayl qo'shildi: {n} ta savol.\nEndi SHU fayl uchun javoblar kalitini yuboring.\n\n📋 Har bir savol variantlari (aynan shu harflarni kiriting):\n{labels}\n\nMasalan: <code>1a 2b</code>. O'tkazib yuborish: <code>5-</code>",
-        "en": "✅ File {i} added: {n} questions.\nNow send THIS file's answer key.\n\n📋 Each question's real options (type exactly these letters):\n{labels}\n\nExample: <code>1a 2b</code>. Skip: <code>5-</code>",
-        "ru": "✅ Файл {i} добавлен: {n} вопросов.\nТеперь отправьте ключ ответов ЭТОГО файла.\n\n📋 Реальные варианты каждого вопроса (введите именно эти буквы):\n{labels}\n\nНапример: <code>1a 2b</code>. Пропустить: <code>5-</code>",
+        "uz": "✅ {i}-fayl qo'shildi: {n} ta savol.\nEndi SHU fayl uchun javoblar kalitini yuboring.\n\n📋 Har bir savol variantlari (aynan shu harflarni kiriting):\n{labels}\n\nMasalan: <code>1a 2b</code>. Savolni o'chirish (tasdiqlash bilan): <code>5-</code>",
+        "en": "✅ File {i} added: {n} questions.\nNow send THIS file's answer key.\n\n📋 Each question's real options (type exactly these letters):\n{labels}\n\nExample: <code>1a 2b</code>. Delete a question (asks to confirm): <code>5-</code>",
+        "ru": "✅ Файл {i} добавлен: {n} вопросов.\nТеперь отправьте ключ ответов ЭТОГО файла.\n\n📋 Реальные варианты каждого вопроса (введите именно эти буквы):\n{labels}\n\nНапример: <code>1a 2b</code>. Удалить вопрос (с подтверждением): <code>5-</code>",
     },
     "key_done": {
         "uz": "✅ Kalit qabul qilindi. Sessiyada: {files} ta fayl, {questions} ta savol.",
