@@ -417,10 +417,14 @@ async def handle_answer_sheet_upload(
         await message.answer(_UNREADABLE.get(lang, _UNREADABLE["uz"]))
         return  # unreadable sheet — stay and let them retake
 
-    # Name fallback: caption → OCR → optional prompt (type or /skip).
-    if not name:
+    # Name fallback/confirm (parity with the manual flow): prompt when the name
+    # is blank OR the sheet-reader flagged it unclear. A present-but-unclear name
+    # gets the confirm wording; a blank one gets the plain prompt.
+    needs_name = (name is None) or bool(read.get("name_unclear"))
+    if needs_name:
         await state.set_state(CheckingStates.waiting_for_saved_name)
-        await message.answer(_STUDENT_NAME_PROMPT.get(lang, _STUDENT_NAME_PROMPT["uz"]))
+        prompt = _NAME_CONFIRM_PROMPT if name else _STUDENT_NAME_PROMPT
+        await message.answer(prompt.get(lang, prompt["uz"]))
         return
 
     await _resolve_saved_variant(message, state, db_user, name)
