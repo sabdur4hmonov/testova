@@ -783,6 +783,22 @@ def _strip_own_number(q: dict) -> None:
         logger.info("own_number_stripped", question=n)
 
 
+def _strip_leading_backticks(q: dict) -> None:
+    """Drop a leading run of stray backticks (markdown / code-fence bleed) when
+    they open the stem with no number after — the number+markdown case is already
+    handled by _strip_own_number. The prompt forbids markdown, so a leading
+    backtick is never real stem content. Scoped to BACKTICKS only — unlike a
+    leading `*`/`_` (which could be intentional math/emphasis), a leading
+    backtick is always an artifact, so the whole leading run is dropped. Runs
+    AFTER _strip_own_number, so it only touches the residual no-number case
+    (e.g. "`Hisoblang:" -> "Hisoblang:")."""
+    text = q.get("question_text") or ""
+    new = re.sub(r'^\s*`+\s*', '', text, count=1)
+    if new != text:
+        q["question_text"] = new
+        logger.info("leading_backticks_stripped", question=q.get("question_number"))
+
+
 _UNKNOWN_NODE = r'[XYZ][₀-₉0-9]*'
 
 
@@ -1183,6 +1199,7 @@ class AIAnalyzer:
         # ── Post-extraction stem cleaning (ISSUES 1, 4b, 4d) ─────────────────
         for q in unique:
             _strip_own_number(q)
+            _strip_leading_backticks(q)
             _strip_inline_options(q)
             q["question_text"] = canonicalize_chain_text(q.get("question_text"))
 
