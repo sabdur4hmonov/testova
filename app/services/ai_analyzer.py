@@ -772,7 +772,12 @@ def _strip_own_number(q: dict) -> None:
     if not n:
         return
     text = q.get("question_text") or ""
-    new = re.sub(rf'^\s*{n}\s*[.)]\s*', '', text, count=1)
+    # Tolerate a SHORT leading run of markdown/code artifacts Gemini occasionally
+    # leaks before the number — a stray backtick, a ``` fence, ** , etc. Bounded
+    # to 0-4 such chars so it can never eat into real stem text, and still gated
+    # on {n}[.)], so this strips ONLY the question's OWN number: a list marker
+    # "1)" (1 != n) is left intact.
+    new = re.sub(rf'^\s*[`*~_#]{{0,4}}\s*{n}\s*[.)]\s*', '', text, count=1)
     if new != text:
         q["question_text"] = new
         logger.info("own_number_stripped", question=n)
