@@ -574,6 +574,7 @@ async def _grade_saved(
     await state.update_data(
         sheet_answer_key=answer_key,
         sheet_variant_id=str(variant_record.id),
+        sheet_variant_num=variant_num,   # the finalizer needs it after the taps
     )
 
     # Score once, then (step 4) confirm any wrong WRITTEN answers before the
@@ -599,11 +600,19 @@ async def _score_and_maybe_confirm_saved(
         if r.position in text_qs and not r.is_correct and not r.is_skipped
     ]
 
-    # NOTE: the confirm routing (confirm_flow + _advance_confirm) is wired in
-    # step 4. For now every sheet finalizes directly, so behaviour is identical
-    # to the pre-split flow. `wrong_written` is computed here so step 4 only
-    # flips the branch.
-    del wrong_written
+    if wrong_written:
+        # Confirm each wrong WRITTEN answer before the final result (Design B).
+        # confirm_flow tags the queue as "saved" so the shared _advance_confirm
+        # routes back to _grade_saved_cached. Wrong A/B/C/D and correct answers
+        # are never asked (marked options are reliable).
+        await state.update_data(
+            confirm_flow="saved",
+            confirm_pending=wrong_written,
+            confirm_overrides={},
+        )
+        await _advance_confirm(target, state, db_user)
+        return
+
     await _grade_saved_cached(target, state, db_user, variant_num, name)
 
 
@@ -647,8 +656,11 @@ async def _grade_saved_cached(
     )
     # Ready for the next sheet in the same run.
     await state.set_state(CheckingStates.waiting_for_answer_sheet)
-    # Confirm cache no longer needed (parity with the manual finalizer).
-    await state.update_data(confirm_pending=None, confirm_overrides=None)
+    # Confirm cache no longer needed (parity with the manual finalizer). Clearing
+    # confirm_flow keeps the routing key from lingering into the next sheet.
+    await state.update_data(
+        confirm_pending=None, confirm_overrides=None, confirm_flow=None,
+    )
 
     # Save submission record (UNCHANGED — existing shipped behaviour).
     if variant_id:
@@ -1072,11 +1084,17 @@ async def _advance_confirm(target, state: FSMContext, db_user: User) -> None:
     shown, never the AI's read); when the queue empties, grade with overrides."""
     lang = db_user.language.value
     data = await state.get_data()
+    # Flow routing: "saved" reads the saved sheet's key and finalizes via
+    # _grade_saved_cached; ANY other value (including missing/unrecognised)
+    # finalizes as MANUAL — the existing behaviour, so a stray/absent key never
+    # drops a grade.
+    saved = data.get("confirm_flow") == "saved"
+    key_src = (data.get("sheet_answer_key") if saved else data.get("manual_key")) or {}
 
     pending = list(data.get("confirm_pending") or [])
     if pending:
         q = pending[0]
-        correct = " / ".join(accepted_list((data.get("manual_key") or {}).get(str(q)))) or "—"
+        correct = " / ".join(accepted_list(key_src.get(str(q)))) or "—"
         await state.set_state(CheckingStates.waiting_for_confirm)
         await target.answer(
             _CONFIRM_Q.get(lang, _CONFIRM_Q["en"]).format(q=q, correct=correct),
@@ -1085,7 +1103,13 @@ async def _advance_confirm(target, state: FSMContext, db_user: User) -> None:
         return
 
     # Everything confirmed: grade with the teacher's overrides applied.
-    await _grade_manual_cached(target, state, db_user, data.get("student_name"))
+    if saved:
+        await _grade_saved_cached(
+            target, state, db_user,
+            data.get("sheet_variant_num"), data.get("student_name"),
+        )
+    else:
+        await _grade_manual_cached(target, state, db_user, data.get("student_name"))
 
 
 @router.message(CheckingStates.waiting_for_manual_name, F.text)

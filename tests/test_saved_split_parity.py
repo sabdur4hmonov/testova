@@ -141,9 +141,10 @@ async def test_all_correct_clean_path(monkeypatch):
     assert subs[0].correct_count == 2 and subs[0].score == ref.score_percent
 
 
-async def test_wrong_written_still_finalizes_pre_step4(monkeypatch):
-    # Until step 4 wires the confirm routing, a wrong-written sheet finalizes
-    # directly (today's behaviour) — no confirm state, no dropped grade.
+async def test_wrong_written_enters_confirm(monkeypatch):
+    # Step 4: a wrong WRITTEN answer now enters the confirm state (Design B)
+    # instead of finalizing directly — tagged confirm_flow="saved", nothing
+    # persisted yet.
     sink: list = []
     monkeypatch.setattr(C, "async_session_factory", lambda: _CapSession(sink))
 
@@ -155,5 +156,7 @@ async def test_wrong_written_still_finalizes_pre_step4(monkeypatch):
 
     await C._score_and_maybe_confirm_saved(msg, st, FakeUser(), 1, "ALI")
 
-    assert st.state == CheckingStates.waiting_for_answer_sheet   # finalized, no confirm
-    assert len(_rows(sink, "Submission")) == 1
+    assert st.state == CheckingStates.waiting_for_confirm
+    assert st._data.get("confirm_flow") == "saved"
+    assert st._data.get("confirm_pending") == [1]
+    assert len(_rows(sink, "Submission")) == 0   # NOT finalized yet
