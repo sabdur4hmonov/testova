@@ -408,6 +408,12 @@ async def handle_answer_sheet_upload(
     await state.update_data(
         answer_sheet_key=key,
         sheet_answers=answers_str,
+        # Sheet SPLIT cached for the (upcoming) wrong-written confirm step,
+        # mirroring manual_texts/manual_unclear/manual_name_unclear. Inert for
+        # now — nothing consumes these until the saved confirm loop is wired.
+        sheet_texts={str(k): v for k, v in read["texts"].items()},
+        sheet_unclear=read["unclear"],
+        sheet_name_unclear=bool(read.get("name_unclear")),
         valid_variants=sorted(valid),
         pending_variant=candidate,
         student_name=name,
@@ -561,6 +567,11 @@ async def _grade_saved(
         # Stay in the flow so the teacher can retry a different variant/photo.
         await state.set_state(CheckingStates.waiting_for_answer_sheet)
         return
+
+    # Cache the resolved variant's answer key for the (upcoming) wrong-written
+    # confirm step — it needs to show the correct answer per question and
+    # re-grade after overrides without another DB read. Inert for now.
+    await state.update_data(sheet_answer_key=answer_key)
 
     # ── Student answers ───────────────────────────────────────────────────────
     # Already read once at upload and cached in state (position-STRING keys, the
