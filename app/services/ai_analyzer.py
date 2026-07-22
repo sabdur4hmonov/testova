@@ -1584,6 +1584,13 @@ class AIAnalyzer:
         """
         by_page: dict[int, list[dict]] = {}
         for q in questions:
+            # A figure-based WRITE-IN question is legitimately option-less — it is
+            # NOT "options lost during extraction". Sending it to options recovery
+            # wastes a Gemini call and, worse, risks Gemini hallucinating options
+            # off the diagram, converting a real open figure-question into a bogus
+            # MC one (which then grades against a fabricated key). Skip it.
+            if q.get("has_image") or q.get("image_description"):
+                continue
             if q.get("is_open_ended") and not q.get("options"):
                 page = q.get("page_number") or 0
                 if 1 <= page <= len(images):
