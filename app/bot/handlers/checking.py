@@ -568,15 +568,68 @@ async def _grade_saved(
         await state.set_state(CheckingStates.waiting_for_answer_sheet)
         return
 
-    # Cache the resolved variant's answer key for the (upcoming) wrong-written
-    # confirm step — it needs to show the correct answer per question and
-    # re-grade after overrides without another DB read. Inert for now.
-    await state.update_data(sheet_answer_key=answer_key)
+    # Cache the resolved variant's answer key + id for the wrong-written confirm
+    # step — it needs to show the correct answer per question and re-grade after
+    # overrides without another DB read.
+    await state.update_data(
+        sheet_answer_key=answer_key,
+        sheet_variant_id=str(variant_record.id),
+    )
 
-    # ── Student answers ───────────────────────────────────────────────────────
-    # Already read once at upload and cached in state (position-STRING keys, the
-    # exact shape check_answers/the answer key use) — no second Gemini call.
+    # Score once, then (step 4) confirm any wrong WRITTEN answers before the
+    # final result. No wrong written → straight to the final result.
+    await _score_and_maybe_confirm_saved(message, state, db_user, variant_num, name)
+
+
+async def _score_and_maybe_confirm_saved(
+    target, state: FSMContext, db_user: User, variant_num: int, name: str | None
+) -> None:
+    """Saved-flow analog of _score_and_maybe_confirm: score once; if any WRITTEN
+    answer is wrong, confirm those (one at a time) before the final result.
+    Written = the question is in sheet_texts. No wrong written → straight to the
+    final result (byte-for-byte the clean path). `target` supports .answer()."""
+    data = await state.get_data()
     student_answers = data.get("sheet_answers") or {}
+    answer_key = data.get("sheet_answer_key") or {}
+    text_qs = {int(k) for k in (data.get("sheet_texts") or {})}
+
+    res = check_answers(student_answers, answer_key)
+    wrong_written = [
+        r.position for r in res.question_results
+        if r.position in text_qs and not r.is_correct and not r.is_skipped
+    ]
+
+    # NOTE: the confirm routing (confirm_flow + _advance_confirm) is wired in
+    # step 4. For now every sheet finalizes directly, so behaviour is identical
+    # to the pre-split flow. `wrong_written` is computed here so step 4 only
+    # flips the branch.
+    del wrong_written
+    await _grade_saved_cached(target, state, db_user, variant_num, name)
+
+
+async def _grade_saved_cached(
+    message: Message, state: FSMContext, db_user: User,
+    variant_num: int, name: str | None,
+) -> None:
+    """Finalize one saved sheet from the cached read: apply any To'g'ri/Xato
+    overrides, grade, report, persist. With NO overrides this is byte-for-byte
+    the pre-split _grade_saved tail (report + Submission + check_results row)."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    answer_sheet_key = data.get("answer_sheet_key")
+    project_id = data.get("project_id")
+    answer_key = data.get("sheet_answer_key") or {}
+    variant_id = data.get("sheet_variant_id")
+    student_answers = dict(data.get("sheet_answers") or {})
+
+    # Apply the teacher's To'g'ri/Xato overrides (empty until step 4). option (a),
+    # identical to _grade_manual_cached: "ok" → an accepted answer (forces a
+    # match), "no" → None (clean miss). checker.py / check_answers are NOT
+    # touched — we only shape the student dict they receive.
+    overrides = data.get("confirm_overrides") or {}
+    for q_str, is_ok in overrides.items():
+        accepted = accepted_list(answer_key.get(q_str))
+        student_answers[q_str] = accepted[0] if (is_ok and accepted) else None
 
     # ── Grade ─────────────────────────────────────────────────────────────────
     result = check_answers(student_answers, answer_key)
@@ -594,13 +647,16 @@ async def _grade_saved(
     )
     # Ready for the next sheet in the same run.
     await state.set_state(CheckingStates.waiting_for_answer_sheet)
+    # Confirm cache no longer needed (parity with the manual finalizer).
+    await state.update_data(confirm_pending=None, confirm_overrides=None)
 
     # Save submission record (UNCHANGED — existing shipped behaviour).
-    if variant_record:
+    if variant_id:
+        import uuid as _uuid
         from app.models.submission import Submission
         async with async_session_factory() as session:
             sub = Submission(
-                variant_id=variant_record.id,
+                variant_id=_uuid.UUID(variant_id),
                 answer_sheet_path=answer_sheet_key,
                 student_answers=student_answers,
                 results=result.to_dict(),
