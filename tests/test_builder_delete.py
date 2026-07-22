@@ -87,7 +87,13 @@ class _Res:
 
 
 class _Router:
-    """One session reused across `async with`; execute() pops results in order."""
+    """Fake session that pops query results in call order.
+
+    IMPORTANT: bind ONE instance and reuse it —
+        router = _Router([...]); monkeypatch.setattr(..., lambda: router)
+    A `lambda: _Router([...])` rebuilds a fresh queue for every `async with`
+    block, so a multi-block handler silently gets result[0] again (the aliasing
+    bug that made a green test hide a real one)."""
     def __init__(self, results):
         self._results = list(results)
 
@@ -149,8 +155,8 @@ async def test_dash_number_pins_and_names_file(monkeypatch):
 
 # ── (3) guard: pinned project not in this session → abort loudly ─────────────
 async def test_guard_aborts_on_project_mismatch(monkeypatch):
-    monkeypatch.setattr(ms, "async_session_factory",
-                        lambda: _Router([_Res(scalar=None)]))   # BuilderSource missing
+    router = _Router([_Res(scalar=None)])   # BuilderSource missing
+    monkeypatch.setattr(ms, "async_session_factory", lambda: router)
     rec = _RecLogger()
     monkeypatch.setattr(ms, "logger", rec)
 
@@ -183,11 +189,12 @@ async def test_yes_soft_deletes_pinned_project(monkeypatch):
     q23 = SimpleNamespace(question_number=23, is_deleted=False)
     src = SimpleNamespace(question_count=25)
     proj = SimpleNamespace(question_count=25)
-    monkeypatch.setattr(ms, "async_session_factory", lambda: _Router([
+    router = _Router([
         _Res(scalar=src),       # guard: BuilderSource present
         _Res(all_=[q23]),       # questions to soft-delete
         _Res(scalar=proj),      # project (count decrement)
-    ]))
+    ])
+    monkeypatch.setattr(ms, "async_session_factory", lambda: router)
     monkeypatch.setattr(ms, "logger", _RecLogger())
     calls = _mock_resume(monkeypatch)
 
@@ -224,8 +231,8 @@ async def test_no_keeps_question(monkeypatch):
 async def test_resume_reask_when_missing(monkeypatch):
     q = SimpleNamespace(question_number=24, is_deleted=False,
                         options_ordered=[{"letter": "A", "text": "x"}])
-    monkeypatch.setattr(ms, "async_session_factory",
-                        lambda: _Router([_Res(all_=[q])]))
+    router = _Router([_Res(all_=[q])])
+    monkeypatch.setattr(ms, "async_session_factory", lambda: router)
     st = FakeState({"answers": {}})
     msg = FakeTextMsg()
     await ms._builder_resume_key(msg, st, FakeUser(), _SID, _P1)
