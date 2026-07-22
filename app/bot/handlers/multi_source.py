@@ -28,6 +28,7 @@ from app.bot.handlers.upload import (
     t as ut,
 )
 from app.bot.keyboards.inline import (
+    builder_delete_confirm_keyboard,
     builder_dup_file_keyboard,
     builder_fail_keyboard,
     builder_next_keyboard,
@@ -210,6 +211,34 @@ BT = {
         "uz": "📚 Sessiya faol. Davom etish yoki bekor qilishni tanlang:",
         "en": "📚 A session is active. Continue or cancel:",
         "ru": "📚 Сессия активна. Продолжить или отменить:",
+    },
+    # ── Piece 3b: per-source delete-with-confirm ("23: -") ────────────────────
+    # The confirm NAMES the file — a builder run has several files in flight and
+    # a destructive confirm must say which one it's about to cut.
+    "bld_del_confirm": {
+        "uz": "🗑 <b>{filename}</b> faylidan {nums}-savol(lar)ni <b>o'chirasizmi</b>?\nUlar testdan butunlay chiqariladi.",
+        "en": "🗑 <b>Delete</b> question(s) {nums} from <b>{filename}</b>?\nThey will be removed from the test entirely.",
+        "ru": "🗑 <b>Удалить</b> вопрос(ы) {nums} из <b>{filename}</b>?\nОни будут полностью убраны из теста.",
+    },
+    "bld_del_done": {
+        "uz": "🗑 O'chirildi ({filename}): {nums}. Qolgan savollar qayta raqamlanmaydi — kalit variant yaratishda tuziladi.",
+        "en": "🗑 Deleted from {filename}: {nums}. Remaining questions are NOT renumbered — the key is built at generation.",
+        "ru": "🗑 Удалено из {filename}: {nums}. Остальные вопросы НЕ перенумеровываются — ключ строится при генерации.",
+    },
+    "bld_del_cancelled": {
+        "uz": "↩️ O'chirish bekor qilindi. Savol qoldirildi.",
+        "en": "↩️ Deletion cancelled. The question was kept.",
+        "ru": "↩️ Удаление отменено. Вопрос оставлен.",
+    },
+    "bld_del_reask": {
+        "uz": "Qolgan savollarga javob bering: {missing}",
+        "en": "Please answer the remaining questions: {missing}",
+        "ru": "Ответьте на оставшиеся вопросы: {missing}",
+    },
+    "bld_del_error": {
+        "uz": "⚠️ Ichki xatolik: o'chirish bajarilmadi (fayl mos kelmadi). Sessiya saqlanib qoldi.",
+        "en": "⚠️ Internal error: deletion aborted (source mismatch). Your session is intact.",
+        "ru": "⚠️ Внутренняя ошибка: удаление отменено (несоответствие файла). Сессия сохранена.",
     },
 }
 
@@ -544,6 +573,7 @@ async def _process_builder_file(
 
     await state.update_data(
         project_id=project_id,
+        source_filename=filename,   # for the delete-confirm message (Piece 3b)
         answers=result.detected,
         key_max=result.key_max,
         question_count=len(result.questions),
@@ -578,17 +608,36 @@ async def handle_builder_answers(message: Message, state: FSMContext, db_user: U
 
     if not skip and text:
         key_max = data.get("key_max") or data.get("question_count", 0)
-        # NOTE: Multi-Source still uses the OLD skip semantics for "23: -" (skip
-        # and keep, folded into answers) — delete_mode stays False here. The
-        # single-file flow uses delete_mode=True (delete-with-confirmation).
-        # Wiring delete into Multi-Source is the outstanding Piece 3b; until then
-        # the two flows deliberately differ and "-" means SKIP here.
-        reply_parts, complete, answers, _to_delete = await apply_key_text(
-            project_id, text, key_max, answers, lang, delete_mode=False
+        # Piece 3b: "23: -" now DELETES the question (with confirmation), matching
+        # the single-file flow — no longer skip-and-keep. A bare "-" above still
+        # skips the WHOLE file's key.
+        reply_parts, complete, answers, to_delete = await apply_key_text(
+            project_id, text, key_max, answers, lang, delete_mode=True
         )
         await state.update_data(answers=answers)
         if reply_parts:
             await message.answer("\n\n".join(reply_parts), parse_mode="HTML")
+
+        if to_delete:
+            # PIN the source's project_id + filename WITH the candidates, so the
+            # confirm can never land on a different file. A builder run touches
+            # several projects; the yes-handler re-checks the pin against this
+            # session's sources before writing (never trusts FSM order alone).
+            filename = data.get("source_filename", "")
+            await state.update_data(
+                pending_delete=to_delete,
+                pending_delete_project=project_id,
+                pending_delete_filename=filename,
+            )
+            await state.set_state(BuilderStates.waiting_for_delete_confirm)
+            await message.answer(
+                bt("bld_del_confirm", lang,
+                   nums=", ".join(map(str, to_delete)), filename=filename or "?"),
+                parse_mode="HTML",
+                reply_markup=builder_delete_confirm_keyboard(lang),
+            )
+            return
+
         if not complete:
             return
 
@@ -611,6 +660,158 @@ async def handle_builder_answers(message: Message, state: FSMContext, db_user: U
         bt("key_done", lang, files=files, questions=questions),
         reply_markup=builder_next_keyboard(lang),
     )
+
+
+# ── Piece 3b: per-source delete-with-confirm ──────────────────────────────────
+
+async def _builder_resume_key(
+    message: Message, state: FSMContext, db_user: User,
+    session_id: str, project_id: str,
+) -> None:
+    """After a delete confirm (Yes or No): re-evaluate this source's key against
+    its REMAINING (non-deleted) questions. Still missing → stay and re-ask;
+    otherwise mark the source key-complete and move to the next-action menu.
+    Mirrors handle_builder_answers's completion tail."""
+    lang = db_user.language.value
+    data = await state.get_data()
+    answers = data.get("answers", {})
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),
+            )
+        )
+        rows = res.scalars().all()
+    still_missing = [
+        str(r.question_number)
+        for r in sorted(rows, key=lambda x: x.question_number)
+        if r.options_ordered and not answers.get(str(r.question_number))
+    ]
+    if still_missing:
+        await state.set_state(BuilderStates.waiting_for_answers)
+        await message.answer(bt("bld_del_reask", lang, missing=", ".join(still_missing)))
+        return
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(BuilderSource).where(
+                BuilderSource.session_id == uuid.UUID(session_id),
+                BuilderSource.project_id == uuid.UUID(project_id),
+            )
+        )
+        src = res.scalar_one_or_none()
+        if src:
+            src.key_complete = True
+            await session.commit()
+
+    files, questions = await _session_counts(session_id)
+    await state.set_state(BuilderStates.waiting_for_next_action)
+    await message.answer(
+        bt("key_done", lang, files=files, questions=questions),
+        reply_markup=builder_next_keyboard(lang),
+    )
+
+
+@router.callback_query(BuilderStates.waiting_for_delete_confirm, F.data == "bld:qdel:yes")
+async def handle_builder_delete_yes(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    to_delete: list[int] = data.get("pending_delete") or []
+    pinned_project: str = data.get("pending_delete_project") or ""
+    session_id: str = data.get("builder_session_id") or ""
+    filename: str = data.get("pending_delete_filename") or "?"
+    answers: dict = data.get("answers", {})
+    await callback.answer()
+
+    if not to_delete or not pinned_project or not session_id:
+        await state.set_state(BuilderStates.waiting_for_answers)
+        return
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        # GUARD: the PINNED project must be a source of THIS session. Otherwise we
+        # would soft-delete in the wrong file — abort LOUDLY (a silent wrong
+        # delete only surfaces months later as a short variant).
+        src_res = await session.execute(
+            select(BuilderSource).where(
+                BuilderSource.session_id == uuid.UUID(session_id),
+                BuilderSource.project_id == uuid.UUID(pinned_project),
+            )
+        )
+        src = src_res.scalar_one_or_none()
+        if src is None:
+            logger.error(
+                "builder_delete_project_mismatch",
+                session_id=session_id, pinned_project=pinned_project,
+                to_delete=to_delete,
+            )
+            await state.update_data(
+                pending_delete=[], pending_delete_project=None,
+                pending_delete_filename=None,
+            )
+            await state.set_state(BuilderStates.waiting_for_next_action)
+            await callback.message.edit_text(bt("bld_del_error", lang))
+            return
+
+        q_res = await session.execute(
+            select(Question).where(
+                Question.project_id == uuid.UUID(pinned_project),
+                Question.is_deleted.is_(False),
+                Question.question_number.in_(to_delete),
+            )
+        )
+        removed = 0
+        for r in q_res.scalars().all():
+            r.is_deleted = True
+            removed += 1
+        pres = await session.execute(
+            select(Project).where(Project.id == uuid.UUID(pinned_project))
+        )
+        p = pres.scalar_one_or_none()
+        if p:
+            p.question_count = max(0, p.question_count - removed)
+        src.question_count = max(0, src.question_count - removed)
+        await session.commit()
+
+    answers = {k: v for k, v in answers.items() if int(k) not in to_delete}
+    await state.update_data(
+        answers=answers, pending_delete=[],
+        pending_delete_project=None, pending_delete_filename=None,
+    )
+    logger.info(
+        "builder_question_soft_deleted",
+        project_id=pinned_project, nums=to_delete, removed=removed,
+    )
+    await callback.message.edit_text(
+        bt("bld_del_done", lang, nums=", ".join(map(str, to_delete)), filename=filename)
+    )
+    await _builder_resume_key(callback.message, state, db_user, session_id, pinned_project)
+
+
+@router.callback_query(BuilderStates.waiting_for_delete_confirm, F.data == "bld:qdel:no")
+async def handle_builder_delete_no(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
+    lang = db_user.language.value
+    data = await state.get_data()
+    pinned_project: str = data.get("pending_delete_project") or data.get("project_id") or ""
+    session_id: str = data.get("builder_session_id") or ""
+    await callback.answer()
+    await state.update_data(
+        pending_delete=[], pending_delete_project=None, pending_delete_filename=None,
+    )
+    await callback.message.edit_text(bt("bld_del_cancelled", lang))
+    # The question was KEPT and is still unanswered → resume the key loop (it
+    # will be re-asked as still-missing).
+    if pinned_project and session_id:
+        await _builder_resume_key(callback.message, state, db_user, session_id, pinned_project)
+    else:
+        await state.set_state(BuilderStates.waiting_for_answers)
 
 
 # ── Add another / finish ──────────────────────────────────────────────────────

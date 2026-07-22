@@ -54,6 +54,17 @@ def delete_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     return _two_button_kb(labels.get(lang, labels["en"]))
 
 
+def builder_delete_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """Multi-Source delete confirm (Piece 3b). Distinct bld:qdel:* callbacks so
+    it never collides with the single-file qdel:* handlers."""
+    labels = {
+        "uz": [("✅ Ha, o'chirish", "bld:qdel:yes"), ("❌ Yo'q, qoldirish", "bld:qdel:no")],
+        "en": [("✅ Yes, delete", "bld:qdel:yes"), ("❌ No, keep it", "bld:qdel:no")],
+        "ru": [("✅ Да, удалить", "bld:qdel:yes"), ("❌ Нет, оставить", "bld:qdel:no")],
+    }
+    return _two_button_kb(labels.get(lang, labels["en"]))
+
+
 def key_finish_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """[🏁 Yakunlash] escape for the persistent missing-answer loop — proceed
     even if some questions still lack an answer (they stay ungraded)."""
