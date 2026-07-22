@@ -381,6 +381,12 @@ def clean_question(q: dict) -> dict:
     q["question_text"] = clean_latex(q.get("question_text", ""))
     opts = q.get("options", {})
     q["options"] = {k: clean_latex(v) for k, v in opts.items() if v}
+    # Shape guard: a description that is a sentence ABOUT whether an image exists
+    # (a leaked prompt answer) is not a real description — drop it so it can never
+    # reach the printed "[Rasm]: ..." box. Applies to EVERY extraction path.
+    if _is_meta_desc(q.get("image_description")):
+        logger.info("meta_desc_dropped", question=q.get("question_number"))
+        q["image_description"] = None
     if q.get("image_description"):
         q["image_description"] = clean_latex(q["image_description"])
 
@@ -470,6 +476,27 @@ FORMULA_RE = re.compile(r'\b[A-Z][a-z]?\d|\b(?:[A-Z][a-z]?){2,}\b')
 
 # Descriptions that carry no content and must never reach the printed PDF.
 _USELESS_DESC_RE = re.compile(r'cut ?off|is cut|kesilgan|not (?:visible|readable)', re.I)
+
+# A recovery/transcription call can return PROSE answering the prompt's implicit
+# question ("does this question contain a scheme?") instead of a description OF a
+# figure — e.g. "Question 7 does not contain a scheme/diagram of transformations".
+# That is a sentence ABOUT whether an image exists, not a description of one; it
+# must NEVER be stored as image_description (it renders as a "[Rasm]: ..." box on
+# the exam). Shape guard — reject the tell-tale meta phrasings.
+_META_DESC_RE = re.compile(
+    r"\b(?:does\s*not|does\s*n.t|do\s*not|don.t|did\s*not|didn.t)\s+"
+    r"(?:contain|have|include|show|depict)\b"
+    r"|\bthere\s+is\s+no\b"
+    r"|\bno\s+(?:scheme|diagram|transformation)\b"
+    r"|^\s*question\s+\d+\b",
+    re.I,
+)
+
+
+def _is_meta_desc(desc: str | None) -> bool:
+    """True if `desc` is a sentence ABOUT whether an image exists (a leaked
+    prompt answer), not a description OF an image — must not be stored."""
+    return bool(desc and _META_DESC_RE.search(desc))
 
 
 def _needs_scheme(q: dict) -> bool:
@@ -1316,7 +1343,11 @@ class AIAnalyzer:
                     )
                     continue
                 desc = clean_latex(str(data.get("desc") or "")).strip()
-                if desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
+                if _is_meta_desc(desc):
+                    # Gemini answered "this has no scheme" in prose — not a figure
+                    # description. Never store it (it would print as a [Rasm] box).
+                    logger.info("scheme_meta_desc_rejected", question=n)
+                elif desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
                     q["image_description"] = desc
                     logger.info("scheme_recovered_by_description", question=n)
                     continue
