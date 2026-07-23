@@ -402,7 +402,23 @@ def _markup_width(markup: str, style: ParagraphStyle) -> float:
     return total + _text_width(markup[last:], style)
 
 
-def _option_flowables(options: dict, available_w: float) -> list:
+def _std_cell(letter: str, markup: str, cell_w: float):
+    """Standard-builder cell: ONE Paragraph carrying "letter) text"."""
+    return Paragraph(f"{letter}) {markup}", STYLES["option_cell"])
+
+
+def _std_line(letter: str, markup: str, line_w: float) -> list:
+    """Standard-builder tier-3 line — exactly what every option printed before
+    the reflow, plus an _fit_imgs clamp for a formula wider than the full line."""
+    return [Paragraph(f"{letter}) {_fit_imgs(markup, line_w)}", STYLES["option"])]
+
+
+def _option_flowables(options: dict, available_w: float, *,
+                      measure_style: ParagraphStyle | None = None,
+                      indent: float | None = None,
+                      gap: float = _OPT_COL_GAP,
+                      cell: "callable" = _std_cell,
+                      line: "callable" = _std_line) -> list:
     """Lay one question's options out on as FEW lines as they fit on.
 
     Ladder — the WIDEST option decides for the whole set:
@@ -412,10 +428,17 @@ def _option_flowables(options: dict, available_w: float) -> list:
          stored order
       3. one option per line (what every question printed before this change)
 
+    ONE ladder serves BOTH builders. The tier decision and the alignment
+    contract live here; only the CELL CONTENT differs, supplied by the `cell`
+    and `line` callbacks — the standard builder renders a single Paragraph,
+    while the compact builder renders through _compact_flowables so a tall
+    stacked fraction is promoted to its own Image inside the cell. Widths are
+    measured with `measure_style` (10pt standard, 8pt compact).
+
     ALIGNMENT CONTRACT — this is the part that must never break. A student
     marks a sheet against printed option positions and the grader reads it back
     against the STORED labels, so:
-      * each cell carries "letter) text" as ONE Paragraph, never a label cell
+      * each cell carries "letter) text" as ONE unit, never a label cell
         beside a text cell that a grid could drift apart;
       * labels come from `options.items()` in stored order and are printed
         verbatim — they are NOT sequential (`a,b,d,e` is 46% of the corpus,
@@ -428,56 +451,55 @@ def _option_flowables(options: dict, available_w: float) -> list:
     if not items:
         return []
 
-    cell_style = STYLES["option_cell"]
+    measure_style = measure_style or STYLES["option_cell"]
+    indent = STYLES["option"].leftIndent if indent is None else indent
     markups = [(letter, render_to_markup(text)) for letter, text in items]
     n = len(markups)
-    indent = STYLES["option"].leftIndent
     table_w = available_w - indent
     widest = max(
-        _markup_width(f"{letter}) {mk}", cell_style) for letter, mk in markups
+        _markup_width(f"{letter}) {mk}", measure_style) for letter, mk in markups
     )
 
     # Tier 1 (N columns) then tier 2 (2 columns). For N <= 2 they are the same
     # layout, so only try it once.
     for ncols in ([n] if n <= 2 else [n, 2]):
-        if widest <= table_w / ncols - _OPT_COL_GAP:
-            return [_option_table(markups, ncols, indent, table_w, cell_style)]
+        if widest <= table_w / ncols - gap:
+            return [_option_table(markups, ncols, indent, table_w, gap, cell)]
 
     # Tier 3 — one option per line, the layout every question used before the
     # reflow, kept unchanged as the fallback.
     #
-    # NOT EXERCISED BY ANY REAL DATA: across all 546 stored option sets, ZERO
-    # reach this tier — the widest real option renders 152.3pt against a
-    # 228.9pt two-column cell. Only the synthetic very-long case in
-    # tests/test_variants_pdf_options_reflow.py gets here. Treat this branch as
-    # unproven in production: re-measure the corpus before assuming how it
-    # behaves, and do not "simplify" it on the assumption that it is dead.
-    # (_fit_imgs clamps a formula wider than the full line — impossible today,
-    # but this tier is the last stop before an overflow.)
-    return [
-        Paragraph(f"{letter}) {_fit_imgs(mk, table_w - _OPT_COL_GAP)}",
-                  STYLES["option"])
-        for letter, mk in markups
-    ]
+    # REACHED BY REAL DATA IN THE COMPACT BUILDER ONLY. Across the 546 stored
+    # option sets: 3 sets reach this tier at the compact column's 8pt/198.6pt
+    # geometry, but ZERO reach it in the standard builder (the widest real
+    # option renders 152.3pt against a 228.9pt two-column cell there), where
+    # only the synthetic very-long test case gets here. So do not assume this
+    # branch is battle-tested on the standard path, and do not "simplify" it as
+    # dead on either — it is the last stop before an overflow.
+    line_w = table_w - gap
+    out: list = []
+    for letter, mk in markups:
+        out.extend(line(letter, mk, line_w))
+    return out
 
 
-def _option_table(markups: list, ncols: int, indent: float,
-                  table_w: float, cell_style: ParagraphStyle) -> Table:
+def _option_table(markups: list, ncols: int, indent: float, table_w: float,
+                  gap: float, cell: "callable") -> Table:
     """The options as a grid, filled ROW-MAJOR. The leading zero-width column
-    reproduces STYLES["option"]'s 12pt indent without stealing width from the
-    first option's cell."""
+    reproduces the option indent without stealing width from the first cell."""
     col_w = table_w / ncols
+    cell_w = col_w - gap
     rows = []
     for i in range(0, len(markups), ncols):
         chunk = markups[i:i + ncols]
-        cells = [Paragraph(f"{letter}) {mk}", cell_style) for letter, mk in chunk]
+        cells = [cell(letter, mk, cell_w) for letter, mk in chunk]
         cells += [""] * (ncols - len(cells))   # short last row (e.g. 3 options)
         rows.append([""] + cells)
     tbl = Table(rows, colWidths=[indent] + [col_w] * ncols, hAlign="LEFT")
     tbl.setStyle(TableStyle([
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), _OPT_COL_GAP),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), gap),
         ("TOPPADDING",    (0, 0), (-1, -1), _OPT_CELL_PAD),
         ("BOTTOMPADDING", (0, 0), (-1, -1), _OPT_CELL_PAD),
     ]))
