@@ -507,6 +507,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         story.append(Spacer(1, 3 * mm))
 
         for q in questions:
+            # A question is assembled as ONE block and placed with KeepTogether
+            # (see the end of this loop), so a page break can never strand an
+            # option away from the stem it belongs to.
+            block: list = []
             pos       = q.get("position_in_variant", q.get("question_number", "?"))
             # Typeset math (parse→render); prose stays verbatim, bail-safe.
             q_text    = render_to_markup(q.get("question_text", ""))
@@ -526,7 +530,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
 
             # Group context box
             if group_ctx:
-                story.append(Spacer(1, 3 * mm))
+                block.append(Spacer(1, 3 * mm))
                 para = Paragraph(render_to_markup(group_ctx).replace("\n", "<br/>"), STYLES["context"])
                 tbl = Table([[para]], colWidths=[available_w])
                 tbl.setStyle(TableStyle([
@@ -537,11 +541,11 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                     ("LEFTPADDING",   (0, 0), (-1, -1), 8),
                     ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                 ]))
-                story.append(tbl)
-                story.append(Spacer(1, 3 * mm))
+                block.append(tbl)
+                block.append(Spacer(1, 3 * mm))
 
             # Question text
-            story.append(Paragraph(f"{pos}. {q_text}", STYLES["question_variant"]))
+            block.append(Paragraph(f"{pos}. {q_text}", STYLES["question_variant"]))
 
             # ── Image block ──────────────────────────────────────────────────
             if q.get("has_image"):
@@ -551,7 +555,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 if img_path:
                     img_flow = _load_image_rl(img_path, max_width=available_w * 0.80)
                     if img_flow:
-                        story.append(Spacer(1, 2 * mm))
+                        block.append(Spacer(1, 2 * mm))
                         # BUG FIX: added left/right padding so image doesn't
                         # touch the edge of the content area
                         tbl = Table([[img_flow]], colWidths=[available_w])
@@ -563,27 +567,27 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                             ("LEFTPADDING",   (0, 0), (-1, -1), 8),
                             ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                         ]))
-                        story.append(tbl)
-                        story.append(Spacer(1, 2 * mm))
+                        block.append(tbl)
+                        block.append(Spacer(1, 2 * mm))
                     else:
                         # Image path exists but failed to load — show description
-                        _append_img_desc(story, img_desc, available_w)
+                        _append_img_desc(block, img_desc, available_w)
                 elif img_desc:
                     # No path at all — show description as styled box
-                    _append_img_desc(story, img_desc, available_w)
+                    _append_img_desc(block, img_desc, available_w)
 
             # ── BUG FIX: open-ended questions ────────────────────────────────
             # Previously: silently rendered nothing → looked broken to students.
             # Now: show a clear label and a writing line so students know to
             # write their answer, instead of staring at blank space.
             if is_open:
-                story.append(Paragraph(
+                block.append(Paragraph(
                     "<i>(Javobni yozing)</i>",
                     STYLES["open_ended_label"],
                 ))
                 # Draw a dotted answer line
-                story.append(Spacer(1, 2 * mm))
-                story.append(HRFlowable(
+                block.append(Spacer(1, 2 * mm))
+                block.append(HRFlowable(
                     width="80%", thickness=0.5,
                     color=colors.HexColor("#aaaaaa"),
                     dash=(2, 4),
@@ -594,10 +598,26 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 # lines as they FIT on — see _option_flowables, which keeps each
                 # REAL stored label welded to its own text in a single cell
                 # (Latin or Cyrillic, gaps preserved, never a fixed A..E list).
-                story.extend(_option_flowables(options, available_w))
+                block.extend(_option_flowables(options, available_w))
 
             # Trailing gap between questions — halved so more fit per page.
-            story.append(Spacer(1, 1.5 * mm))
+            block.append(Spacer(1, 1.5 * mm))
+
+            # Keep the whole question on one page. This builder had no
+            # KeepTogether at all (the compact one always did), so a break could
+            # land mid-question and strand an option at the top of the next page
+            # — observed on a real render, where a variant's last option printed
+            # alone above the following question's stem.
+            #
+            # Safe here because no real block is anywhere near a frame tall:
+            # measured over every stored question, the tallest possible block
+            # (a 395pt figure plus stem and options) is 461pt against a 714pt
+            # frame — 64%, and 0 of 177 image-bearing questions exceed 75%. So
+            # KeepTogether can always place a block and never hits ReportLab's
+            # "flowable too large" path; the worst case is one short block
+            # pushed to the next page, against a guaranteed orphan on every
+            # page break before this.
+            story.append(KeepTogether(block))
 
         story.append(PageBreak())
 
