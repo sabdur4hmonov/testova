@@ -587,16 +587,24 @@ def _expand_with_labels(
     xlo, xhi = x0 - 12, x1 + 12
     margin = max(union.height * 1.6, 18.0)
     win_top = max(y_top, union.y0 - margin)
-    win_bot = min(y_bottom, union.y1 + margin)
 
-    # never expand into the options block: stop just above the first option
-    # marker sitting below the figure
+    # Downward window: a thin diagram (a bare line/segment) prints its labels
+    # ("A", "B", "c") a little BELOW the strokes — often further than the fixed
+    # `margin`, which was tuned for labels hugging the figure. So when there is
+    # an options block below, extend the window DOWN to just above the first
+    # option line (capped at the question's band) and let those labels in. The
+    # option markers and question numbers are still excluded from the figure box
+    # below, and the crop is re-checked by the garbage detector afterwards, so
+    # this never swallows the stem or the options. Open-ended questions (no
+    # option line below) keep the original fixed-margin fallback.
     opt_below = [
         w[1] for w in words
         if _OPTION_MARKER_RE.match(str(w[4]).strip()) and (w[1] + w[3]) / 2 > union.y1
     ]
     if opt_below:
-        win_bot = min(win_bot, min(opt_below) - 2)
+        win_bot = min(y_bottom, min(opt_below) - 2)
+    else:
+        win_bot = min(y_bottom, union.y1 + margin)
 
     fig = fitz.Rect(union)
     for w in words:
@@ -686,8 +694,11 @@ def _find_drawing_figure_rect(
 
 # ── Crop sanity check (FIX 1: garbage detector) ──────────────────────────────
 
-# Option marker word: "A)" .. "E)" (Latin or Cyrillic), possibly glued ("A)2")
-_OPTION_MARKER_RE = re.compile(r'^[A-EА-Е]\)')
+# Option marker word: "A)" .. "E)" (Latin or Cyrillic), possibly glued ("A)2").
+# Case-INSENSITIVE: a paper may label its options lowercase (a), b), d), e)) —
+# those must be recognised as the options boundary too, otherwise a figure crop
+# can run straight through them and the garbage/recrop guards can't stop at them.
+_OPTION_MARKER_RE = re.compile(r'^[A-Ea-eА-Еа-е]\)')
 # Question-number word: "12." / "12)" but NOT decimals like "0.5"
 _QNUM_WORD_RE = re.compile(r'^(\d{1,2})[.)](?!\d)')
 
@@ -1331,7 +1342,7 @@ class _DocxCanvas:
         for row in rows:
             cells = row.cells
             wrapped = [
-                _wrap_text(self.draw, c.text, font, col_w - 2 * _DOCX_TABLE_PAD)
+                _wrap_text(self.draw, _cell_scripted_text(c), font, col_w - 2 * _DOCX_TABLE_PAD)
                 for c in cells
             ]
             row_h = max(
@@ -1352,6 +1363,63 @@ class _DocxCanvas:
             self.y += row_h
 
 
+# python-docx `.text` silently drops run-level `w:vertAlign` (super/subscript),
+# flattening U² → U2, 2⁸ → 28 — arithmetically false once printed. We rebuild the
+# paragraph text from runs and make the formatting VISIBLE as ^/_ caret notation
+# (which the vision prompt already asks for), so Gemini transcribes 2^8 and the
+# math renderer typesets 2⁸.
+#
+# Trailing separators (";", spaces) sometimes inherit the superscript property
+# (the author left it on) and must be peeled OUT of the caret, or an option
+# separator gets swallowed into the exponent ("512=2^(8; )").
+_SCRIPT_TRAIL_RE = re.compile(r'[\s;,.):\]}]+$')
+# An exponent/index needs parens only when it is a multi-token expression (has an
+# operator or space); a bare number/word ("10", "n") renders fine without them.
+_SCRIPT_PARENS_RE = re.compile(r'[+\-*/^ ]')
+
+
+def _wrap_script(text: str, marker: str) -> str:
+    m = _SCRIPT_TRAIL_RE.search(text)
+    core = text[:m.start()] if m else text
+    trail = text[m.start():] if m else ""
+    if not core:
+        return text  # nothing but punctuation/space — leave as-is
+    body = f"{marker}({core})" if _SCRIPT_PARENS_RE.search(core) else f"{marker}{core}"
+    return body + trail
+
+
+def _para_scripted_text(para) -> str:
+    """Paragraph text with super/subscript runs surfaced as ^/_ notation.
+    Bail-safe: any error reverts to `.text` AND logs at warning, so a run-walk
+    that throws on a real DOCX surfaces as a regression instead of silently
+    reverting every question to flattened superscripts."""
+    try:
+        out: list[str] = []
+        for r in para.runs:
+            t = r.text
+            if not t:
+                continue
+            if r.font.superscript:
+                out.append(_wrap_script(t, "^"))
+            elif r.font.subscript:
+                out.append(_wrap_script(t, "_"))
+            else:
+                out.append(t)
+        result = "".join(out)
+        return result if result else para.text  # run-less para (fields) → .text
+    except Exception as e:
+        logger.warning("docx_script_walk_failed", error=str(e))
+        return para.text
+
+
+def _cell_scripted_text(cell) -> str:
+    try:
+        return "\n".join(_para_scripted_text(p) for p in cell.paragraphs) or cell.text
+    except Exception as e:
+        logger.warning("docx_cell_script_walk_failed", error=str(e))
+        return cell.text
+
+
 def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
     """Render a DOCX into page images (fed to the vision pipeline) + its text.
 
@@ -1367,22 +1435,24 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
         for block in _iter_docx_blocks(doc):
             if isinstance(block, _DocxParagraph):
                 if block.text.strip():
-                    canvas.text_block(block.text, body_font)
-                    text_parts.append(block.text)
+                    scripted = _para_scripted_text(block)
+                    canvas.text_block(scripted, body_font)
+                    text_parts.append(scripted)
                 for pic in _para_inline_images(doc, block):
                     canvas.image_block(pic)
             elif isinstance(block, _DocxTable):
                 canvas.table_block(block, body_font)
                 for row in block.rows:
-                    text_parts.append(" | ".join(c.text for c in row.cells))
+                    text_parts.append(" | ".join(_cell_scripted_text(c) for c in row.cells))
     except Exception as e:
         logger.warning("docx_structured_render_failed", error=str(e))
         # Fallback: dump all paragraph text onto fresh pages.
         canvas = _DocxCanvas()
         for para in doc.paragraphs:
             if para.text.strip():
-                canvas.text_block(para.text, body_font)
-                text_parts.append(para.text)
+                scripted = _para_scripted_text(para)
+                canvas.text_block(scripted, body_font)
+                text_parts.append(scripted)
 
     pages = [
         PageImage(page_number=i + 1, image=img)
@@ -1393,6 +1463,90 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
         "docx_rendered", pages=len(pages), text_chars=len(text_content)
     )
     return pages, text_content
+
+
+def _save_docx_image(pic: Image.Image) -> str | None:
+    """Save one decoded DOCX inline image as PNG in IMAGE_SAVE_DIR.
+
+    The `docximg_` filename prefix is a deliberate marker: the PDF renderer
+    reads it to size the image fit-to-column. A CROP_DPI crop has a known
+    physical size (pixels / CROP_DPI inches); a DOCX-embedded image does NOT —
+    it is arbitrary pixels — so the two must be sized differently.
+    """
+    try:
+        save_dir = _ensure_image_dir()
+        path = save_dir / f"docximg_{uuid.uuid4().hex[:10]}.png"
+        pic.save(str(path), format="PNG")
+        logger.info(
+            "docx_image_saved", path=str(path), size=f"{pic.width}x{pic.height}"
+        )
+        return str(path)
+    except Exception as e:
+        logger.warning("docx_image_save_failed", error=str(e))
+        return None
+
+
+def docx_extract_ordered_images(docx_bytes: bytes) -> list[Image.Image]:
+    """Every inline image in the DOCX, IN DOCUMENT (reading) ORDER.
+
+    Kept SEPARATE from docx_to_images (whose 2-tuple return other callers rely
+    on). Best-effort: a malformed document or an undecodable picture is
+    skipped, never raised. The a:blip -> r:embed -> media lookup lives in
+    _para_inline_images and is reused verbatim.
+    """
+    out: list[Image.Image] = []
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception as e:
+        logger.warning("docx_open_failed", error=str(e))
+        return out
+    try:
+        for block in _iter_docx_blocks(doc):
+            if isinstance(block, _DocxParagraph):
+                out.extend(_para_inline_images(doc, block))
+            elif isinstance(block, _DocxTable):
+                # images inside table cells, cell-by-cell in reading order
+                for row in block.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            out.extend(_para_inline_images(doc, para))
+    except Exception as e:
+        logger.warning("docx_ordered_images_failed", error=str(e))
+    return out
+
+
+def attach_docx_inline_images(questions: list[dict], docx_bytes: bytes) -> int:
+    """Attach a DOCX's embedded images to the questions Gemini flagged.
+
+    DOCX has no page geometry, so figures can't be cropped by rect like a PDF.
+    Instead we pair the ordered inline images with the flagged questions IN
+    QUESTION ORDER — but ONLY when the two counts match EXACTLY. A mismatch
+    attaches nothing and the description box still renders, mirroring the PDF
+    rule (principle: never attach a WRONG figure). Only fills questions that
+    have has_image=True and no image_path yet. Returns the count attached.
+    """
+    images = docx_extract_ordered_images(docx_bytes)
+    if not images:
+        return 0
+    flagged = sorted(
+        (q for q in questions
+         if q.get("has_image") and not q.get("image_path")),
+        key=lambda q: q.get("question_number", 0),
+    )
+    if len(flagged) != len(images):
+        logger.info(
+            "docx_image_count_mismatch",
+            images=len(images), flagged=len(flagged),
+        )
+        return 0
+    attached = 0
+    for q, pic in zip(flagged, images):
+        path = _save_docx_image(pic)
+        if path:
+            q["image_path"] = path
+            attached += 1
+    logger.info("docx_images_attached", count=attached)
+    return attached
 
 
 def docx_extract_text(docx_bytes: bytes) -> str:

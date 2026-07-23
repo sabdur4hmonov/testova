@@ -71,6 +71,11 @@ CRITICAL RULES:
    - Do NOT renumber or relabel. Do NOT convert Cyrillic labels to Latin.
    - Do NOT fill gaps: a paper printed "a) b) d) e)" returns keys "a","b","d","e"
      with NO "c". A paper with five options returns five keys.
+   - Options may run INLINE on one line, and an option's TEXT may itself contain
+     inner numbering like "1)...2)..." (e.g. "a) 1)14sm,2)48sm; b) 1)15sm...").
+     That inner numbering is part of the option TEXT — it is NOT a label. Key
+     each option by its printed marker (a, b, d, e...) exactly, and NEVER
+     renumber them into a fresh A,B,C,D sequence.
    - "ans" (if you can see the marked/correct option) must be one of these exact
      labels.
 7. If answer options are NOT visible on this page (cut off), return "opts": {}
@@ -256,6 +261,10 @@ Return ONLY a JSON array, one item per question number:
 
 CRITICAL RULES:
 - Copy option text EXACTLY as printed; keep math symbols (∈ ∅ π √ ...) as real Unicode
+- Use the EXACT printed marker as each option's label — keep gaps (a,b,d,e stays
+  a,b,d,e, no "c") and keep Cyrillic labels as-is. Inner numbering inside an
+  option's text ("1)...2)...") is part of the TEXT, not a label. NEVER renumber
+  the options into a fresh A,B,C,D sequence.
 - If a question genuinely has NO printed options anywhere on these pages,
   return "" for all its letters
 - NEVER invent, guess or complete options that are not printed on the pages
@@ -372,6 +381,12 @@ def clean_question(q: dict) -> dict:
     q["question_text"] = clean_latex(q.get("question_text", ""))
     opts = q.get("options", {})
     q["options"] = {k: clean_latex(v) for k, v in opts.items() if v}
+    # Shape guard: a description that is a sentence ABOUT whether an image exists
+    # (a leaked prompt answer) is not a real description — drop it so it can never
+    # reach the printed "[Rasm]: ..." box. Applies to EVERY extraction path.
+    if _is_meta_desc(q.get("image_description")):
+        logger.info("meta_desc_dropped", question=q.get("question_number"))
+        q["image_description"] = None
     if q.get("image_description"):
         q["image_description"] = clean_latex(q["image_description"])
 
@@ -461,6 +476,27 @@ FORMULA_RE = re.compile(r'\b[A-Z][a-z]?\d|\b(?:[A-Z][a-z]?){2,}\b')
 
 # Descriptions that carry no content and must never reach the printed PDF.
 _USELESS_DESC_RE = re.compile(r'cut ?off|is cut|kesilgan|not (?:visible|readable)', re.I)
+
+# A recovery/transcription call can return PROSE answering the prompt's implicit
+# question ("does this question contain a scheme?") instead of a description OF a
+# figure — e.g. "Question 7 does not contain a scheme/diagram of transformations".
+# That is a sentence ABOUT whether an image exists, not a description of one; it
+# must NEVER be stored as image_description (it renders as a "[Rasm]: ..." box on
+# the exam). Shape guard — reject the tell-tale meta phrasings.
+_META_DESC_RE = re.compile(
+    r"\b(?:does\s*not|does\s*n.t|do\s*not|don.t|did\s*not|didn.t)\s+"
+    r"(?:contain|have|include|show|depict)\b"
+    r"|\bthere\s+is\s+no\b"
+    r"|\bno\s+(?:scheme|diagram|transformation)\b"
+    r"|^\s*question\s+\d+\b",
+    re.I,
+)
+
+
+def _is_meta_desc(desc: str | None) -> bool:
+    """True if `desc` is a sentence ABOUT whether an image exists (a leaked
+    prompt answer), not a description OF an image — must not be stored."""
+    return bool(desc and _META_DESC_RE.search(desc))
 
 
 def _needs_scheme(q: dict) -> bool:
@@ -763,10 +799,31 @@ def _strip_own_number(q: dict) -> None:
     if not n:
         return
     text = q.get("question_text") or ""
-    new = re.sub(rf'^\s*{n}\s*[.)]\s*', '', text, count=1)
+    # Tolerate a SHORT leading run of markdown/code artifacts Gemini occasionally
+    # leaks before the number — a stray backtick, a ``` fence, ** , etc. Bounded
+    # to 0-4 such chars so it can never eat into real stem text, and still gated
+    # on {n}[.)], so this strips ONLY the question's OWN number: a list marker
+    # "1)" (1 != n) is left intact.
+    new = re.sub(rf'^\s*[`*~_#]{{0,4}}\s*{n}\s*[.)]\s*', '', text, count=1)
     if new != text:
         q["question_text"] = new
         logger.info("own_number_stripped", question=n)
+
+
+def _strip_leading_backticks(q: dict) -> None:
+    """Drop a leading run of stray backticks (markdown / code-fence bleed) when
+    they open the stem with no number after — the number+markdown case is already
+    handled by _strip_own_number. The prompt forbids markdown, so a leading
+    backtick is never real stem content. Scoped to BACKTICKS only — unlike a
+    leading `*`/`_` (which could be intentional math/emphasis), a leading
+    backtick is always an artifact, so the whole leading run is dropped. Runs
+    AFTER _strip_own_number, so it only touches the residual no-number case
+    (e.g. "`Hisoblang:" -> "Hisoblang:")."""
+    text = q.get("question_text") or ""
+    new = re.sub(r'^\s*`+\s*', '', text, count=1)
+    if new != text:
+        q["question_text"] = new
+        logger.info("leading_backticks_stripped", question=q.get("question_number"))
 
 
 _UNKNOWN_NODE = r'[XYZ][₀-₉0-9]*'
@@ -1169,6 +1226,7 @@ class AIAnalyzer:
         # ── Post-extraction stem cleaning (ISSUES 1, 4b, 4d) ─────────────────
         for q in unique:
             _strip_own_number(q)
+            _strip_leading_backticks(q)
             _strip_inline_options(q)
             q["question_text"] = canonicalize_chain_text(q.get("question_text"))
 
@@ -1285,7 +1343,11 @@ class AIAnalyzer:
                     )
                     continue
                 desc = clean_latex(str(data.get("desc") or "")).strip()
-                if desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
+                if _is_meta_desc(desc):
+                    # Gemini answered "this has no scheme" in prose — not a figure
+                    # description. Never store it (it would print as a [Rasm] box).
+                    logger.info("scheme_meta_desc_rejected", question=n)
+                elif desc and FORMULA_RE.search(desc) and not _USELESS_DESC_RE.search(desc):
                     q["image_description"] = desc
                     logger.info("scheme_recovered_by_description", question=n)
                     continue
@@ -1522,6 +1584,13 @@ class AIAnalyzer:
         """
         by_page: dict[int, list[dict]] = {}
         for q in questions:
+            # A figure-based WRITE-IN question is legitimately option-less — it is
+            # NOT "options lost during extraction". Sending it to options recovery
+            # wastes a Gemini call and, worse, risks Gemini hallucinating options
+            # off the diagram, converting a real open figure-question into a bogus
+            # MC one (which then grades against a fabricated key). Skip it.
+            if q.get("has_image") or q.get("image_description"):
+                continue
             if q.get("is_open_ended") and not q.get("options"):
                 page = q.get("page_number") or 0
                 if 1 <= page <= len(images):

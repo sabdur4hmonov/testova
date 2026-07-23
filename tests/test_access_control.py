@@ -12,7 +12,10 @@ from app.models.user import User
 from app.services import access
 
 
-NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+# Anchored to the REAL clock so FUTURE stays in the future and PAST in the past
+# every day. A hardcoded date made FUTURE go stale (the tests that read the live
+# clock, e.g. _myaccess_text, went red once the wall date passed it).
+NOW = datetime.now(timezone.utc)
 FUTURE = NOW + timedelta(days=10)
 PAST = NOW - timedelta(days=1)
 

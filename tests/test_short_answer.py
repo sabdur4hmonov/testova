@@ -99,6 +99,66 @@ def test_empty_word_body_rejected():
     assert reason
 
 
+# ── Bug A: a bare slash/comma inside a value is LITERAL, not a separator ──────
+def test_fraction_stays_single_literal():
+    # "1/2" must NOT split into ["1","2"] — it's the fraction, one accepted answer.
+    key, reason = parse_answer_key("20: 1/2")
+    assert reason == "" and key == {20: ["1/2"]}
+
+
+def test_ratio_slash_stays_literal():
+    key, reason = parse_answer_key("7: a/b")
+    assert reason == "" and key == {7: ["a/b".upper()]}   # normalised, still one item
+
+
+def test_comma_answer_stays_single_literal():
+    key, reason = parse_answer_key("19: 8,23")
+    assert reason == "" and key == {19: ["8,23"]}
+
+
+def test_comma_list_answer_stays_single_literal():
+    key, reason = parse_answer_key("24: 1000 g, 400 g, 600 g")
+    assert reason == "" and key == {24: ["1000 G, 400 G, 600 G"]}
+
+
+def test_spaced_slash_still_multi_accepts():
+    # The documented multi-accept form (spaces around /) is unchanged.
+    key, reason = parse_answer_key("22: PHONE / TELEPHONE")
+    assert reason == "" and key == {22: ["PHONE", "TELEPHONE"]}
+
+
+# ── Bug A (real cause): a numeric written answer with a NON-colon separator was
+#    routed to the letter parser and silently dropped. It must now store. ──────
+@pytest.mark.parametrize("text,expected", [
+    ("19: 8,23", {19: ["8,23"]}),     # the literal string reported (colon)
+    ("19 8,23",  {19: ["8,23"]}),     # space  — was LOST
+    ("19- 8,23", {19: ["8,23"]}),     # dash + space — was LOST
+    ("19-8,23",  {19: ["8,23"]}),     # dash, no space — was LOST
+    ("19. 8,23", {19: ["8,23"]}),     # dot — was LOST
+    ("19) 8,23", {19: ["8,23"]}),     # paren — was LOST
+    ("20: 1/2",  {20: ["1/2"]}),      # the literal string reported (colon)
+    ("20 1/2",   {20: ["1/2"]}),      # space — was LOST
+    ("20- 1/2",  {20: ["1/2"]}),      # dash — was LOST
+])
+def test_noncolon_numeric_written_answers_are_kept(text, expected):
+    key, reason = parse_answer_key(text)
+    assert reason == "" and key == expected
+
+
+def test_letter_answers_with_separators_still_letters():
+    # The fix must NOT hijack MC letter answers or labelled runs.
+    assert parse_answer_key("19 a")[0] == {19: ["A"]}
+    assert parse_answer_key("1-A 2-B")[0] == {1: ["A"], 2: ["B"]}
+    assert parse_answer_key("1a 2b 3c")[0] == {1: ["A"], 2: ["B"], 3: ["C"]}
+
+
+def test_bare_dash_is_still_a_skip_not_a_written_answer():
+    # "19-" with nothing after stays a skip marker (parsed by _SKIP_RE upstream),
+    # not a written answer — the parser leaves it to the letter path, no value.
+    key, reason = parse_answer_key("19-")
+    assert 19 not in key   # no written value invented
+
+
 def test_invalid_letter_line_alongside_word_still_rejected():
     # A genuinely invalid letter (X) on a letter line rejects the whole key,
     # even next to a valid written answer. (E is now a valid option letter, so
@@ -133,6 +193,33 @@ def test_sign_is_meaning_bearing():
     # No punctuation stripping: -5 must never equal 5 (regex-on-math is banned).
     assert not is_correct("-5", ["5"])
     assert is_correct("-5", ["-5"])
+
+
+# ── Safe numeric-notation equivalence (comma/dot + trailing zeros ONLY) ──────
+def test_comma_dot_decimals_are_equal():
+    assert is_correct("8.23", ["8,23"])      # the live-test case (dot vs comma)
+    assert is_correct("8,23", ["8.23"])
+    assert is_correct("2,3", ["2.3"])
+    assert is_correct("2.3", ["2,3"])
+
+
+def test_trailing_zeros_are_equal():
+    assert is_correct("2,30", ["2.3"])
+    assert is_correct("2.300", ["2,3"])
+    assert is_correct("5.0", ["5"])
+    assert is_correct("5", ["5,00"])
+
+
+def test_numeric_normalization_guards_hold():
+    # A fraction is NOT a plain number → stays literal, never equals a decimal.
+    assert not is_correct("2,3", ["2/3"])
+    assert not is_correct("0.67", ["2/3"])
+    assert is_correct("2/3", ["2/3"])            # exact fraction still matches
+    # Sign stays meaning-bearing under numeric compare.
+    assert not is_correct("-5", ["5"])
+    # A comma-separated LIST (not a plain number) stays exact-match only.
+    assert is_correct("1000 g, 400 g, 600 g", ["1000 g, 400 g, 600 g"])
+    assert not is_correct("1000 g, 400 g, 600 g", ["1000"])
 
 
 def test_equation_answer_kept_intact():

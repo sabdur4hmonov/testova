@@ -2,7 +2,23 @@
 Format matrix for the teacher answer-key parser — different teachers type
 keys in different styles; fixing one style must never break another.
 """
-from app.bot.handlers.upload import _parse_answer_input
+from app.bot.handlers.upload import _labels_hint, _parse_answer_input
+
+
+def test_labels_hint_shows_real_gapped_labels():
+    # Stage 1: the key-entry hint must show each question's REAL labels (gaps
+    # and all), not a contiguous A-D example — this is what made a teacher type
+    # C on an a,b,d,e paper. Open-ended questions show a write-in marker.
+    qs = [
+        {"question_number": 1, "options": {"a": "x", "b": "y", "d": "z", "e": "w"}},
+        {"question_number": 16, "options": {"b": "x", "d": "y", "e": "z"}},
+        {"question_number": 19, "options": {}},
+    ]
+    hint = _labels_hint(qs)
+    assert "1) abde" in hint          # gap at c preserved
+    assert "16) bde" in hint          # gap at a,c
+    assert "19)" in hint and "✍️" in hint  # open-ended → write-in
+    assert "1A 2B 5C 10D" not in hint  # the stale contiguous example is gone
 
 
 def test_plain_pairs():

@@ -72,7 +72,7 @@ def test_shuffle_preserves_label_set_and_gap():
         # The printed label set is exactly the paper's — no C, no relabel.
         assert set(qd["options"].keys()) == {"A", "B", "D", "E"}
         # The answer key names the label now holding BUXORO.
-        key_label = v["answer_key"]["1"]
+        key_label = v["answer_key"]["1"][0]   # answer_key values are lists now
         assert qd["options"][key_label] == "BUXORO"
 
 
@@ -85,7 +85,7 @@ def test_shuffle_cyrillic_labels_preserved():
         qd = v["questions_data"][0]
         assert set(qd["options"].keys()) == {"А", "Б", "Д", "Е"}   # Cyrillic kept
         # key is CANONICAL (for grading); the label it points at holds td.
-        key_canon = v["answer_key"]["1"]
+        key_canon = v["answer_key"]["1"][0]   # answer_key values are lists now
         real_label = next(L for L in qd["options"] if canonical_letter(L) == key_canon)
         assert qd["options"][real_label] == "td"
 
@@ -128,9 +128,51 @@ def test_grading_match_canonical_across_scripts():
            "options": {"А": "ta", "Б": "tb", "Д": "td"}, "correct_answer": "Д"}]
     v = generate_variants(qs, count=1, seed=9)[0]
     qd = v["questions_data"][0]
-    key_canon = v["answer_key"]["1"]
+    key_canon = v["answer_key"]["1"][0]   # answer_key values are lists now
     correct_label = next(L for L in qd["options"] if canonical_letter(L) == key_canon)
     # student marks that real Cyrillic label → reader canonicalises → matches key
     assert _norm_letter(correct_label) == key_canon
     # a Latin look-alike mark for the same option also matches
     assert _norm_letter(canonical_letter(correct_label)) == key_canon
+
+
+# ── Stage 3 (unification): correct_answers list storage + fallback ───────────
+def test_correct_answers_new_row_list():
+    q = Question(question_number=1, question_text="x",
+                 correct_answers=["PHONE", "TELEPHONE"])
+    assert q.correct_answers_ordered == ["PHONE", "TELEPHONE"]
+
+
+def test_correct_answers_old_row_fallback_to_scalar():
+    # options=NULL, correct_answers=NULL (pre-008 row) → falls back to the
+    # legacy single-letter correct_answer, so old rows grade unchanged.
+    q = Question(question_number=1, question_text="x", correct_answer="B")
+    assert q.correct_answers_ordered == ["B"]
+
+
+def test_correct_answers_empty_when_none_set():
+    q = Question(question_number=1, question_text="x")
+    assert q.correct_answers_ordered == []
+
+
+def test_mc_variant_answer_key_is_one_item_list():
+    qs = [{"question_id": "q1", "question_number": 1, "question_text": "t",
+           "options": {"A": "ta", "B": "tb"}, "correct_answer": "A"}]
+    v = generate_variants(qs, count=1, seed=1)[0]
+    val = v["answer_key"]["1"]
+    assert isinstance(val, list) and len(val) == 1 and val[0] in {"A", "B"}
+
+
+def test_open_question_no_key_is_none():
+    # An open-ended question with no accepted answers → answer_key None (ungraded).
+    qs = [
+        {"question_id": "q1", "question_number": 1, "question_text": "mc",
+         "options": {"A": "ta", "B": "tb"}, "correct_answer": "A"},
+        {"question_id": "q2", "question_number": 2, "question_text": "open",
+         "options": {}, "correct_answer": None, "correct_answers": []},
+    ]
+    v = generate_variants(qs, count=1, seed=1)[0]
+    # positions are 1..2 in some order; the open one has None, the MC one a list
+    vals = list(v["answer_key"].values())
+    assert None in vals
+    assert any(isinstance(x, list) and len(x) == 1 for x in vals)

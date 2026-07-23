@@ -6,6 +6,7 @@ class UploadStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_format = State()  # choose Oddiy / Ixcham before extraction
     waiting_for_answers = State()
+    waiting_for_delete_confirm = State()  # "23: -" → confirm delete of that question
     waiting_for_dup_resolution = State()
     waiting_for_variant_count = State()
 
@@ -33,6 +34,7 @@ class BuilderStates(StatesGroup):
     waiting_for_test_name = State()  # name FIRST, before any file
     waiting_for_file = State()
     waiting_for_answers = State()
+    waiting_for_delete_confirm = State()  # "23: -" → confirm delete (Piece 3b)
     waiting_for_next_action = State()
     waiting_for_builder_format = State()  # Oddiy / Ixcham, asked at finish
     waiting_for_variant_count = State()

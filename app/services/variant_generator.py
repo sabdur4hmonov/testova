@@ -237,9 +237,29 @@ def _generate_one_variant(
                         break
 
             option_mapping[q_id] = fwd_map
-            # The printed variant shows the REAL label (from options); the key is
-            # stored CANONICAL so grading matches the canonical sheet read.
-            answer_key[str(pos)] = canonical_letter(new_correct) if new_correct else None
+            # answer_key values are LISTS of accepted answers (migration 008).
+            #  * MC: the shuffled correct label(s), stored CANONICAL so grading
+            #    matches the canonical sheet read. new_correct (from the scalar
+            #    correct_answer) is authoritative; EVERY other accepted letter in
+            #    correct_answers is mapped through the same shuffle (fwd_map) and
+            #    added — a multi-accept MC key ("A / B") must not be dropped.
+            #  * WRITTEN/open (no options, not shuffled): the question's accepted
+            #    answers as-is (text, multi-accept). Empty → None (ungraded).
+            if orig_opts:
+                labels = [new_correct] if new_correct else []
+                for lab in (q.get("correct_answers") or []):
+                    lab = str(lab).strip()
+                    if lab and lab in fwd_map and fwd_map[lab] not in labels:
+                        labels.append(fwd_map[lab])
+                canon: list[str] = []
+                for lab in labels:
+                    c = canonical_letter(lab)
+                    if c not in canon:
+                        canon.append(c)
+                answer_key[str(pos)] = canon or None
+            else:
+                accepted = [str(a) for a in (q.get("correct_answers") or []) if str(a).strip()]
+                answer_key[str(pos)] = accepted or None
 
             resolved.append({
                 **q,

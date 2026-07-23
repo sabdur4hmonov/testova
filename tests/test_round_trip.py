@@ -68,8 +68,11 @@ def _grade_all_variants(pool, expected_count):
             pos = str(q["position_in_variant"])
             assert key[pos] is not None
             expected_prefix = f"opt-{15 if pos_to_orig[pos] == 35 else pos_to_orig[pos]}-"
-            assert q["options"][key[pos]].startswith(expected_prefix)
-        result = check_answers(dict(key), key)
+            assert q["options"][key[pos][0]].startswith(expected_prefix)
+        # answer_key values are LISTS now; a perfect student picks an accepted
+        # answer per position (scalar), which is what a real sheet read gives.
+        student = {k: v[0] for k, v in key.items() if v}
+        result = check_answers(student, key)
         assert result.correct == expected_count
         assert result.score_percent == 100.0
 

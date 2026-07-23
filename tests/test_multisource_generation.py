@@ -65,14 +65,14 @@ def test_1_colliding_pool_round_trip_100_percent():
 
         for q in qd:
             pos = str(q["position_in_variant"])
-            key_letter = v["answer_key"][pos]
+            key_letter = v["answer_key"][pos][0]   # key values are lists now
             # the key must point at the ORIGINAL correct option's text,
             # proving grading tracks correctness through pooling + shuffle
             assert q["options"][key_letter] == f"{q['question_id']}-CORRECT"
             seen_ids.add(q["question_id"])
 
         # a perfect student answering per the key scores 100%
-        student = dict(v["answer_key"])
+        student = {k: a[0] for k, a in v["answer_key"].items() if a}
         assert check_answers(student, v["answer_key"]).score_percent == 100.0
 
     # both sources' questions were exercised across the variants
@@ -160,6 +160,20 @@ class _FakeState:
 class _User:
     id = "u1"
     language = type("L", (), {"value": "uz"})()
+
+
+# ── Stage 4.5b: the per-file key prompt shows REAL labels, not "1A 2B 3C" ─────
+
+def test_file_added_prompt_shows_real_gapped_labels():
+    from app.bot.handlers.multi_source import bt
+    from app.bot.handlers.upload import _labels_hint
+
+    qs = [{"question_number": 1, "options": {"a": "x", "b": "y", "d": "z", "e": "w"}},
+          {"question_number": 19, "options": {}}]   # gapped MC + open
+    for lang in ("uz", "en", "ru"):
+        msg = bt("file_added", lang, i=1, n=2, labels=_labels_hint(qs))
+        assert "1) abde" in msg and "19) ✍️" in msg   # real labels rendered
+        assert "1A 2B 3C" not in msg                  # stale static hint gone
 
 
 def test_4_generation_error_code_and_retry(monkeypatch):

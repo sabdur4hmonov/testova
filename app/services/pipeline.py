@@ -28,7 +28,9 @@ from app.services.ai_analyzer import (
     sections_confident,
     summarize_sections,
 )
+from app.services.option_label_recovery import recover_pdf_option_labels
 from app.services.file_processor import (
+    attach_docx_inline_images,
     attach_images_to_questions,
     compute_page_infos,
     docx_to_images,
@@ -184,6 +186,25 @@ async def process_file(
         src_pages,
     )
 
+    # DOCX has no page geometry to crop from, so figures are attached here
+    # instead: pair the document's ordered inline images with the flagged
+    # questions, count-guarded (never a wrong figure). PDF/image sources are
+    # unaffected — attach_images_to_questions already handled them above.
+    if file_type == "docx":
+        await asyncio.to_thread(
+            attach_docx_inline_images, all_questions, content
+        )
+
+    # Deterministic option-label backstop (PDF text layer): correct Gemini's
+    # non-deterministic per-page relabelling (a,b,d,e -> A,B,C,D) by reading the
+    # ACTUAL printed markers. Count-guarded; unconfirmed questions get
+    # label_doubt (surfaced in the suspicious report below). PDF only — DOCX and
+    # scanned PDFs fall through untouched.
+    if _pdf_bytes_for_crop:
+        await asyncio.to_thread(
+            recover_pdf_option_labels, _pdf_bytes_for_crop, all_questions
+        )
+
     # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
     scheme_failed = await analyzer.ensure_scheme_content(
         all_questions, images, _pdf_bytes_for_crop, col_map, src_pages
@@ -252,6 +273,14 @@ async def process_file(
         "suspicious": [list(s) for s in suspicious],
         "unanswerable": [[u[0], u[1], ",".join(u[2])] for u in unanswerable],
         "ocr_fixes": [[sec, n] for sec, n in sorted(ocr_by_sec.items())],
+        # Option-label backstop couldn't confirm these from the text layer — the
+        # teacher should eyeball the labels against the source. Kept SEPARATE
+        # from "suspicious" on purpose: it must NOT drive the Gemini re-read (a
+        # re-read wouldn't fix labels and would burn quota).
+        "label_doubt": [
+            [q.get("section", 1), q.get("question_number", 0)]
+            for q in all_questions if q.get("label_doubt")
+        ],
     }
 
     # CHANGE 2: NOTHING is removed at extraction time.

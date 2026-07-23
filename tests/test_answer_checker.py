@@ -83,3 +83,46 @@ def test_to_dict():
     assert d["correct"] == 5
     assert "question_results" in d
     assert len(d["question_results"]) == 5
+
+
+# ── Stage 2 (unification): list-aware matching via shared is_correct ─────────
+def test_list_key_grades_letters_identically():
+    # A one-item list key must grade EXACTLY like the legacy scalar key.
+    scalar = check_answers({"1": "A", "2": "B"}, {"1": "A", "2": "C"})
+    listed = check_answers({"1": "A", "2": "B"}, {"1": ["A"], "2": ["C"]})
+    assert (listed.correct, listed.wrong, listed.total) == (scalar.correct, scalar.wrong, scalar.total)
+    assert listed.correct == 1 and listed.wrong == 1
+
+
+def test_multi_accept_and_written_answers():
+    key = {"1": ["PHONE", "TELEPHONE", "SMARTPHONE"], "2": ["TOSHKENT"]}
+    res = check_answers({"1": "smartphone", "2": "Toshkent"}, key)  # case-insensitive
+    assert res.correct == 2 and res.wrong == 0
+
+
+def test_written_wrong_answer_counts_wrong_and_shows_all_accepted():
+    key = {"1": ["PHONE", "TELEPHONE"]}
+    res = check_answers({"1": "TABLET"}, key)
+    assert res.correct == 0 and res.wrong == 1
+    assert res.question_results[0].correct_answer == "PHONE / TELEPHONE"
+
+
+def test_sign_still_meaning_bearing():
+    # -5 must not equal 5 (checker.normalize does not strip punctuation).
+    assert check_answers({"1": "-5"}, {"1": ["5"]}).wrong == 1
+    assert check_answers({"1": "-5"}, {"1": ["-5"]}).correct == 1
+
+
+# ── Saved flow gets numeric normalization too (shared is_correct) ────────────
+def test_saved_flow_comma_dot_decimals_match():
+    # The live-test bug: student wrote 8.23 (dot), key has 8,23 (comma). The saved
+    # flow grades via check_answers -> is_correct, so it must now score correct.
+    res = check_answers({"1": "8.23", "2": "2,3", "3": "5.0"},
+                        {"1": ["8,23"], "2": ["2.3"], "3": ["5"]})
+    assert res.correct == 3 and res.wrong == 0
+
+
+def test_saved_flow_numeric_guards():
+    assert check_answers({"1": "2,3"}, {"1": ["2/3"]}).wrong == 1     # comma ≠ fraction
+    assert check_answers({"1": "0.67"}, {"1": ["2/3"]}).wrong == 1    # decimal ≠ fraction
+    assert check_answers({"1": "-5"}, {"1": ["5"]}).wrong == 1        # sign preserved
