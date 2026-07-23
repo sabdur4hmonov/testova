@@ -197,13 +197,55 @@ near-misses ("A line segment with points A, B, C marked on it.").
 Until then this is a closed door, and Option D is machinery maintained forever
 against a class that is not being produced.
 
-## PDF variant layout — Group B (options reflow) considerations
+## PDF variant layout — Group B (options reflow) — SHIPPED v0.25
 
 Group A (compact header, reachable write-in line, tighter spacing) shipped in
-**v0.23**. Group B — laying options out on fewer lines (4-across, else a 2x2
-grid, else one per line) — is deliberately held for its own session.
+**v0.23**. Group B shipped in **v0.25**: options now share a line when they fit
+on one, and a question is held together across a page break.
 
-### The alignment constraint Group B lives or dies on
+### What shipped
+`_option_flowables` in `pdf_generator.py`, a width ladder driven by the WIDEST
+option in the set:
+
+1. **all N on ONE row** (N columns) — 4-across, but also 3- and 5-across;
+2. **2 columns × ceil(N/2) rows**, filled ROW-MAJOR so reading order is stored
+   order;
+3. **one per line** — the pre-v0.25 layout, kept as the fallback.
+
+Blanket `KeepTogether` per question was folded in (it was deferred INTO this
+work, see below).
+
+### Measured, against all 546 stored option sets
+| tier | rows | share |
+|---|---|---|
+| all N on one row | 542 | 99.3% |
+| 2-column grid | 4 | 0.7% |
+| one per line | 0 | **0.0%** |
+
+- Sizes are **not** all four: `n=3` 47 rows, `n=4` 480, `n=5` 19 — 12% is
+  non-4, which is why the ladder generalises to N-across instead of hard-coding
+  a 2x2.
+- Real-project effect: proj40 **5 pages → 3**, proj25 **5 pages → 3**. Option
+  block height −74% (2422→618pt) and −81% (1927→358pt).
+
+### Why the width test is a GUARD, not a cosmetic nicety
+An inline typeset-math `<img>` is atomic — ReportLab neither wraps nor shrinks
+it — so an option wider than its cell **draws over the next column**. Measured
+on stored row `868dbdbc`: a 137.5pt formula in a 117.5pt four-across cell
+overflows its neighbour by ~38pt, and the fourth crosses the right margin. That
+is printed math detached from the letter that owns it — the option-alignment
+bug class, reintroduced as a layout defect. `_markup_width` counts image widths
+so the ladder steps down to a wider cell. `tests/test_variants_pdf_options_reflow.py`
+reads image bounding boxes back out of the rendered PDF to pin this.
+
+### DO NOT assume tier 3 is battle-tested
+**Zero** of the 546 stored option sets reach the one-per-line tier (widest real
+option = 152.3pt against a 228.9pt two-column cell). Only the synthetic case in
+`test_very_long_options_fall_to_one_per_line` exercises that branch. The code
+says so at the branch itself. Re-measure the corpus before relying on its
+behaviour, and do not delete it as dead — it is the overflow backstop.
+
+### The alignment constraint Group B lived or died on
 Change 2 alters how an option LABEL maps onto a printed POSITION. A student
 marks a sheet against those positions and the grader reads it against the
 STORED labels, so a reflow that ever detaches a label from its own text — or
@@ -221,20 +263,42 @@ printed PDF.
   `tests/test_variants_pdf_layout.py` pins that gapped and Cyrillic sets print
   verbatim. Any reflow must keep those tests green.
 - Prove the 2x2 grid on a GAPPED set specifically — four options with no `c`
-  must render `a/b/d/e`, never relabelled to `a/b/c/d`.
+  must render `a/b/d/e`, never relabelled to `a/b/c/d`. **Done — see Verified
+  at ship time below.**
 - Prove the width thresholds with a long-option case that forces 2x2 and a
-  very-long case that forces one-per-line, rather than guessing them.
+  very-long case that forces one-per-line, rather than guessing them. **Done,
+  from stored data for the 2x2 case.**
+- Kept true by construction in v0.25: a wrong width estimate makes a cell WRAP
+  to a taller row. Degradation costs vertical space; it cannot misalign a label.
 
-### Deferred INTO Group B: the page-break option orphan
+### The page-break option orphan — RESOLVED in v0.25 (blanket KeepTogether)
 Observed on the Group A sample render — a variant's last option (`D) …`) landed
 alone at the top of the next page, split from its question. **Pre-existing, not
-a Group A regression:** `build_variants_pdf` never wraps a question block in
-`KeepTogether`, while `build_variants_pdf_compact` already does. Group A's
-tighter spacing only shifts WHERE breaks fall; it does not create the behaviour.
+a Group A regression:** `build_variants_pdf` never wrapped a question block in
+`KeepTogether`, while `build_variants_pdf_compact` always did.
 
-It is deferred into Group B on purpose rather than fixed separately: wrapping a
-question plus its options in `KeepTogether` changes pagination AND interacts
-with how the options lay out (a 4-across row, a 2x2 grid and a 1-per-line stack
-each have a different block height, so each changes what fits before a break,
-and an over-eager `KeepTogether` on a tall block pushes whole questions to the
-next page and wastes more space than the orphan cost). Decide both together.
+The stated worry was that an over-eager `KeepTogether` on a tall block pushes
+whole questions to the next page and wastes more than the orphan costs. **That
+does not hold for this corpus, measured rather than assumed:** the tallest
+possible question block anywhere in the stored data (a 395pt figure plus stem
+and options) is **461pt against a 714pt frame — 64%**, and **0 of 177**
+image-bearing questions exceed 75% of a frame. So `KeepTogether` can always
+place a real block and never reaches ReportLab's "flowable too large" path.
+
+Against that, orphaning was happening on **every** page break: before the fix
+proj40 split 3 questions (q26 left *zero* options on the stem's page and one
+printed alone overleaf; q35 moved four) and proj25 split 4. After: **0 splits,
+0 orphaned options, on both projects.**
+
+### Verified at ship time
+- Gapped `a,b,d,e` in the 2-column grid: all four print, **no `c` appears**,
+  row-major (`a b` / `d e`), and the two rows' column edges line up.
+- Cyrillic `АБВГ` 4-across; mixed-case `abDe` printed as stored.
+- Real row `868dbdbc` demoted to 2 columns; **0 image overflows** past a cell
+  edge and none past the right margin (bounding boxes read back from the PDF).
+- Synthetic very-long set falls to one per line, still in stored order.
+- Answer-key and compact PDFs **byte-identical** to master
+  (`4437a249…` / `70ebacee…`, built with `rl_config.invariant`) — the proof
+  that `STYLES` did not leak.
+- Rendered proof sheet + real-project before/after kept out of the repo
+  (`sardorbek/groupb_proof/`), regenerable from `tests/` fixtures.

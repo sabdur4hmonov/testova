@@ -1,8 +1,10 @@
 ﻿"""PDF generation using ReportLab."""
 from __future__ import annotations
 
+import html as _html
 import io
 import os
+import re as _re
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +185,16 @@ STYLES["variant_header_center"] = ParagraphStyle(
 STYLES["question_variant"] = ParagraphStyle(
     "question_variant", parent=STYLES["question"], spaceBefore=4,
 )
+# One option INSIDE a reflow table cell. The 12pt indent moves to the table (a
+# per-cell indent would eat the cell's own text width), and spaceBefore/After
+# are zeroed because a Table cell does not apply them at all — verified: with
+# the parent's spaceBefore=5 and zero cell padding, two stacked-fraction rows
+# come out touching at a 0.0pt gap. The stacked-fraction bleed guard is
+# therefore re-created as _OPT_CELL_PAD below, not inherited.
+STYLES["option_cell"] = ParagraphStyle(
+    "option_cell", parent=STYLES["option"],
+    leftIndent=0, spaceBefore=0, spaceAfter=0,
+)
 
 
 # ── Image loader — handles BOTH storage keys AND direct file paths ────────────
@@ -335,6 +347,137 @@ def _fillin_row(available_w: float) -> Table:
     return tbl
 
 
+# ── Option reflow ────────────────────────────────────────────────────────────
+# Options used to print one per line, which cost four lines for four one-word
+# answers. They now share a line when they FIT on one. The width test is not a
+# cosmetic nicety — it is the guard that keeps a label attached to its own text
+# (see _markup_width).
+
+_IMG_TAG_RE = _re.compile(r'<img\b[^>]*?/>')
+_MARKUP_TAG_RE = _re.compile(r'<[^>]+>')
+
+_OPT_COL_GAP = 6.0   # right padding inside each cell: the gutter between options
+_OPT_CELL_PAD = 3.0  # vertical padding — stands in for STYLES["option"]'s
+                     # spaceBefore bleed guard, which a Table cell ignores
+
+
+def _text_width(chunk: str, style: ParagraphStyle) -> float:
+    """Printed width of a plain-text run under `style`'s font."""
+    chunk = _MARKUP_TAG_RE.sub("", chunk)   # <i>/<b> carry no width
+    chunk = _html.unescape(chunk)           # &amp; measures as "&"
+    if not chunk:
+        return 0.0
+    try:
+        return pdfmetrics.stringWidth(chunk, style.fontName, style.fontSize)
+    except Exception:
+        return len(chunk) * style.fontSize * 0.6
+
+
+def _markup_width(markup: str, style: ParagraphStyle) -> float:
+    """Width of ONE unwrapped line of Paragraph markup.
+
+    Text runs are measured with the real font metrics; an inline typeset-math
+    <img> contributes its DECLARED width. Counting the image is the whole point:
+    it is an atomic object that ReportLab neither wraps nor shrinks, so an
+    option whose formula is wider than its cell simply DRAWS OVER the next
+    column. Measured on the stored F(x) row: a 137.5pt formula in a 117.5pt
+    four-across cell overflows into its neighbour by ~38pt (and the last one
+    past the right margin), which is printed math detached from the letter that
+    owns it. The ladder steps down to a wider cell instead of letting that
+    happen.
+    """
+    total = 0.0
+    last = 0
+    for m in _IMG_TAG_RE.finditer(markup):
+        total += _text_width(markup[last:m.start()], style)
+        wm = _re.search(r'width="([\d.]+)"', m.group(0))
+        total += float(wm.group(1)) if wm else 0.0
+        last = m.end()
+    return total + _text_width(markup[last:], style)
+
+
+def _option_flowables(options: dict, available_w: float) -> list:
+    """Lay one question's options out on as FEW lines as they fit on.
+
+    Ladder — the WIDEST option decides for the whole set:
+      1. all N on ONE row  (N columns: 4-across, but also 3- and 5-across;
+         12% of the stored corpus is not four options)
+      2. 2 columns x ceil(N/2) rows, filled ROW-MAJOR so reading order is
+         stored order
+      3. one option per line (what every question printed before this change)
+
+    ALIGNMENT CONTRACT — this is the part that must never break. A student
+    marks a sheet against printed option positions and the grader reads it back
+    against the STORED labels, so:
+      * each cell carries "letter) text" as ONE Paragraph, never a label cell
+        beside a text cell that a grid could drift apart;
+      * labels come from `options.items()` in stored order and are printed
+        verbatim — they are NOT sequential (`a,b,d,e` is 46% of the corpus,
+        `АБВГ` is Cyrillic, `abDe` is mixed case), and nothing here renumbers
+        or reorders them;
+      * if the width estimate is ever wrong the cell WRAPS to a taller row.
+        Degradation costs vertical space; it cannot misalign a label.
+    """
+    items = [(letter, text) for letter, text in options.items() if text]
+    if not items:
+        return []
+
+    cell_style = STYLES["option_cell"]
+    markups = [(letter, render_to_markup(text)) for letter, text in items]
+    n = len(markups)
+    indent = STYLES["option"].leftIndent
+    table_w = available_w - indent
+    widest = max(
+        _markup_width(f"{letter}) {mk}", cell_style) for letter, mk in markups
+    )
+
+    # Tier 1 (N columns) then tier 2 (2 columns). For N <= 2 they are the same
+    # layout, so only try it once.
+    for ncols in ([n] if n <= 2 else [n, 2]):
+        if widest <= table_w / ncols - _OPT_COL_GAP:
+            return [_option_table(markups, ncols, indent, table_w, cell_style)]
+
+    # Tier 3 — one option per line, the layout every question used before the
+    # reflow, kept unchanged as the fallback.
+    #
+    # NOT EXERCISED BY ANY REAL DATA: across all 546 stored option sets, ZERO
+    # reach this tier — the widest real option renders 152.3pt against a
+    # 228.9pt two-column cell. Only the synthetic very-long case in
+    # tests/test_variants_pdf_options_reflow.py gets here. Treat this branch as
+    # unproven in production: re-measure the corpus before assuming how it
+    # behaves, and do not "simplify" it on the assumption that it is dead.
+    # (_fit_imgs clamps a formula wider than the full line — impossible today,
+    # but this tier is the last stop before an overflow.)
+    return [
+        Paragraph(f"{letter}) {_fit_imgs(mk, table_w - _OPT_COL_GAP)}",
+                  STYLES["option"])
+        for letter, mk in markups
+    ]
+
+
+def _option_table(markups: list, ncols: int, indent: float,
+                  table_w: float, cell_style: ParagraphStyle) -> Table:
+    """The options as a grid, filled ROW-MAJOR. The leading zero-width column
+    reproduces STYLES["option"]'s 12pt indent without stealing width from the
+    first option's cell."""
+    col_w = table_w / ncols
+    rows = []
+    for i in range(0, len(markups), ncols):
+        chunk = markups[i:i + ncols]
+        cells = [Paragraph(f"{letter}) {mk}", cell_style) for letter, mk in chunk]
+        cells += [""] * (ncols - len(cells))   # short last row (e.g. 3 options)
+        rows.append([""] + cells)
+    tbl = Table(rows, colWidths=[indent] + [col_w] * ncols, hAlign="LEFT")
+    tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), _OPT_COL_GAP),
+        ("TOPPADDING",    (0, 0), (-1, -1), _OPT_CELL_PAD),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), _OPT_CELL_PAD),
+    ]))
+    return tbl
+
+
 def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
     """exam_title is retained for signature compatibility but no longer
     printed — each variant starts with a handwriting fill-in block."""
@@ -364,6 +507,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         story.append(Spacer(1, 3 * mm))
 
         for q in questions:
+            # A question is assembled as ONE block and placed with KeepTogether
+            # (see the end of this loop), so a page break can never strand an
+            # option away from the stem it belongs to.
+            block: list = []
             pos       = q.get("position_in_variant", q.get("question_number", "?"))
             # Typeset math (parse→render); prose stays verbatim, bail-safe.
             q_text    = render_to_markup(q.get("question_text", ""))
@@ -383,7 +530,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
 
             # Group context box
             if group_ctx:
-                story.append(Spacer(1, 3 * mm))
+                block.append(Spacer(1, 3 * mm))
                 para = Paragraph(render_to_markup(group_ctx).replace("\n", "<br/>"), STYLES["context"])
                 tbl = Table([[para]], colWidths=[available_w])
                 tbl.setStyle(TableStyle([
@@ -394,11 +541,11 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                     ("LEFTPADDING",   (0, 0), (-1, -1), 8),
                     ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                 ]))
-                story.append(tbl)
-                story.append(Spacer(1, 3 * mm))
+                block.append(tbl)
+                block.append(Spacer(1, 3 * mm))
 
             # Question text
-            story.append(Paragraph(f"{pos}. {q_text}", STYLES["question_variant"]))
+            block.append(Paragraph(f"{pos}. {q_text}", STYLES["question_variant"]))
 
             # ── Image block ──────────────────────────────────────────────────
             if q.get("has_image"):
@@ -408,7 +555,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 if img_path:
                     img_flow = _load_image_rl(img_path, max_width=available_w * 0.80)
                     if img_flow:
-                        story.append(Spacer(1, 2 * mm))
+                        block.append(Spacer(1, 2 * mm))
                         # BUG FIX: added left/right padding so image doesn't
                         # touch the edge of the content area
                         tbl = Table([[img_flow]], colWidths=[available_w])
@@ -420,44 +567,57 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                             ("LEFTPADDING",   (0, 0), (-1, -1), 8),
                             ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
                         ]))
-                        story.append(tbl)
-                        story.append(Spacer(1, 2 * mm))
+                        block.append(tbl)
+                        block.append(Spacer(1, 2 * mm))
                     else:
                         # Image path exists but failed to load — show description
-                        _append_img_desc(story, img_desc, available_w)
+                        _append_img_desc(block, img_desc, available_w)
                 elif img_desc:
                     # No path at all — show description as styled box
-                    _append_img_desc(story, img_desc, available_w)
+                    _append_img_desc(block, img_desc, available_w)
 
             # ── BUG FIX: open-ended questions ────────────────────────────────
             # Previously: silently rendered nothing → looked broken to students.
             # Now: show a clear label and a writing line so students know to
             # write their answer, instead of staring at blank space.
             if is_open:
-                story.append(Paragraph(
+                block.append(Paragraph(
                     "<i>(Javobni yozing)</i>",
                     STYLES["open_ended_label"],
                 ))
                 # Draw a dotted answer line
-                story.append(Spacer(1, 2 * mm))
-                story.append(HRFlowable(
+                block.append(Spacer(1, 2 * mm))
+                block.append(HRFlowable(
                     width="80%", thickness=0.5,
                     color=colors.HexColor("#aaaaaa"),
                     dash=(2, 4),
                     spaceAfter=2 * mm,
                 ))
             else:
-                # Answer options (multiple-choice only). Iterate the REAL labels
-                # in printed order (Latin or Cyrillic, gaps preserved) — never a
-                # fixed A..E list, which would drop Cyrillic labels.
-                for letter, opt_text in options.items():
-                    if opt_text:
-                        story.append(Paragraph(
-                            f"{letter}) {render_to_markup(opt_text)}", STYLES["option"]
-                        ))
+                # Answer options (multiple-choice only). Laid out on as few
+                # lines as they FIT on — see _option_flowables, which keeps each
+                # REAL stored label welded to its own text in a single cell
+                # (Latin or Cyrillic, gaps preserved, never a fixed A..E list).
+                block.extend(_option_flowables(options, available_w))
 
             # Trailing gap between questions — halved so more fit per page.
-            story.append(Spacer(1, 1.5 * mm))
+            block.append(Spacer(1, 1.5 * mm))
+
+            # Keep the whole question on one page. This builder had no
+            # KeepTogether at all (the compact one always did), so a break could
+            # land mid-question and strand an option at the top of the next page
+            # — observed on a real render, where a variant's last option printed
+            # alone above the following question's stem.
+            #
+            # Safe here because no real block is anywhere near a frame tall:
+            # measured over every stored question, the tallest possible block
+            # (a 395pt figure plus stem and options) is 461pt against a 714pt
+            # frame — 64%, and 0 of 177 image-bearing questions exceed 75%. So
+            # KeepTogether can always place a block and never hits ReportLab's
+            # "flowable too large" path; the worst case is one short block
+            # pushed to the next page, against a guaranteed orphan on every
+            # page break before this.
+            story.append(KeepTogether(block))
 
         story.append(PageBreak())
 
@@ -465,8 +625,6 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
     logger.info("variants_pdf_built", variants=len(variants))
     return buf.getvalue()
 
-
-import re as _re
 
 # FIX 3(d): a description box must carry real content — never placeholders
 # like "diagram is cut off".
@@ -502,7 +660,7 @@ def _append_img_desc(story: list, img_desc: str | None, available_w: float) -> N
 # Rescale an inline math <img> only when it is WIDER than the narrow column —
 # proportionally, never cropped, never dropped to ASCII. Layout-only: operates
 # on the generated markup, never on math source (math_render.py is untouched).
-_IMG_TAG_RE = _re.compile(r'<img\b[^>]*?/>')
+# (_IMG_TAG_RE now lives with the option-reflow helpers above; both need it.)
 
 
 def _fit_imgs(markup: str, max_w: float) -> str:
