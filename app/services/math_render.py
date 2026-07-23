@@ -48,7 +48,7 @@ except Exception as _e:  # pragma: no cover - only when dep missing
 # Bump _CACHE_VERSION whenever the AST→LaTeX or the PNG rendering changes, so a
 # stale image from an older build can NEVER be served (it is baked into both the
 # cache dir name and the per-image key).
-_CACHE_VERSION = "v2"
+_CACHE_VERSION = "v3"
 _CACHE_DIR = Path(tempfile.gettempdir()) / f"testova_math_cache_{_CACHE_VERSION}"
 _FONT_PT = 12.0      # a touch larger than the 10pt body so fractions stay legible
 _RENDER_DPI = 300    # crisp for print; displayed back at natural point size
@@ -344,7 +344,16 @@ class _Parser:
             items.append(self._term(stop))
         return items
 
-    def _term(self, stop: set[str]) -> Node:
+    def _power(self, stop: set[str]) -> Node:
+        """A factor plus any scripts glued to it — scripts bind TIGHTER than
+        fraction division (Defect 2).
+
+        The exponent in "a/b^2" belongs to the DENOMINATOR (a/b²), not to the
+        whole fraction ((a/b)² is a different number). Subscripts follow the
+        same rule: "x_1/x_2" is x₁/x₂, never (x₁/x)₂. An explicit "(a/b)^2"
+        still raises the whole fraction — the parens make it a Paren factor
+        before any script is read, so the escape hatch is unaffected.
+        """
         node = self._factor(stop)
         while True:
             t = self._peek()
@@ -356,10 +365,20 @@ class _Parser:
             elif t.kind == "_":
                 self._next()
                 node = Sub(node, self._script_operand())
-            elif t.kind == "/":
+            else:
+                break
+        return node
+
+    def _term(self, stop: set[str]) -> Node:
+        node = self._power(stop)
+        while True:
+            t = self._peek()
+            if t is None or t.kind in stop:
+                break
+            if t.kind == "/":
                 self._next()
                 self._skip_sp()
-                node = Frac(node, self._factor(stop))
+                node = Frac(node, self._power(stop))
             else:
                 break
         return node

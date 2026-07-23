@@ -6,8 +6,8 @@ Gemini transcribes 2^8 and math_render typesets 2⁸.
 
 Includes: the trailing-separator case found in the real paper (a ';' inheriting
 superscript must NOT be swallowed into the exponent), adversarial cases proving
-correct render, and a characterization test pinning the pre-existing Defect 2
-fraction-denominator mis-scope so it can't silently change.
+correct render, and the Defect 2 regression tests (scripts bind tighter than
+fraction division: a/b^2 is a/b², not the different number (a/b)²).
 """
 import io
 
@@ -95,10 +95,29 @@ def test_paren_base_and_multitoken_exponent_correct():
     assert parse("2^(n+1) + (c-1)").latex() == "{2}^{n+1} + \\left(c-1\\right)"
 
 
-# ── characterization: the pre-existing Defect 2 mis-scope (must not drift) ───
-def test_denominator_exponent_misscope_is_pinned():
-    # KNOWN-WRONG, pre-existing math_render precedence bug (Defect 2, backlog):
-    # an exponent on a fraction denominator hoists to the whole fraction.
-    # Confirmed ABSENT from the live paper; pinned here so a change is visible.
-    assert parse("a/b^2").latex() == "{\\frac{a}{b}}^{2}"       # should be a/b^2
-    assert parse("a^2/b^2").latex() == "{\\frac{{a}^{2}}{b}}^{2}"
+# ── Defect 2 (FIXED): scripts bind tighter than fraction division ────────────
+def test_denominator_script_binds_tighter_than_fraction():
+    # A script on a denominator belongs to the DENOMINATOR, never hoisted onto
+    # the whole fraction — (a/b)^2 is a DIFFERENT NUMBER than a/b^2, so the old
+    # hoist put false math in front of students.
+    assert parse("a/b^2").latex() == "\\frac{a}{{b}^{2}}"
+    assert parse("a^2/b^2").latex() == "\\frac{{a}^{2}}{{b}^{2}}"
+    assert parse("a/b^2/c").latex() == "\\frac{\\frac{a}{{b}^{2}}}{c}"
+    # a radical numerator stays intact; only the precedence around it is fixed
+    assert parse("sqrt(a)/b^2").latex() == "\\frac{\\sqrt{a}}{{b}^{2}}"
+    # a parenthesised denominator takes the script too
+    assert parse("a/(b+c)^2").latex() == "\\frac{a}{{\\left(b+c\\right)}^{2}}"
+    # subscripts are the SAME rule: x_1/x_2 is x1/x2, never (x_1/x)_2
+    assert parse("a/b_2").latex() == "\\frac{a}{{b}_{2}}"
+    assert parse("x_1/x_2").latex() == "\\frac{{x}_{1}}{{x}_{2}}"
+
+
+def test_defect2_fix_leaves_neighbouring_shapes_alone():
+    # the explicit escape hatch still raises the WHOLE fraction
+    assert parse("(a/b)^2").latex() == "{\\left(\\frac{a}{b}\\right)}^{2}"
+    # a numerator script was always correct and must not move
+    assert parse("a^2/b").latex() == "\\frac{{a}^{2}}{b}"
+    # division stays left-associative
+    assert parse("a/b/c").latex() == "\\frac{\\frac{a}{b}}{c}"
+    # a radical denominator is untouched
+    assert parse("a/sqrt(b)").latex() == "\\frac{a}{\\sqrt{b}}"
