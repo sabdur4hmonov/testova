@@ -196,3 +196,45 @@ near-misses ("A line segment with points A, B, C marked on it.").
 **Reopen criterion:** a leak observed on a NEW extraction (post-`_is_meta_desc`).
 Until then this is a closed door, and Option D is machinery maintained forever
 against a class that is not being produced.
+
+## PDF variant layout — Group B (options reflow) considerations
+
+Group A (compact header, reachable write-in line, tighter spacing) shipped in
+**v0.23**. Group B — laying options out on fewer lines (4-across, else a 2x2
+grid, else one per line) — is deliberately held for its own session.
+
+### The alignment constraint Group B lives or dies on
+Change 2 alters how an option LABEL maps onto a printed POSITION. A student
+marks a sheet against those positions and the grader reads it against the
+STORED labels, so a reflow that ever detaches a label from its own text — or
+drops a label into the wrong grid cell — silently reintroduces the exact
+option-alignment bug class the whole `option_label_recovery` backstop exists to
+prevent, except as a LAYOUT bug: invisible in the code, visible only in a
+printed PDF.
+
+- Carry `"{letter}) {text}"` as **ONE table cell**. Never put the label in one
+  cell and its text in another, where the grid could drift them apart.
+- Pull labels from the stored option data, **whatever they are**. They are NOT
+  sequential: `a, b, d, e` (gapped, 252 rows) and `А, Б, В, Г` (Cyrillic, 72
+  rows) are both common — see the Defect 4 measurement. `build_variants_pdf`
+  already iterates `options.items()` in stored order, and
+  `tests/test_variants_pdf_layout.py` pins that gapped and Cyrillic sets print
+  verbatim. Any reflow must keep those tests green.
+- Prove the 2x2 grid on a GAPPED set specifically — four options with no `c`
+  must render `a/b/d/e`, never relabelled to `a/b/c/d`.
+- Prove the width thresholds with a long-option case that forces 2x2 and a
+  very-long case that forces one-per-line, rather than guessing them.
+
+### Deferred INTO Group B: the page-break option orphan
+Observed on the Group A sample render — a variant's last option (`D) …`) landed
+alone at the top of the next page, split from its question. **Pre-existing, not
+a Group A regression:** `build_variants_pdf` never wraps a question block in
+`KeepTogether`, while `build_variants_pdf_compact` already does. Group A's
+tighter spacing only shifts WHERE breaks fall; it does not create the behaviour.
+
+It is deferred into Group B on purpose rather than fixed separately: wrapping a
+question plus its options in `KeepTogether` changes pagination AND interacts
+with how the options lay out (a 4-across row, a 2x2 grid and a 1-per-line stack
+each have a different block height, so each changes what fits before a break,
+and an over-eager `KeepTogether` on a tall block pushes whole questions to the
+next page and wastes more space than the orphan cost). Decide both together.
