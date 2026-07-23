@@ -211,3 +211,38 @@ def test_gutter_divider_compact_only():
 
     assert has_vertical_rule(build_variants_pdf_compact([_variant(MATHY)], "T"))
     assert not has_vertical_rule(build_variants_pdf([_variant(MATHY)], "T"))
+
+
+# ── open-ended write-in line, derived from the options actually present ──────
+# `is_open_ended` never survives persistence (no DB column, absent from
+# Question.to_dict() and from the dicts handed to generate_variants), so the
+# flag was always False here and this builder's write-in block was unreachable —
+# an option-less question printed a bare stem. Same fix as build_variants_pdf.
+
+def _compact_text(qs) -> str:
+    doc = fitz.open(stream=build_variants_pdf_compact([_variant(qs)], "T"),
+                    filetype="pdf")
+    try:
+        return "\n".join(doc[i].get_text() for i in range(len(doc)))
+    finally:
+        doc.close()
+
+
+def test_compact_no_options_gets_the_write_in_line_without_any_flag():
+    qs = [{"position_in_variant": 1, "question_text": "Ochiq savol", "options": {}}]
+    assert "Javobni yozing" in _compact_text(qs)
+
+
+def test_compact_all_blank_options_count_as_open_ended():
+    qs = [{"position_in_variant": 1, "question_text": "Savol",
+           "options": {"a": "", "b": None, "c": "   "}}]
+    assert "Javobni yozing" in _compact_text(qs)
+
+
+def test_compact_options_none_does_not_crash():
+    qs = [{"position_in_variant": 1, "question_text": "Savol", "options": None}]
+    assert "Javobni yozing" in _compact_text(qs)
+
+
+def test_compact_multiple_choice_gets_no_write_in_line():
+    assert "Javobni yozing" not in _compact_text(MATHY)
