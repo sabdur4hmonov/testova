@@ -827,6 +827,53 @@ def _compact_flowables(markup: str, style: ParagraphStyle, max_w: float,
     return flow or [Paragraph(prefix + markup, style)]
 
 
+_COMPACT_OPT_GAP = 4.0   # inter-cell gutter in the narrow compact column
+
+
+def _compact_option_cell(style: ParagraphStyle):
+    """Cell renderer for the compact option grid.
+
+    Routes each option through _compact_flowables, so a TALL stacked fraction
+    is still promoted to its own Image flowable — inside the cell — instead of
+    confusing autoLeading and drawing onto the next line. The returned list is
+    the cell's content (ReportLab accepts a list of flowables per cell).
+
+    `total_w` is the CELL width, not the column width: _compact_flowables hands
+    it to _prefix_img_row, which builds a nested table to keep a lone "A)" on
+    the promoted image's line. Passing the column width there would build a
+    nested table WIDER than its own cell.
+
+    Verified by geometry on a real gapped a,b,d,e set of stacked fractions:
+    every label prints on the same row as its own fraction, ~5.5pt away, with
+    zero image overflow past a cell edge.
+    """
+    def render(letter: str, markup: str, cell_w: float) -> list:
+        prefix = f"{letter}) "
+        # An image is capped to what is left AFTER the label, because
+        # _prefix_img_row lays the two side by side inside `total_w`; capping at
+        # the full cell width would overflow that nested table by the label.
+        img_w = max(10.0, cell_w - _prefix_w(prefix, style))
+        return _compact_flowables(
+            _fit_imgs(markup, img_w), style, img_w, cell_w,
+            prefix=prefix, space=5.0,
+        )
+    return render
+
+
+def _compact_option_line(style: ParagraphStyle, total_w: float):
+    """Tier-3 renderer for the compact builder — one option per line, what this
+    builder printed before the reflow. Unlike the standard builder, 3 real
+    stored option sets DO reach this tier at the compact geometry."""
+    def render(letter: str, markup: str, line_w: float) -> list:
+        prefix = f"{letter}) "
+        img_w = max(10.0, line_w - _prefix_w(prefix, style))
+        return _compact_flowables(
+            _fit_imgs(markup, img_w), style, img_w, total_w,
+            prefix=prefix, space=5.0,
+        )
+    return render
+
+
 def _compact_page(canvas, doc) -> None:
     """Footer + a thin light-gray rule down the gutter (compact layout only)."""
     _page_footer(canvas, doc)
@@ -855,7 +902,6 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     # cap images to the TRUE available width, leaving room for the leading
     # prefix ("10." / "A)") so they never overflow or orphan the number
     stem_max_w = usable - 18
-    opt_max_w = usable - opt_indent - 14
     frame_h = PAGE_HEIGHT - MARGIN - BOTTOM_MARGIN
     left = Frame(MARGIN, BOTTOM_MARGIN, colw, frame_h,
                  leftPadding=0, rightPadding=frame_pad, topPadding=0, bottomPadding=0, id="c1")
@@ -878,6 +924,12 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     # — the tighter question gap the standard builder took in v0.23.
     q_st = ParagraphStyle("c_q", parent=STYLES["question_variant"], fontSize=9)
     o_st = ParagraphStyle("c_o", parent=STYLES["option"], fontSize=8, leftIndent=opt_indent)
+    # Option INSIDE a grid cell: the indent belongs to the table's leading
+    # column, and a Table cell does not apply spaceBefore/After anyway. A CHILD
+    # of c_o, which is itself a child of the shared STYLES["option"] — nothing
+    # here mutates a shared entry, which would restyle the ANSWER KEY too.
+    o_cell = ParagraphStyle("c_o_cell", parent=o_st,
+                            leftIndent=0, spaceBefore=0, spaceAfter=0)
     ctx_st = ParagraphStyle("c_ctx", parent=STYLES["context"], fontSize=8)
     open_st = ParagraphStyle("c_open", parent=STYLES["open_ended_label"], fontSize=8)
     fill_st = ParagraphStyle("c_fill", parent=STYLES["fillin"], fontSize=9)
@@ -965,14 +1017,17 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                                         color=colors.HexColor("#aaaaaa"),
                                         dash=(2, 4), spaceAfter=1.5 * mm))
             else:
-                # Real labels in printed order (any script, gaps preserved).
-                for letter, opt_text in options.items():
-                    if opt_text:
-                        mk = _fit_imgs(render_to_markup(opt_text), opt_max_w)
-                        block.extend(_compact_flowables(
-                            mk, o_st, opt_max_w, usable, prefix=f"{letter}) ",
-                            space=5.0,
-                        ))
+                # Options on as few lines as they FIT on, through the SAME
+                # ladder the standard builder uses — real labels in printed
+                # order (any script, gaps preserved), each welded to its own
+                # text in one cell.
+                block.extend(_option_flowables(
+                    options, usable,
+                    measure_style=o_cell, indent=opt_indent,
+                    gap=_COMPACT_OPT_GAP,
+                    cell=_compact_option_cell(o_cell),
+                    line=_compact_option_line(o_st, usable),
+                ))
 
             block.append(Spacer(1, 2.5 * mm))
             # keep a whole question together so it never splits across a column

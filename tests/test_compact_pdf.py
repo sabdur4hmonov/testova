@@ -164,18 +164,26 @@ def test_bug2_number_not_orphaned_above_formula():
 
 
 def test_bug1b_consecutive_option_images_do_not_collide():
-    # stacked-fraction options must have real vertical gaps between them
+    # Stacked-fraction options must never overlap. Since the options reflow,
+    # they no longer stack unconditionally — four short fractions share ONE row
+    # — so "separated" is checked in the axis that actually applies: options on
+    # the same row are separated HORIZONTALLY, options on different rows
+    # VERTICALLY. The original single-axis check read a correct 4-across row as
+    # a collision.
     q = {"position_in_variant": 2, "question_number": 2,
          "question_text": "Toping.",
          "options": {"A": "(8)/(5)", "B": "(8)/(3)", "C": "(3)/(8)", "D": "(5)/(8)"}}
     pdf = build_variants_pdf_compact([_variant([q])], "T")
     d = fitz.open(stream=pdf, filetype="pdf")
-    imgs = sorted(_imgs(d[0]), key=lambda b: b[1])
+    imgs = _imgs(d[0])
     d.close()
     assert len(imgs) == 4
-    for i in range(1, len(imgs)):
-        gap = imgs[i][1] - imgs[i - 1][3]
-        assert gap >= 1.0, f"option fractions collide (gap={gap:.1f})"
+    for i, a in enumerate(imgs):
+        for b in imgs[i + 1:]:
+            overlap_x = min(a[2], b[2]) - max(a[0], b[0])
+            overlap_y = min(a[3], b[3]) - max(a[1], b[1])
+            assert overlap_x <= 0 or overlap_y <= 0, (
+                f"option fractions overlap in BOTH axes: {a} vs {b}")
 
 
 def test_bug4_orphan_punctuation_dropped_operators_kept():
