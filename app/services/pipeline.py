@@ -28,7 +28,10 @@ from app.services.ai_analyzer import (
     sections_confident,
     summarize_sections,
 )
-from app.services.option_label_recovery import recover_pdf_option_labels
+from app.services.option_label_recovery import (
+    flag_mixed_case_labels,
+    recover_pdf_option_labels,
+)
 from app.services.file_processor import (
     attach_docx_inline_images,
     attach_images_to_questions,
@@ -204,6 +207,13 @@ async def process_file(
         await asyncio.to_thread(
             recover_pdf_option_labels, _pdf_bytes_for_crop, all_questions
         )
+
+    # Defect 4: a label set that MIXES case ("a, b, D, e") is a source typo and
+    # prints verbatim as an odd capital. Source-INDEPENDENT, so it deliberately
+    # sits OUTSIDE the PDF guard above — a DOCX gets no text-layer backstop and
+    # would otherwise never be flagged. Runs AFTER the backstop so it judges the
+    # FINAL labels. Advisory only: rides label_doubt, rewrites nothing.
+    flag_mixed_case_labels(all_questions)
 
     # ── FIX 2 + FIX 3: scheme-dependent questions must carry scheme content ──
     scheme_failed = await analyzer.ensure_scheme_content(
