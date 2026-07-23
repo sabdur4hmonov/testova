@@ -235,7 +235,7 @@ def test_variant_pdf_layout():
     assert "Test nomi:" in text
     assert "Ism familiya:" in text
     assert "Guruh:" in text
-    assert "Ball:" in text
+    assert "Ball:" not in text                # Group A: dropped from the header
     assert "TEACHERNAME" not in text          # title removed
     assert "cut off" not in text              # useless desc suppressed
     # footer page number: a lone "1" in the bottom margin zone
