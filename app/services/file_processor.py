@@ -1342,7 +1342,7 @@ class _DocxCanvas:
         for row in rows:
             cells = row.cells
             wrapped = [
-                _wrap_text(self.draw, c.text, font, col_w - 2 * _DOCX_TABLE_PAD)
+                _wrap_text(self.draw, _cell_scripted_text(c), font, col_w - 2 * _DOCX_TABLE_PAD)
                 for c in cells
             ]
             row_h = max(
@@ -1363,6 +1363,63 @@ class _DocxCanvas:
             self.y += row_h
 
 
+# python-docx `.text` silently drops run-level `w:vertAlign` (super/subscript),
+# flattening U² → U2, 2⁸ → 28 — arithmetically false once printed. We rebuild the
+# paragraph text from runs and make the formatting VISIBLE as ^/_ caret notation
+# (which the vision prompt already asks for), so Gemini transcribes 2^8 and the
+# math renderer typesets 2⁸.
+#
+# Trailing separators (";", spaces) sometimes inherit the superscript property
+# (the author left it on) and must be peeled OUT of the caret, or an option
+# separator gets swallowed into the exponent ("512=2^(8; )").
+_SCRIPT_TRAIL_RE = re.compile(r'[\s;,.):\]}]+$')
+# An exponent/index needs parens only when it is a multi-token expression (has an
+# operator or space); a bare number/word ("10", "n") renders fine without them.
+_SCRIPT_PARENS_RE = re.compile(r'[+\-*/^ ]')
+
+
+def _wrap_script(text: str, marker: str) -> str:
+    m = _SCRIPT_TRAIL_RE.search(text)
+    core = text[:m.start()] if m else text
+    trail = text[m.start():] if m else ""
+    if not core:
+        return text  # nothing but punctuation/space — leave as-is
+    body = f"{marker}({core})" if _SCRIPT_PARENS_RE.search(core) else f"{marker}{core}"
+    return body + trail
+
+
+def _para_scripted_text(para) -> str:
+    """Paragraph text with super/subscript runs surfaced as ^/_ notation.
+    Bail-safe: any error reverts to `.text` AND logs at warning, so a run-walk
+    that throws on a real DOCX surfaces as a regression instead of silently
+    reverting every question to flattened superscripts."""
+    try:
+        out: list[str] = []
+        for r in para.runs:
+            t = r.text
+            if not t:
+                continue
+            if r.font.superscript:
+                out.append(_wrap_script(t, "^"))
+            elif r.font.subscript:
+                out.append(_wrap_script(t, "_"))
+            else:
+                out.append(t)
+        result = "".join(out)
+        return result if result else para.text  # run-less para (fields) → .text
+    except Exception as e:
+        logger.warning("docx_script_walk_failed", error=str(e))
+        return para.text
+
+
+def _cell_scripted_text(cell) -> str:
+    try:
+        return "\n".join(_para_scripted_text(p) for p in cell.paragraphs) or cell.text
+    except Exception as e:
+        logger.warning("docx_cell_script_walk_failed", error=str(e))
+        return cell.text
+
+
 def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
     """Render a DOCX into page images (fed to the vision pipeline) + its text.
 
@@ -1378,22 +1435,24 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
         for block in _iter_docx_blocks(doc):
             if isinstance(block, _DocxParagraph):
                 if block.text.strip():
-                    canvas.text_block(block.text, body_font)
-                    text_parts.append(block.text)
+                    scripted = _para_scripted_text(block)
+                    canvas.text_block(scripted, body_font)
+                    text_parts.append(scripted)
                 for pic in _para_inline_images(doc, block):
                     canvas.image_block(pic)
             elif isinstance(block, _DocxTable):
                 canvas.table_block(block, body_font)
                 for row in block.rows:
-                    text_parts.append(" | ".join(c.text for c in row.cells))
+                    text_parts.append(" | ".join(_cell_scripted_text(c) for c in row.cells))
     except Exception as e:
         logger.warning("docx_structured_render_failed", error=str(e))
         # Fallback: dump all paragraph text onto fresh pages.
         canvas = _DocxCanvas()
         for para in doc.paragraphs:
             if para.text.strip():
-                canvas.text_block(para.text, body_font)
-                text_parts.append(para.text)
+                scripted = _para_scripted_text(para)
+                canvas.text_block(scripted, body_font)
+                text_parts.append(scripted)
 
     pages = [
         PageImage(page_number=i + 1, image=img)
