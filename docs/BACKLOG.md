@@ -65,3 +65,50 @@ on T-108 multiple times. Adding trailing-digit stripping, or a `VISION_PROMPT` r
 Also obsolete in that doc (already implemented and committed, do not re-plan):
 - ~~"2-column layout support"~~
 - ~~"question ordering across columns"~~
+
+## DOCX extraction / rendering defects (from live run, 2026-07-22)
+
+Found on a real DOCX math exam (`5-sinf_matematika_test_1-variant.docx`). All
+pre-existing (git-confirmed: `docx_to_images` and `math_render` unchanged on the
+grading-unification branch). Defect 1 (superscript loss) is being handled
+pre-merge; these are the carve-offs.
+
+### Defect 3 — `docx_to_images` drops OMML equations & VML shapes (BIG)
+A whole question's content vanished (a vertical subtraction puzzle → only the
+stem stored). `docx_to_images` renders only `paragraph.text` + tables; Word
+equation objects (`m:oMath` / `oMathPara`) and drawing shapes (`v:shape` /
+`w:pict`) are in separate XML namespaces and are silently dropped before Gemini.
+Fix needs an OMML→text linearizer (mini-parser over ~15 element types: `m:f`,
+`m:rad`, `m:sSup`, `m:sSub`, `m:d`, `m:nary`, …) or an OMML→image render (headless
+Word/LibreOffice dep). LARGE — genuinely separate from the Defect 1 run-walk.
+Lower severity than Defect 1: affected puzzles are OPEN (no answer key), so a
+missing puzzle is a *visibly incomplete* question, ungraded — not a silently
+wrong key. Same root also explains the un-extractable figure (Defect 5, a VML
+shape).
+
+### Defect 2 — `math_render` mis-scopes a `^` on a fraction denominator (MEDIUM)
+`3,5x/0.7`-style stems and, more sharply, **an exponent on a fraction
+denominator**: `a/b^2` → renders `(a/b)^2` (WRONG, should be `a/b^2`); `a^2/b^2`
+→ `(a^2/b)^2`. A parser-precedence bug in `math_render`, independent of source
+(hits PDF too). Found via adversarial testing of the Defect 1 caret synthesis —
+NOTE: the flat form (`a2/b2`) is *also* mis-typeset today, so Defect 1 does not
+regress it (wrong→wrong), but this bug should be fixed so DOCX superscript
+fractions render correctly. Visible-wrong, single question, no silent key
+corruption → post-merge. Contrast: `(2,15+a)/2` (parens) renders correctly.
+
+### Defect 4 — capital label leaks into printed options; no display normalization (SMALL)
+A teacher typo (`D=8`) stored the option label as capital `D` among lowercase
+`a,b,e`, and it prints verbatim. Verbatim storage is CORRECT for real gapped /
+Cyrillic labels, and the PDF-only backstop rightly never claimed DOCX — but a
+LONE capital among an otherwise-lowercase label set is almost certainly a typo
+and should be flaggable (or display-normalized) even without the text-layer
+backstop. Backlog: a cheap heuristic flag on mixed-case label sets, surfaced in
+the extraction summary like `label_doubt`.
+
+### Defect 5 — answer-revealing `[Rasm]` description (SMALL, policy)
+A figure question with no recoverable image printed a fallback description
+("…segments AB, BC, AC") that is answer-equivalent to option d — it solves the
+question. Policy: when a figure can't be rendered, a description that gives away
+the answer should be suppressed (or the question flagged), not printed. Distinct
+from the settled VML-not-extractable finding — the issue is the *content* of the
+fallback, not the missing image.
