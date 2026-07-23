@@ -169,6 +169,21 @@ STYLES = {
 for _mstyle in ("question", "option", "context", "img_desc"):
     STYLES[_mstyle].autoLeading = "max"
 
+# ── Variant-PDF-only styles ──────────────────────────────────────────────────
+# CHILD styles, never mutations of the shared entries above. The compact builder
+# parents c_q/c_o on STYLES["question"]/["option"], and the ANSWER KEY parents
+# keycol_cell on STYLES["option"] — and a child built AFTER a parent mutation
+# inherits the mutated value, so editing a shared entry in place would silently
+# restyle both of those PDFs. Defined here, after the autoLeading loop, so they
+# inherit autoLeading="max" and tall typeset math keeps its reserved gap.
+STYLES["variant_header_center"] = ParagraphStyle(
+    "variant_header_center", parent=STYLES["variant_header"],
+    alignment=TA_CENTER, spaceBefore=3, spaceAfter=3,
+)
+STYLES["question_variant"] = ParagraphStyle(
+    "question_variant", parent=STYLES["question"], spaceBefore=4,
+)
+
 
 # ── Image loader — handles BOTH storage keys AND direct file paths ────────────
 
@@ -281,24 +296,43 @@ def _page_footer(canvas, doc) -> None:
     canvas.restoreState()
 
 
-# Fill-in header block: students write these by hand on the first page of
-# each variant. (The teacher-name title was removed — it served no one.)
-_FILLIN_ROWS = [
-    ("Test nomi:", 44),
-    ("Ism familiya:", 42),
-    ("Guruh:", 48),
-    ("Ball:", 16),
-]
+# Fill-in header fields: students write these by hand on the first page of each
+# variant. (The teacher-name title was removed — it served no one. "Ball:" was
+# removed too: the score belongs on the teacher's sheet, not the student's.)
+# Four stacked rows became ONE line, so the header costs 3 lines, not half a page.
+_FILLIN_FIELDS = ("Test nomi:", "Ism familiya:", "Guruh:")
 
 
-def _fillin_block() -> list:
-    flow = []
-    for label, dashes in _FILLIN_ROWS:
-        flow.append(Paragraph(
-            f"{label} " + "_" * dashes,
-            STYLES["fillin"],
-        ))
-    return flow
+def _fillin_row(available_w: float) -> Table:
+    """The handwriting fields on ONE line, evenly spread across the page.
+
+    Each label owns its own cell and its underline is sized to whatever space is
+    left in THAT cell, so a longer label just gets a shorter rule instead of
+    wrapping the whole row onto a second line.
+    """
+    style = STYLES["fillin"]
+    col_w = available_w / len(_FILLIN_FIELDS)
+    try:
+        under_w = pdfmetrics.stringWidth("_", style.fontName, style.fontSize)
+    except Exception:
+        under_w = 0.0
+    under_w = under_w or style.fontSize * 0.6
+    cells = [
+        Paragraph(
+            f"{label} " + "_" * max(4, int((col_w - _prefix_w(label, style) - 6) / under_w)),
+            style,
+        )
+        for label in _FILLIN_FIELDS
+    ]
+    tbl = Table([cells], colWidths=[col_w] * len(cells))
+    tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+    ]))
+    return tbl
 
 
 def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
@@ -317,21 +351,35 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        # "Variant N" stays prominent — grading matches it to answer keys.
-        story.append(Paragraph(f"Variant {vnum}", STYLES["variant_header"]))
-        story.extend(_fillin_block())
-        story.append(Spacer(1, 2 * mm))
+        # Compact header: the fill-in fields on ONE line, then "Variant N"
+        # centered between two rules. "Variant N" stays prominent — grading
+        # matches a student's sheet to its answer key by that number.
+        story.append(_fillin_row(available_w))
+        story.append(Spacer(1, 1.5 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
-        story.append(Spacer(1, 4 * mm))
+        story.append(Paragraph(f"Variant {vnum}", STYLES["variant_header_center"]))
+        story.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#1a237e")))
+        story.append(Spacer(1, 3 * mm))
 
         for q in questions:
             pos       = q.get("position_in_variant", q.get("question_number", "?"))
             # Typeset math (parse→render); prose stays verbatim, bail-safe.
             q_text    = render_to_markup(q.get("question_text", ""))
-            options   = q.get("options", {})
+            options   = q.get("options") or {}
             group_ctx = q.get("group_context")
-            is_open   = q.get("is_open_ended", False)
+            # `is_open_ended` never survives persistence — no DB column, absent
+            # from Question.to_dict() and from the dicts handed to
+            # generate_variants — so this flag was ALWAYS False here and the
+            # write-in block below was unreachable. Every option-less question
+            # printed a stem followed by blank space. Derive it from the options
+            # actually present at render time; a caller that DOES set the flag is
+            # still honoured. (The compact builder has the same latent gap; left
+            # alone deliberately — this change is scoped to build_variants_pdf.)
+            is_open   = q.get("is_open_ended", False) or not any(
+                str(v).strip() for v in options.values() if v is not None
+            )
 
             # Group context box
             if group_ctx:
@@ -350,7 +398,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                 story.append(Spacer(1, 3 * mm))
 
             # Question text
-            story.append(Paragraph(f"{pos}. {q_text}", STYLES["question"]))
+            story.append(Paragraph(f"{pos}. {q_text}", STYLES["question_variant"]))
 
             # ── Image block ──────────────────────────────────────────────────
             if q.get("has_image"):
@@ -408,7 +456,8 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                             f"{letter}) {render_to_markup(opt_text)}", STYLES["option"]
                         ))
 
-            story.append(Spacer(1, 3 * mm))
+            # Trailing gap between questions — halved so more fit per page.
+            story.append(Spacer(1, 1.5 * mm))
 
         story.append(PageBreak())
 
