@@ -702,9 +702,16 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
             block: list = []
             pos       = q.get("position_in_variant", q.get("question_number", "?"))
             q_text    = _fit_imgs(render_to_markup(q.get("question_text", "")), stem_max_w)
-            options   = q.get("options", {})
+            options   = q.get("options") or {}
             group_ctx = q.get("group_context")
-            is_open   = q.get("is_open_ended", False)
+            # Same derived trigger as build_variants_pdf: `is_open_ended` never
+            # survives persistence (no DB column, absent from Question.to_dict()
+            # and from the dicts handed to generate_variants), so the flag alone
+            # was always False and this builder's write-in block was unreachable
+            # too — an option-less question printed a bare stem here as well.
+            is_open   = q.get("is_open_ended", False) or not any(
+                str(v).strip() for v in options.values() if v is not None
+            )
 
             if group_ctx:
                 para = Paragraph(
