@@ -16,9 +16,13 @@ SAFETY MODEL — never guess a mapping:
   question is surfaced (suspicious report) for the teacher to eyeball. A
   question the backstop cannot see at all is as visible as one it declined.
 
-SCOPE: PDF only. DOCX (rendered to image here — no text layer) stays prompt-only
-(backlog follow-up). Scanned/image PDFs (no text layer at all) no-op entirely and
+SCOPE: the text-layer backstop is PDF only. DOCX (rendered to image here — no
+text layer) and scanned/image PDFs (no text layer at all) no-op entirely and
 fall through to today's behaviour.
+
+`flag_mixed_case_labels` below is the SOURCE-INDEPENDENT companion: it judges
+the labels themselves rather than the source, so a DOCX — which the backstop can
+never reach — still gets a label warning. It rides the same `label_doubt` flag.
 """
 from __future__ import annotations
 
@@ -177,3 +181,50 @@ def recover_pdf_option_labels(pdf_bytes: bytes | None,
         return applied
     finally:
         doc.close()
+
+
+def flag_mixed_case_labels(questions: list[dict]) -> int:
+    """Flag a question whose option labels MIX upper and lower case, in place.
+
+    A paper prints its option markers in ONE consistent case, so a set like
+    (a, b, D, e) is a typo at the source — and it reaches the student as an odd
+    capital among lowercase siblings. ADVISORY ONLY: the label is never
+    rewritten. Verbatim storage stays correct for real GAPPED sets ("a, b, d, e"
+    with no "c") and Cyrillic sets ("АБВГ") — neither trips this rule, because
+    the signal is a case MIX, never a gap and never a script.
+
+    Deliberately NOT flagged: a mixed-SCRIPT set (Latin "A" + Cyrillic "БВГ").
+    Latin "A" and Cyrillic "А" are visually identical in print, and
+    canonical_letter folds both sets to the same sequence, so it changes nothing
+    a teacher or a student can see. Flagging it would only train teachers to
+    ignore the flag.
+
+    Measured against all 679 stored options-JSON rows: fires on exactly one of
+    the eleven distinct label sets — the real "a, b, D, e" typo (12 rows) —
+    and stays silent on the 252 gapped-lowercase and 72 all-Cyrillic rows.
+
+    SOURCE-INDEPENDENT, unlike recover_pdf_option_labels: it must run OUTSIDE
+    the PDF-bytes guard, and AFTER the text-layer backstop so it judges the
+    FINAL labels that actually get stored and printed.
+
+    Returns the number of questions newly flagged.
+    """
+    flagged = 0
+    for q in questions:
+        if q.get("label_doubt"):
+            continue  # already flagged by the backstop — same teacher action
+        labels = [str(k).strip() for k in (q.get("options") or {})]
+        # str.isupper()/islower() are False for uncased labels ("1", "-"), so a
+        # numeric marker set can never trip this.
+        if not (any(s.isupper() for s in labels)
+                and any(s.islower() for s in labels)):
+            continue
+        q["label_doubt"] = True
+        flagged += 1
+        # ascii(): a mixed-case CYRILLIC set would otherwise crash a cp1251
+        # console at runtime and take the extraction down with it.
+        logger.info(
+            "label_doubt", question=q.get("question_number"),
+            reason="mixed_case", labels=ascii("".join(labels)),
+        )
+    return flagged
