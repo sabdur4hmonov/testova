@@ -315,15 +315,21 @@ def _page_footer(canvas, doc) -> None:
 _FILLIN_FIELDS = ("Test nomi:", "Ism familiya:", "Guruh:")
 
 
-def _fillin_row(available_w: float) -> Table:
-    """The handwriting fields on ONE line, evenly spread across the page.
+def _fillin_row(available_w: float, fields: tuple = _FILLIN_FIELDS,
+                style: ParagraphStyle | None = None) -> Table:
+    """The handwriting fields on ONE line, evenly spread across `available_w`.
 
     Each label owns its own cell and its underline is sized to whatever space is
     left in THAT cell, so a longer label just gets a shorter rule instead of
     wrapping the whole row onto a second line.
+
+    `fields`/`style` are parameterised for the COMPACT builder, whose column is
+    only ~213pt wide: three fields on one line there would leave
+    "Ism familiya:" a 7pt rule (one underscore), so it splits the same fields
+    over two rows instead. Defaults reproduce the standard builder exactly.
     """
-    style = STYLES["fillin"]
-    col_w = available_w / len(_FILLIN_FIELDS)
+    style = style or STYLES["fillin"]
+    col_w = available_w / len(fields)
     try:
         under_w = pdfmetrics.stringWidth("_", style.fontName, style.fontSize)
     except Exception:
@@ -334,7 +340,7 @@ def _fillin_row(available_w: float) -> Table:
             f"{label} " + "_" * max(4, int((col_w - _prefix_w(label, style) - 6) / under_w)),
             style,
         )
-        for label in _FILLIN_FIELDS
+        for label in fields
     ]
     tbl = Table([cells], colWidths=[col_w] * len(cells))
     tbl.setStyle(TableStyle([
@@ -687,9 +693,16 @@ def _fit_imgs(markup: str, max_w: float) -> str:
     return _IMG_TAG_RE.sub(_rescale, markup)
 
 
-_FILLIN_ROWS_COMPACT = [
-    ("Test nomi:", 18), ("Ism familiya:", 15), ("Guruh:", 20), ("Ball:", 8),
-]
+# Compact header fill-ins, split over TWO rows. Was four stacked rows including
+# "Ball:"; the standard builder collapsed the same fields to ONE line in v0.23,
+# but that does not port literally — a 213pt column leaves "Ism familiya:" a
+# 7.1pt rule (one underscore), unwritable. Two rows keep every rule usable and
+# still halve the header. "Ball:" is dropped for the same reason as the standard
+# builder: the score belongs on the teacher's sheet, not the student's.
+_FILLIN_ROWS_COMPACT = (
+    ("Test nomi:",),
+    ("Ism familiya:", "Guruh:"),
+)
 
 
 def _img_flowable(tag: str, max_w: float) -> RLImage | None:
@@ -834,8 +847,14 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
         PageTemplate(id="twocol", frames=[left, right], onPage=_compact_page)
     ])
 
-    head = ParagraphStyle("c_head", parent=STYLES["variant_header"], fontSize=10)
-    q_st = ParagraphStyle("c_q", parent=STYLES["question"], fontSize=9)
+    # "Variant N" centered between two rules, as the standard builder prints it
+    # (v0.23). Grading matches a student's sheet to its key by this number, so it
+    # stays prominent.
+    head = ParagraphStyle("c_head", parent=STYLES["variant_header_center"],
+                          fontSize=10)
+    # Parented on question_variant (spaceBefore=4), not question (spaceBefore=8)
+    # — the tighter question gap the standard builder took in v0.23.
+    q_st = ParagraphStyle("c_q", parent=STYLES["question_variant"], fontSize=9)
     o_st = ParagraphStyle("c_o", parent=STYLES["option"], fontSize=8, leftIndent=opt_indent)
     ctx_st = ParagraphStyle("c_ctx", parent=STYLES["context"], fontSize=8)
     open_st = ParagraphStyle("c_open", parent=STYLES["open_ended_label"], fontSize=8)
@@ -848,10 +867,14 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        story.append(Paragraph(f"Variant {vnum}", head))
-        for label, dashes in _FILLIN_ROWS_COMPACT:
-            story.append(Paragraph(f"{label} " + "_" * dashes, fill_st))
+        # Compact header, same shape as the standard builder's: fill-ins, then
+        # "Variant N" centered between two rules.
+        for fields in _FILLIN_ROWS_COMPACT:
+            story.append(_fillin_row(colw, fields, fill_st))
         story.append(Spacer(1, 1.5 * mm))
+        story.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#1a237e")))
+        story.append(Paragraph(f"Variant {vnum}", head))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(Spacer(1, 2 * mm))

@@ -63,9 +63,15 @@ def test_compact_each_variant_starts_on_new_page():
     pdf = build_variants_pdf_compact([_variant(qs, 1), _variant(qs, 2)], "T")
     d = fitz.open(stream=pdf, filetype="pdf")
     pg = next(p for p in d if "Variant 2" in p.get_text())
-    blk = min((b for b in pg.get_text("blocks") if "Variant 2" in b[4]), key=lambda b: b[1])
+    # Anchor on the page's TOPMOST block, not on the "Variant 2" text. Since the
+    # compact header was ported to the standard builder's shape, the fill-in
+    # fields print first and "Variant N" sits below them between two rules — so
+    # the variant label is no longer the topmost thing on its page. What this
+    # test is actually about is that the variant begins a FRESH page.
+    blk = min((b for b in pg.get_text("blocks") if b[6] == 0), key=lambda b: b[1])
     d.close()
     assert blk[1] < MARGIN + 20, "Variant 2 must start at the top of a fresh page"
+    assert "Test nomi" in blk[4], "a variant's page must open with its header"
 
 
 def test_compact_math_routes_through_render_not_ascii():

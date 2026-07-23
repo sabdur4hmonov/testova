@@ -48,7 +48,10 @@ def test_compact_renders_multisource_pool_variants():
     assert d.page_count >= 2
     imgs = sum(1 for p in d for b in p.get_text("rawdict")["blocks"] if b.get("type") == 1)
     pg = next(p for p in d if "Variant 2" in p.get_text())
-    blk = min((b for b in pg.get_text("blocks") if "Variant 2" in b[4]), key=lambda b: b[1])
+    # Topmost block, not the "Variant 2" text: the ported compact header prints
+    # the fill-in fields first and "Variant N" below them, so the label is no
+    # longer topmost. The property under test is the fresh page.
+    blk = min((b for b in pg.get_text("blocks") if b[6] == 0), key=lambda b: b[1])
     d.close()
     assert imgs >= 1, "math should route through math_render (image markup)"
     assert blk[1] < MARGIN + 20, "each variant must start on a fresh page"
