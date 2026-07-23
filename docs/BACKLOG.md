@@ -105,10 +105,94 @@ and should be flaggable (or display-normalized) even without the text-layer
 backstop. Backlog: a cheap heuristic flag on mixed-case label sets, surfaced in
 the extraction summary like `label_doubt`.
 
-### Defect 5 — answer-revealing `[Rasm]` description (SMALL, policy)
-A figure question with no recoverable image printed a fallback description
-("…segments AB, BC, AC") that is answer-equivalent to option d — it solves the
-question. Policy: when a figure can't be rendered, a description that gives away
-the answer should be suppressed (or the question flagged), not printed. Distinct
-from the settled VML-not-extractable finding — the issue is the *content* of the
-fallback, not the missing image.
+### Defect 5 — answer-revealing `[Rasm]` description — **CLOSED AS MEASURED (2026-07-23)**
+
+**Original report.** A figure question with no recoverable image printed a
+fallback description ("…segments AB, BC, AC") that is answer-equivalent to the
+correct option — it solves the question. Policy: when a figure can't be
+rendered, a description that gives away the answer should be suppressed (or the
+question flagged), not printed. Distinct from the settled VML-not-extractable
+finding — the issue is the *content* of the fallback, not the missing image.
+
+**Resolution: no code change. The class is already closed for new extractions.**
+Decided after a full measurement against the stored rows (DB only — zero Gemini
+quota, no re-upload). Do not re-plan this without reading the reasoning below.
+
+#### What is actually stored
+2423 questions → 216 carry `image_description` → 177 of those have a real
+`image_path`. **39 rows actually print a `[Rasm]` box** (28 distinct texts):
+
+| class | rows | example |
+|---|---|---|
+| ESSENTIAL content | ~20 | number lines with the distances; six-reaction chemistry tables (to 465 chars); reaction chains |
+| decorative | 9 | "A simple red car with two black wheels on a light blue background." |
+| generic, not revealing | ~7 | "A diagram showing points A, B, C on a line." |
+| **answer-revealing** | **4** | "A diagram showing points A, B, C and segments AB, BC, AC." |
+
+The ESSENTIAL set is ~20× the problem — those descriptions ARE the missing
+figure, and suppressing them makes the questions unanswerable. **Any blanket
+suppression of fallback descriptions is disqualified by that ratio alone.**
+
+#### Why it is closed: 3 of the 4 are already handled
+`_is_meta_desc` / `_META_DESC_RE` in `ai_analyzer.py` already blocks three of
+the four. Measured, per alternative:
+
+- "Question 7 asks to write the notation of segments…" → fires `^question \d+`
+- "Question 7 does not contain a scheme/diagram…" → fires `does-not-<verb>` **and** `^question \d+`
+- **"A diagram showing points A, B, C and segments AB, BC, AC." → fires NOTHING**
+
+Those three are **malformed** descriptions — prose *about the question* rather
+than *of a figure* — and are wrong unconditionally, whatever the question asks.
+They are stale rows predating that guard (commit `c97d657`). The guard catches
+them incidentally; not one is caught *because* it leaks.
+
+The fourth is **well-formed**: a faithful description of the figure. It is a
+leak only *relative to this question's answer*, because this question happens to
+ask the student to name the segments the figure contains. **That is a category
+difference, not a pattern gap** — and it needs a genuine semantic coincidence
+(a figure question whose faithful description names the answer, AND an
+unrecoverable figure). **One observed instance, in stale pre-guard data, with
+zero recurrence since.**
+
+#### DO NOT "fix" this by extending `_is_meta_desc`
+Measured against all 28 distinct descriptions:
+
+- `>=2` bare 2-cap tokens → catches it, but **9 false positives**, six of them
+  ESSENTIAL chemistry (`KOH`, `CO2`, `NaOH`, `Zn`, `O2` all yield 2-cap tokens).
+- `>=3` bare 2-cap tokens → still **6 false positives**, all essential tables.
+- `segments?\s+[A-Z]{2}` → catches it with **0 false positives on this corpus**,
+  and was still **REJECTED**: it is a *content* rule wearing a *shape* guard's
+  clothes. It does not generalise past the word "segment" (the same leak in
+  angles, or a table transcription, is untouched), and it would suppress that
+  exact sentence for a question where the description is legitimate and NEEDED
+  ("How many segments are shown?" / "What is the length of AB?"). It would also
+  contaminate a guard whose whole value is a clean shape-only contract —
+  "this description is malformed" — verifiable without knowing the question.
+
+#### If a real leak ever recurs, this is the mechanism (Option D)
+Only an **answer-comparison** detector actually closes the residual class,
+because the answer is the only thing separating the leak from the 8 innocent
+near-misses ("A line segment with points A, B, C marked on it.").
+
+- **Where:** at PDF render time, not extraction. The description is stored at
+  extraction (before the teacher enters the key) but printed at variant
+  generation (key known). **34 of 39 rows have a resolvable key**, including
+  pre-007 legacy rows via `Question.options_ordered`'s `option_a..d` fallback.
+- **Rule:** every token of the **correct option** must appear **as a token** in
+  the description → suppress (and report to the teacher; don't drop silently).
+- **Gate at >=2 tokens.** Single-token numeric answers (`280`, `138`, `194`) are
+  the false-positive risk — a transcribed table can contain that number. The
+  gate keeps the real case (3 tokens) and drops every numeric row from scope.
+- **Substring matching does NOT work** — the real row stores the correct option
+  as `AB,AC,BC` while the description says `AB, BC, AC`: same set, different
+  order, because variants shuffle options. And squashing punctuation makes
+  "points A, B, C" contain `ab`/`bc` by accident. **Token boundaries are
+  essential**; resolve the correct option **per variant**, not from the source row.
+- **Measured:** 4/4 revealing rows caught, **0 false positives across all 34
+  evaluable rows**, including the 8 near-miss segment descriptions.
+- **Render sites:** `_append_img_desc` in `pdf_generator.py`, called from the
+  image-failed-to-load and no-path branches, plus the compact builder's own site.
+
+**Reopen criterion:** a leak observed on a NEW extraction (post-`_is_meta_desc`).
+Until then this is a closed door, and Option D is machinery maintained forever
+against a class that is not being produced.
