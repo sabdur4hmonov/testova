@@ -60,3 +60,41 @@ def test_run_is_bounded():
 # ── no number set → no-op ────────────────────────────────────────────────────
 def test_no_number_noop():
     assert _strip(0, "`11. x") == "`11. x"
+
+
+# ── caret own-number: the DOCX superscript→caret bleed (real DB row qn=11) ────
+# _para_scripted_text turns a superscripted source number into "^11", and Gemini
+# transcribes the stem as "^11.Hisoblang:". The strip must see through the caret
+# — but ONLY when the caret number is the question's own number.
+def test_caret_own_number_stripped():
+    # the real bug row: qn=11, "^11.Hisoblang: (3^3-2-2^2)*(4^2-4)="
+    assert _strip(11, "^11.Hisoblang: (3^3-2-2^2)*(4^2-4)=") \
+        == "Hisoblang: (3^3-2-2^2)*(4^2-4)="
+
+
+def test_caret_own_number_with_paren_terminator():
+    assert _strip(3, "^3) Compute x") == "Compute x"
+
+
+def test_caret_wrong_number_preserved():
+    # "^11." but the question is 13 → not its own number → untouched
+    assert _strip(13, "^11.Hisoblang: 2+2") == "^11.Hisoblang: 2+2"
+
+
+def test_leading_superscript_isotope_preserved():
+    # real DB rows qn 28/31/32/49: a leading isotope mass number is REAL stem
+    # content. Both gates protect it — the number is not the question's own AND
+    # "^210" is followed by "_", never a . / ) terminator.
+    iso = "^210_82 Pb + x^1_0p → ^205_81 Tl + y^4_2α yadro reaksiyasi"
+    assert _strip(28, iso) == iso
+
+
+def test_leading_superscript_that_matches_own_but_is_real_formula_preserved():
+    # the adversarial case: the own number appears as a leading superscript but
+    # is real content (x² + x = 5), so there is no . / ) terminator → untouched.
+    assert _strip(2, "^2 + x = 5 tenglamani yeching") == "^2 + x = 5 tenglamani yeching"
+
+
+def test_internal_carets_never_touched():
+    # only the LEADING own-number token goes; exponents inside the stem stay.
+    assert _strip(5, "5. 2^3 + 3^2 ni hisoblang") == "2^3 + 3^2 ni hisoblang"

@@ -804,7 +804,20 @@ def _strip_own_number(q: dict) -> None:
     # to 0-4 such chars so it can never eat into real stem text, and still gated
     # on {n}[.)], so this strips ONLY the question's OWN number: a list marker
     # "1)" (1 != n) is left intact.
-    new = re.sub(rf'^\s*[`*~_#]{{0,4}}\s*{n}\s*[.)]\s*', '', text, count=1)
+    #
+    # The optional `\^?` sees THROUGH the caret that the DOCX superscript pass
+    # (_para_scripted_text) synthesises: a source question number typed as a
+    # superscript in the DOCX is rendered as "^11", and Gemini transcribes the
+    # stem as "^11.Hisoblang:" — which this strip could not touch, because `^`
+    # was not in the artifact class. The two gates are unchanged, so the caret
+    # form is only stripped when the number IS the question's own number AND is
+    # immediately followed by a . or ) terminator. That double gate is what
+    # protects a legitimate leading superscript that is real stem content — e.g.
+    # an isotope mass number "^210_82 Pb" (210 != the question number, and "^210"
+    # is followed by "_", never a terminator). Proven against every stored
+    # leading-caret stem: strips exactly the one own-number bleed, touches none
+    # of the isotope equations. See tests/test_strip_own_number.py.
+    new = re.sub(rf'^\s*[`*~_#]{{0,4}}\s*\^?{n}\s*[.)]\s*', '', text, count=1)
     if new != text:
         q["question_text"] = new
         logger.info("own_number_stripped", question=n)
