@@ -197,6 +197,30 @@ near-misses ("A line segment with points A, B, C marked on it.").
 Until then this is a closed door, and Option D is machinery maintained forever
 against a class that is not being produced.
 
+### `^N.` superscript-stem strip — SHIPPED v0.27
+
+The intersection of two shipped passes. `_para_scripted_text` (Defect 1 fix)
+surfaces a DOCX superscript as caret notation, so a source question number typed
+as a superscript becomes `^11`; Gemini transcribes the stem as `^11.Hisoblang:`.
+`_strip_own_number` then failed to remove it because `^` was not in its leading
+artifact class — the leading own-number token survived into the printed stem
+(rendered as `13. ^11.Hisoblang:` after the position prefix).
+
+**Fix:** one optional `\^?` before `{n}` in `_strip_own_number`
+(`ai_analyzer.py`). Both gates unchanged — it strips the caret form ONLY when
+the number is the question's OWN number AND is immediately followed by a `.`/`)`
+terminator.
+
+**Boundary, proven by running the shipped pass over every stored leading-caret
+stem (11 rows):** strips exactly the **1** own-number bleed (qn=11), touches
+**0** of the 10 legitimate leading superscripts — isotope mass numbers in
+nuclear-reaction equations (`^210_82 Pb`, `^254_102 No`, `^A_Z E`, `^56_26 Fe`,
+…). Those are double-protected: the number is not the question's own AND `^210`
+is followed by `_`, never a terminator. Source-agnostic fix in the shared strip
+(a PDF whose leading number is visually superscript could yield the same shape),
+safe everywhere because of the two gates. Tests in
+`tests/test_strip_own_number.py`.
+
 ## PDF variant layout — Group B (options reflow) — SHIPPED v0.25
 
 Group A (compact header, reachable write-in line, tighter spacing) shipped in
