@@ -18,9 +18,10 @@
 - Compact PDF: wide figures currently scale to column width. If a real exam needs a
   true full-page-width figure, add a second `PageTemplate` with a full-width frame and
   switch templates mid-document.
-- Compact format is currently only offered in the single-upload flow (`upload.py`). The
-  multi-source builder (`multi_source.py`) always produces standard single-column output.
-  Wire the format choice into `multi_source` later.
+- ~~Compact format is currently only offered in the single-upload flow~~ **DONE**
+  — `multi_source.py` asks Oddiy/Ixcham at finish (line ~897) and routes to
+  `build_variants_pdf_compact` when `pdf_format == "compact"` (line ~1078), the
+  same FSM key as the single-upload flow.
 
 ### FEATURE — Gemini API cost optimization (`ai_analyzer.py`)
 1. **Skip blank pages**: if a page image is >90% white pixels (PIL), skip the Gemini call.
@@ -86,7 +87,12 @@ missing puzzle is a *visibly incomplete* question, ungraded — not a silently
 wrong key. Same root also explains the un-extractable figure (Defect 5, a VML
 shape).
 
-### Defect 2 — `math_render` mis-scopes a `^` on a fraction denominator (MEDIUM)
+### Defect 2 — `math_render` mis-scopes a `^` on a fraction denominator — **FIXED + SHIPPED v0.21**
+Fixed by splitting `_term` into `_power` (factor + glued scripts) and `_term`
+(division over `_power` operands) in `math_render.py`, so a script binds tighter
+than fraction division: `a/b^2` now renders `a/b^2`, not `(a/b)^2`. Tag v0.21.
+Original report below, kept for context.
+
 `3,5x/0.7`-style stems and, more sharply, **an exponent on a fraction
 denominator**: `a/b^2` → renders `(a/b)^2` (WRONG, should be `a/b^2`); `a^2/b^2`
 → `(a^2/b)^2`. A parser-precedence bug in `math_render`, independent of source
@@ -96,7 +102,13 @@ regress it (wrong→wrong), but this bug should be fixed so DOCX superscript
 fractions render correctly. Visible-wrong, single question, no silent key
 corruption → post-merge. Contrast: `(2,15+a)/2` (parens) renders correctly.
 
-### Defect 4 — capital label leaks into printed options; no display normalization (SMALL)
+### Defect 4 — capital label leaks into printed options — **FIXED + SHIPPED v0.22**
+Fixed by `flag_mixed_case_labels` in `option_label_recovery.py`: a label set that
+mixes a cased-upper and cased-lower label raises the existing `label_doubt` flag
+(surfaced in the extraction summary), source-independent so it covers DOCX. It
+FLAGS, never rewrites — verbatim storage of real gapped/Cyrillic labels is
+preserved. Tag v0.22. Original report below, kept for context.
+
 A teacher typo (`D=8`) stored the option label as capital `D` among lowercase
 `a,b,e`, and it prints verbatim. Verbatim storage is CORRECT for real gapped /
 Cyrillic labels, and the PDF-only backstop rightly never claimed DOCX — but a
