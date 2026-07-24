@@ -315,15 +315,21 @@ def _page_footer(canvas, doc) -> None:
 _FILLIN_FIELDS = ("Test nomi:", "Ism familiya:", "Guruh:")
 
 
-def _fillin_row(available_w: float) -> Table:
-    """The handwriting fields on ONE line, evenly spread across the page.
+def _fillin_row(available_w: float, fields: tuple = _FILLIN_FIELDS,
+                style: ParagraphStyle | None = None) -> Table:
+    """The handwriting fields on ONE line, evenly spread across `available_w`.
 
     Each label owns its own cell and its underline is sized to whatever space is
     left in THAT cell, so a longer label just gets a shorter rule instead of
     wrapping the whole row onto a second line.
+
+    `fields`/`style` are parameterised for the COMPACT builder, whose column is
+    only ~213pt wide: three fields on one line there would leave
+    "Ism familiya:" a 7pt rule (one underscore), so it splits the same fields
+    over two rows instead. Defaults reproduce the standard builder exactly.
     """
-    style = STYLES["fillin"]
-    col_w = available_w / len(_FILLIN_FIELDS)
+    style = style or STYLES["fillin"]
+    col_w = available_w / len(fields)
     try:
         under_w = pdfmetrics.stringWidth("_", style.fontName, style.fontSize)
     except Exception:
@@ -334,7 +340,7 @@ def _fillin_row(available_w: float) -> Table:
             f"{label} " + "_" * max(4, int((col_w - _prefix_w(label, style) - 6) / under_w)),
             style,
         )
-        for label in _FILLIN_FIELDS
+        for label in fields
     ]
     tbl = Table([cells], colWidths=[col_w] * len(cells))
     tbl.setStyle(TableStyle([
@@ -396,7 +402,23 @@ def _markup_width(markup: str, style: ParagraphStyle) -> float:
     return total + _text_width(markup[last:], style)
 
 
-def _option_flowables(options: dict, available_w: float) -> list:
+def _std_cell(letter: str, markup: str, cell_w: float):
+    """Standard-builder cell: ONE Paragraph carrying "letter) text"."""
+    return Paragraph(f"{letter}) {markup}", STYLES["option_cell"])
+
+
+def _std_line(letter: str, markup: str, line_w: float) -> list:
+    """Standard-builder tier-3 line — exactly what every option printed before
+    the reflow, plus an _fit_imgs clamp for a formula wider than the full line."""
+    return [Paragraph(f"{letter}) {_fit_imgs(markup, line_w)}", STYLES["option"])]
+
+
+def _option_flowables(options: dict, available_w: float, *,
+                      measure_style: ParagraphStyle | None = None,
+                      indent: float | None = None,
+                      gap: float = _OPT_COL_GAP,
+                      cell: "callable" = _std_cell,
+                      line: "callable" = _std_line) -> list:
     """Lay one question's options out on as FEW lines as they fit on.
 
     Ladder — the WIDEST option decides for the whole set:
@@ -406,10 +428,17 @@ def _option_flowables(options: dict, available_w: float) -> list:
          stored order
       3. one option per line (what every question printed before this change)
 
+    ONE ladder serves BOTH builders. The tier decision and the alignment
+    contract live here; only the CELL CONTENT differs, supplied by the `cell`
+    and `line` callbacks — the standard builder renders a single Paragraph,
+    while the compact builder renders through _compact_flowables so a tall
+    stacked fraction is promoted to its own Image inside the cell. Widths are
+    measured with `measure_style` (10pt standard, 8pt compact).
+
     ALIGNMENT CONTRACT — this is the part that must never break. A student
     marks a sheet against printed option positions and the grader reads it back
     against the STORED labels, so:
-      * each cell carries "letter) text" as ONE Paragraph, never a label cell
+      * each cell carries "letter) text" as ONE unit, never a label cell
         beside a text cell that a grid could drift apart;
       * labels come from `options.items()` in stored order and are printed
         verbatim — they are NOT sequential (`a,b,d,e` is 46% of the corpus,
@@ -422,56 +451,55 @@ def _option_flowables(options: dict, available_w: float) -> list:
     if not items:
         return []
 
-    cell_style = STYLES["option_cell"]
+    measure_style = measure_style or STYLES["option_cell"]
+    indent = STYLES["option"].leftIndent if indent is None else indent
     markups = [(letter, render_to_markup(text)) for letter, text in items]
     n = len(markups)
-    indent = STYLES["option"].leftIndent
     table_w = available_w - indent
     widest = max(
-        _markup_width(f"{letter}) {mk}", cell_style) for letter, mk in markups
+        _markup_width(f"{letter}) {mk}", measure_style) for letter, mk in markups
     )
 
     # Tier 1 (N columns) then tier 2 (2 columns). For N <= 2 they are the same
     # layout, so only try it once.
     for ncols in ([n] if n <= 2 else [n, 2]):
-        if widest <= table_w / ncols - _OPT_COL_GAP:
-            return [_option_table(markups, ncols, indent, table_w, cell_style)]
+        if widest <= table_w / ncols - gap:
+            return [_option_table(markups, ncols, indent, table_w, gap, cell)]
 
     # Tier 3 — one option per line, the layout every question used before the
     # reflow, kept unchanged as the fallback.
     #
-    # NOT EXERCISED BY ANY REAL DATA: across all 546 stored option sets, ZERO
-    # reach this tier — the widest real option renders 152.3pt against a
-    # 228.9pt two-column cell. Only the synthetic very-long case in
-    # tests/test_variants_pdf_options_reflow.py gets here. Treat this branch as
-    # unproven in production: re-measure the corpus before assuming how it
-    # behaves, and do not "simplify" it on the assumption that it is dead.
-    # (_fit_imgs clamps a formula wider than the full line — impossible today,
-    # but this tier is the last stop before an overflow.)
-    return [
-        Paragraph(f"{letter}) {_fit_imgs(mk, table_w - _OPT_COL_GAP)}",
-                  STYLES["option"])
-        for letter, mk in markups
-    ]
+    # REACHED BY REAL DATA IN THE COMPACT BUILDER ONLY. Across the 546 stored
+    # option sets: 3 sets reach this tier at the compact column's 8pt/198.6pt
+    # geometry, but ZERO reach it in the standard builder (the widest real
+    # option renders 152.3pt against a 228.9pt two-column cell there), where
+    # only the synthetic very-long test case gets here. So do not assume this
+    # branch is battle-tested on the standard path, and do not "simplify" it as
+    # dead on either — it is the last stop before an overflow.
+    line_w = table_w - gap
+    out: list = []
+    for letter, mk in markups:
+        out.extend(line(letter, mk, line_w))
+    return out
 
 
-def _option_table(markups: list, ncols: int, indent: float,
-                  table_w: float, cell_style: ParagraphStyle) -> Table:
+def _option_table(markups: list, ncols: int, indent: float, table_w: float,
+                  gap: float, cell: "callable") -> Table:
     """The options as a grid, filled ROW-MAJOR. The leading zero-width column
-    reproduces STYLES["option"]'s 12pt indent without stealing width from the
-    first option's cell."""
+    reproduces the option indent without stealing width from the first cell."""
     col_w = table_w / ncols
+    cell_w = col_w - gap
     rows = []
     for i in range(0, len(markups), ncols):
         chunk = markups[i:i + ncols]
-        cells = [Paragraph(f"{letter}) {mk}", cell_style) for letter, mk in chunk]
+        cells = [cell(letter, mk, cell_w) for letter, mk in chunk]
         cells += [""] * (ncols - len(cells))   # short last row (e.g. 3 options)
         rows.append([""] + cells)
     tbl = Table(rows, colWidths=[indent] + [col_w] * ncols, hAlign="LEFT")
     tbl.setStyle(TableStyle([
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), _OPT_COL_GAP),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), gap),
         ("TOPPADDING",    (0, 0), (-1, -1), _OPT_CELL_PAD),
         ("BOTTOMPADDING", (0, 0), (-1, -1), _OPT_CELL_PAD),
     ]))
@@ -687,9 +715,16 @@ def _fit_imgs(markup: str, max_w: float) -> str:
     return _IMG_TAG_RE.sub(_rescale, markup)
 
 
-_FILLIN_ROWS_COMPACT = [
-    ("Test nomi:", 18), ("Ism familiya:", 15), ("Guruh:", 20), ("Ball:", 8),
-]
+# Compact header fill-ins, split over TWO rows. Was four stacked rows including
+# "Ball:"; the standard builder collapsed the same fields to ONE line in v0.23,
+# but that does not port literally — a 213pt column leaves "Ism familiya:" a
+# 7.1pt rule (one underscore), unwritable. Two rows keep every rule usable and
+# still halve the header. "Ball:" is dropped for the same reason as the standard
+# builder: the score belongs on the teacher's sheet, not the student's.
+_FILLIN_ROWS_COMPACT = (
+    ("Test nomi:",),
+    ("Ism familiya:", "Guruh:"),
+)
 
 
 def _img_flowable(tag: str, max_w: float) -> RLImage | None:
@@ -792,6 +827,53 @@ def _compact_flowables(markup: str, style: ParagraphStyle, max_w: float,
     return flow or [Paragraph(prefix + markup, style)]
 
 
+_COMPACT_OPT_GAP = 4.0   # inter-cell gutter in the narrow compact column
+
+
+def _compact_option_cell(style: ParagraphStyle):
+    """Cell renderer for the compact option grid.
+
+    Routes each option through _compact_flowables, so a TALL stacked fraction
+    is still promoted to its own Image flowable — inside the cell — instead of
+    confusing autoLeading and drawing onto the next line. The returned list is
+    the cell's content (ReportLab accepts a list of flowables per cell).
+
+    `total_w` is the CELL width, not the column width: _compact_flowables hands
+    it to _prefix_img_row, which builds a nested table to keep a lone "A)" on
+    the promoted image's line. Passing the column width there would build a
+    nested table WIDER than its own cell.
+
+    Verified by geometry on a real gapped a,b,d,e set of stacked fractions:
+    every label prints on the same row as its own fraction, ~5.5pt away, with
+    zero image overflow past a cell edge.
+    """
+    def render(letter: str, markup: str, cell_w: float) -> list:
+        prefix = f"{letter}) "
+        # An image is capped to what is left AFTER the label, because
+        # _prefix_img_row lays the two side by side inside `total_w`; capping at
+        # the full cell width would overflow that nested table by the label.
+        img_w = max(10.0, cell_w - _prefix_w(prefix, style))
+        return _compact_flowables(
+            _fit_imgs(markup, img_w), style, img_w, cell_w,
+            prefix=prefix, space=5.0,
+        )
+    return render
+
+
+def _compact_option_line(style: ParagraphStyle, total_w: float):
+    """Tier-3 renderer for the compact builder — one option per line, what this
+    builder printed before the reflow. Unlike the standard builder, 3 real
+    stored option sets DO reach this tier at the compact geometry."""
+    def render(letter: str, markup: str, line_w: float) -> list:
+        prefix = f"{letter}) "
+        img_w = max(10.0, line_w - _prefix_w(prefix, style))
+        return _compact_flowables(
+            _fit_imgs(markup, img_w), style, img_w, total_w,
+            prefix=prefix, space=5.0,
+        )
+    return render
+
+
 def _compact_page(canvas, doc) -> None:
     """Footer + a thin light-gray rule down the gutter (compact layout only)."""
     _page_footer(canvas, doc)
@@ -820,7 +902,6 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     # cap images to the TRUE available width, leaving room for the leading
     # prefix ("10." / "A)") so they never overflow or orphan the number
     stem_max_w = usable - 18
-    opt_max_w = usable - opt_indent - 14
     frame_h = PAGE_HEIGHT - MARGIN - BOTTOM_MARGIN
     left = Frame(MARGIN, BOTTOM_MARGIN, colw, frame_h,
                  leftPadding=0, rightPadding=frame_pad, topPadding=0, bottomPadding=0, id="c1")
@@ -834,9 +915,21 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
         PageTemplate(id="twocol", frames=[left, right], onPage=_compact_page)
     ])
 
-    head = ParagraphStyle("c_head", parent=STYLES["variant_header"], fontSize=10)
-    q_st = ParagraphStyle("c_q", parent=STYLES["question"], fontSize=9)
+    # "Variant N" centered between two rules, as the standard builder prints it
+    # (v0.23). Grading matches a student's sheet to its key by this number, so it
+    # stays prominent.
+    head = ParagraphStyle("c_head", parent=STYLES["variant_header_center"],
+                          fontSize=10)
+    # Parented on question_variant (spaceBefore=4), not question (spaceBefore=8)
+    # — the tighter question gap the standard builder took in v0.23.
+    q_st = ParagraphStyle("c_q", parent=STYLES["question_variant"], fontSize=9)
     o_st = ParagraphStyle("c_o", parent=STYLES["option"], fontSize=8, leftIndent=opt_indent)
+    # Option INSIDE a grid cell: the indent belongs to the table's leading
+    # column, and a Table cell does not apply spaceBefore/After anyway. A CHILD
+    # of c_o, which is itself a child of the shared STYLES["option"] — nothing
+    # here mutates a shared entry, which would restyle the ANSWER KEY too.
+    o_cell = ParagraphStyle("c_o_cell", parent=o_st,
+                            leftIndent=0, spaceBefore=0, spaceAfter=0)
     ctx_st = ParagraphStyle("c_ctx", parent=STYLES["context"], fontSize=8)
     open_st = ParagraphStyle("c_open", parent=STYLES["open_ended_label"], fontSize=8)
     fill_st = ParagraphStyle("c_fill", parent=STYLES["fillin"], fontSize=9)
@@ -848,10 +941,14 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        story.append(Paragraph(f"Variant {vnum}", head))
-        for label, dashes in _FILLIN_ROWS_COMPACT:
-            story.append(Paragraph(f"{label} " + "_" * dashes, fill_st))
+        # Compact header, same shape as the standard builder's: fill-ins, then
+        # "Variant N" centered between two rules.
+        for fields in _FILLIN_ROWS_COMPACT:
+            story.append(_fillin_row(colw, fields, fill_st))
         story.append(Spacer(1, 1.5 * mm))
+        story.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#1a237e")))
+        story.append(Paragraph(f"Variant {vnum}", head))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(Spacer(1, 2 * mm))
@@ -920,14 +1017,17 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                                         color=colors.HexColor("#aaaaaa"),
                                         dash=(2, 4), spaceAfter=1.5 * mm))
             else:
-                # Real labels in printed order (any script, gaps preserved).
-                for letter, opt_text in options.items():
-                    if opt_text:
-                        mk = _fit_imgs(render_to_markup(opt_text), opt_max_w)
-                        block.extend(_compact_flowables(
-                            mk, o_st, opt_max_w, usable, prefix=f"{letter}) ",
-                            space=5.0,
-                        ))
+                # Options on as few lines as they FIT on, through the SAME
+                # ladder the standard builder uses — real labels in printed
+                # order (any script, gaps preserved), each welded to its own
+                # text in one cell.
+                block.extend(_option_flowables(
+                    options, usable,
+                    measure_style=o_cell, indent=opt_indent,
+                    gap=_COMPACT_OPT_GAP,
+                    cell=_compact_option_cell(o_cell),
+                    line=_compact_option_line(o_st, usable),
+                ))
 
             block.append(Spacer(1, 2.5 * mm))
             # keep a whole question together so it never splits across a column

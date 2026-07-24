@@ -302,3 +302,78 @@ printed alone overleaf; q35 moved four) and proj25 split 4. After: **0 splits,
   that `STYLES` did not leak.
 - Rendered proof sheet + real-project before/after kept out of the repo
   (`sardorbek/groupb_proof/`), regenerable from `tests/` fixtures.
+
+## PDF variant layout — compact ("Ixcham") port of Groups A + B — SHIPPED v0.26
+
+**Why this was needed:** Groups A (v0.23) and B (v0.25) were both scoped to
+`build_variants_pdf` (the standard / "Oddiy" builder). A teacher who picks
+"📋 Ixcham" is routed to `build_variants_pdf_compact` (`upload.py:1332`,
+`multi_source.py:1074`), which still ran the pre-Group-A/B layout — so none of
+that work showed on the compact path. This port brings the compact builder up
+to parity.
+
+**Scope was 2 of 4 items, not 4** (confirmed by reading the code, not the
+brief): the compact open-ended write-in line already shipped in **v0.24**, and
+compact **always** had `KeepTogether`. Only the Group A header and the Group B
+options reflow were actually missing.
+
+### What shipped (three commits)
+1. **Header** — `Ball:` dropped, `Variant N` centered between two rules, `c_q`
+   re-parented to `question_variant` for the tighter gap. **The one-line
+   fill-in row did NOT port literally:** a 212.6pt column leaves `Ism familiya:`
+   a 7.1pt rule (one underscore, unwritable), so the fields split over **two**
+   rows — still half the old four-row header, every rule ≥3 underscores.
+2. **Shared ladder** — `_option_flowables` is now builder-agnostic: the tier
+   decision and alignment contract live once, and only the cell CONTENT differs
+   via `cell`/`line` callbacks. Proven a no-op for the standard builder (see
+   below).
+3. **Compact reflow** — the compact cell renderer routes each option through
+   `_compact_flowables`, so tall stacked fractions are still promoted to their
+   own Image **inside the cell**.
+
+### The structural difference from the standard builder
+The compact builder promotes tall math to a standalone flowable. Inside a grid
+that means a cell holds a **list** of flowables, and `_prefix_img_row` builds a
+nested table to keep a lone `A)` on the promoted image's line. Two consequences,
+both handled: `_compact_flowables`' `total_w` must be the **cell** width (not
+the column width, or the nested table exceeds its cell), and a promoted image is
+capped to `cell_w − label_width`. Verified by geometry on a real gapped
+`a,b,d,e` set of stacked fractions: every label prints on the same row as its
+own fraction (~5.5pt away), zero image overflow past a cell edge.
+
+### Measured (compact column, 8pt / 198.6pt option area, all 546 stored sets)
+| tier | cell | rows | share |
+|---|---|---|---|
+| 4-across | 45.6pt | 276 | 50.5% |
+| 2-column | 95.3pt | 204 | 37.4% |
+| 3-across | 62.2pt | 46 | 8.4% |
+| 5-across | 35.7pt | 17 | 3.1% |
+| one-per-line | 194.6pt | **3** | 0.5% |
+
+- **Tier 3 IS reached here (3 real rows)**, unlike the standard builder where
+  zero rows reach it. The "corpus-unexercised" note is standard-builder-only
+  and is NOT repeated on the shared path.
+- **No column floor** on the 5-across 35.7pt tier — those 17 rows are short
+  numerics that measurably fit. Revisit only if a real set looks bad.
+- **Image legibility:** required image scale at the chosen tier is 100% across
+  all 31 math-carrying sets — the width test routes a wide formula to a
+  wide-enough tier before any shrink. No legibility floor.
+- Real projects: compact proj40 **4 → 2 pages**, proj25 **3 → 2 pages**; 0
+  questions split across a column break.
+
+### Byte-identity (the non-negotiable proof)
+Built with `rl_config.invariant` from the same fixture, across all three
+commits:
+- **standard `variants` PDF** `ee00eb8c…` — **identical to v0.25**. The refactor
+  did not touch the working standard builder.
+- **answer key** `4437a249…` — **identical to v0.25**. `STYLES` did not leak;
+  `c_o_cell` is a child of `c_o` (itself a child of shared `STYLES["option"]`).
+- The **compact** PDF hash intentionally changes (`70ebacee…` → new) — that is
+  the port. Supersedes the v0.25 note above that the compact PDF was
+  byte-identical to master (true at v0.25, no longer true by design).
+
+### Deliberately OUT of scope — logged, not fixed
+`_compact_flowables` promoting a tall stem's math splits a STEM across lines
+(e.g. `2. Soddalashtiring:` / fraction / `?` on three lines). This is stem
+behaviour, pre-existing, unrelated to options; pulling it in would be scope
+creep. Its own item.
