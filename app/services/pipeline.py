@@ -41,6 +41,7 @@ from app.services.file_processor import (
     docx_to_pdf,
     image_to_pages,
     pdf_to_images,
+    prune_debug_crops,
     restore_list_markers,
     save_debug_crops,
     split_two_column_pages,
@@ -125,6 +126,10 @@ async def process_file(
     Run the FULL extraction pipeline for one uploaded file and persist its
     questions. Telegram-free: callers own all messaging/FSM.
     """
+    # Reap only stale diagnostic debug_* crops. The referenced figure crops are
+    # the image store variant generation reads later, so they are left alone.
+    await asyncio.to_thread(prune_debug_crops)
+
     # ── Defect 3: DOCX with VML drawings / OMML equations → render via PDF ────
     # docx_to_images drops those shapes, so a segment diagram prints as "[Rasm]"
     # text and a stacked equation vanishes. When they're present, render the

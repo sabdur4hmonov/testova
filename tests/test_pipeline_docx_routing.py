@@ -81,6 +81,7 @@ def _install_stubs(monkeypatch, calls, *, has_shapes, convert_result):
     monkeypatch.setattr(pipeline, "flag_suspicious_questions", lambda qs: [])
     monkeypatch.setattr(pipeline, "find_siblings", lambda qs: [])
     monkeypatch.setattr(pipeline, "save_debug_crops", lambda *a: None)
+    monkeypatch.setattr(pipeline, "prune_debug_crops", lambda *a, **k: 0)
 
     async def _noop(*a, **k):
         return None

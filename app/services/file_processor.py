@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -51,6 +52,34 @@ MAX_IMAGE_PAGE_AREA_RATIO = 0.60
 def _ensure_image_dir() -> Path:
     IMAGE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     return IMAGE_SAVE_DIR
+
+
+def prune_debug_crops(older_than_seconds: int = 3600) -> int:
+    """Delete stale `debug_*` crops from IMAGE_SAVE_DIR. Returns the count.
+
+    save_debug_crops writes diagnostic `debug_*` images that are referenced
+    only from logs. The `q*` / `docximg_` figure crops are DIFFERENT: they are
+    the de-facto image store that variant generation reads back at build time
+    (repeatedly), so they must NOT be reaped here — deleting them would blank
+    diagrams in regenerated variants. Only the debug files are safe, and only
+    when old enough that a concurrent extraction's fresh ones survive. A proper
+    lifecycle-tied reaper for the referenced crops is deferred (see BACKLOG).
+    Best-effort: never raises.
+    """
+    if not IMAGE_SAVE_DIR.exists():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for p in IMAGE_SAVE_DIR.glob("debug_*"):
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("debug_crops_pruned", removed=removed)
+    return removed
 
 
 class PageImage(NamedTuple):
