@@ -36,7 +36,9 @@ from app.services.file_processor import (
     attach_docx_inline_images,
     attach_images_to_questions,
     compute_page_infos,
+    docx_has_renderable_shapes,
     docx_to_images,
+    docx_to_pdf,
     image_to_pages,
     pdf_to_images,
     restore_list_markers,
@@ -123,13 +125,36 @@ async def process_file(
     Run the FULL extraction pipeline for one uploaded file and persist its
     questions. Telegram-free: callers own all messaging/FSM.
     """
+    # ── Defect 3: DOCX with VML drawings / OMML equations → render via PDF ────
+    # docx_to_images drops those shapes, so a segment diagram prints as "[Rasm]"
+    # text and a stacked equation vanishes. When they're present, render the
+    # DOCX to PDF with LibreOffice and treat it as a PDF from here on, so its
+    # figures flow through the proven crop path. A shape-free DOCX skips this
+    # entirely and keeps its byte-identical text render; a conversion failure
+    # falls back to that same text render — visible degradation, never silent.
+    effective_type = file_type
+    effective_bytes = content
+    if file_type == "docx" and docx_has_renderable_shapes(content):
+        pdf_bytes = await asyncio.to_thread(docx_to_pdf, content)
+        if pdf_bytes:
+            effective_type = "pdf"
+            effective_bytes = pdf_bytes
+            logger.info(
+                "docx_converted_to_pdf",
+                project_id=project_id, pdf_bytes=len(pdf_bytes),
+            )
+        else:
+            logger.warning(
+                "docx_pdf_conversion_fallback_text", project_id=project_id
+            )
+
     # ── Convert to page images ────────────────────────────────────────────────
-    if file_type == "pdf":
-        raw_pages = await asyncio.to_thread(pdf_to_images, content)
-    elif file_type == "docx":
-        raw_pages, _ = await asyncio.to_thread(docx_to_images, content)
+    if effective_type == "pdf":
+        raw_pages = await asyncio.to_thread(pdf_to_images, effective_bytes)
+    elif effective_type == "docx":
+        raw_pages, _ = await asyncio.to_thread(docx_to_images, effective_bytes)
     else:
-        raw_pages = await asyncio.to_thread(image_to_pages, content)
+        raw_pages = await asyncio.to_thread(image_to_pages, effective_bytes)
 
     if not raw_pages:
         await _set_project_status(project_id, ProjectStatus.FAILED, "no pages")
@@ -144,9 +169,9 @@ async def process_file(
     # Cost optimizer metadata (PDF only): per-page text length + has-figure, so
     # blank/header-only pages can be skipped WITHOUT ever dropping a figure page.
     page_infos = None
-    if file_type == "pdf":
+    if effective_type == "pdf":
         page_infos = await asyncio.to_thread(
-            compute_page_infos, content, page_images, col_map
+            compute_page_infos, effective_bytes, page_images, col_map
         )
 
     # ── Extract via Gemini Vision ─────────────────────────────────────────────
@@ -179,7 +204,9 @@ async def process_file(
         all_questions = collapse_sections(all_questions)
 
     # ── Attach images — precise crop using PyMuPDF rects ─────────────────────
-    _pdf_bytes_for_crop = content if file_type == "pdf" else None
+    # For a converted DOCX this is the LibreOffice-rendered PDF, so its figures
+    # now crop exactly like a PDF upload's.
+    _pdf_bytes_for_crop = effective_bytes if effective_type == "pdf" else None
     all_questions = await asyncio.to_thread(
         attach_images_to_questions,
         all_questions,
@@ -193,7 +220,10 @@ async def process_file(
     # instead: pair the document's ordered inline images with the flagged
     # questions, count-guarded (never a wrong figure). PDF/image sources are
     # unaffected — attach_images_to_questions already handled them above.
-    if file_type == "docx":
+    # Only a DOCX we did NOT convert reaches here (shape-free, or a conversion
+    # that failed and fell back to the text render); a converted DOCX is now a
+    # PDF and was cropped above.
+    if effective_type == "docx":
         await asyncio.to_thread(
             attach_docx_inline_images, all_questions, content
         )
