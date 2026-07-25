@@ -14,9 +14,9 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm, mm
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, HRFlowable, Image as RLImage, KeepTogether,
-    PageBreak, PageTemplate, Paragraph, SimpleDocTemplate, Spacer, Table,
-    TableStyle,
+    BaseDocTemplate, Frame, FrameBreak, HRFlowable, Image as RLImage,
+    KeepTogether, NextPageTemplate, PageBreak, PageTemplate, Paragraph,
+    SimpleDocTemplate, Spacer, Table, TableStyle,
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -311,46 +311,55 @@ def _page_footer(canvas, doc) -> None:
 # Fill-in header fields: students write these by hand on the first page of each
 # variant. (The teacher-name title was removed — it served no one. "Ball:" was
 # removed too: the score belongs on the teacher's sheet, not the student's.)
-# Four stacked rows became ONE line, so the header costs 3 lines, not half a page.
-_FILLIN_FIELDS = ("Test nomi:", "Ism familiya:", "Guruh:")
+#
+# ONE shared full-width row, IDENTICAL in both builders. Each field is a label
+# plus a DRAWN line (a cell bottom-border, not repeated "_" characters) at a
+# FIXED length, so the output never varies run to run. Order left-to-right:
+# Ism familiya (150pt — long enough for a full name) / Test nomi (72) / Guruh
+# (72). Labels + lines total ~460pt against the 481.9pt content width, so the
+# three always fit on one row (measured); the header spans the FULL page width
+# in both builders (the compact builder gives it its own full-width frame above
+# the two columns — see build_variants_pdf_compact).
+_HEADER_FIELDS = (
+    ("Ism familiya:", 150.0),
+    ("Test nomi:", 72.0),
+    ("Guruh:", 72.0),
+)
 
 
-def _fillin_row(available_w: float, fields: tuple = _FILLIN_FIELDS,
-                style: ParagraphStyle | None = None) -> Table:
-    """The handwriting fields on ONE line, evenly spread across `available_w`.
-
-    Each label owns its own cell and its underline is sized to whatever space is
-    left in THAT cell, so a longer label just gets a shorter rule instead of
-    wrapping the whole row onto a second line.
-
-    `fields`/`style` are parameterised for the COMPACT builder, whose column is
-    only ~213pt wide: three fields on one line there would leave
-    "Ism familiya:" a 7pt rule (one underscore), so it splits the same fields
-    over two rows instead. Defaults reproduce the standard builder exactly.
-    """
+def _header_fields_table(available_w: float,
+                         style: ParagraphStyle | None = None) -> Table:
+    """The three handwriting fields on ONE full-width row, each a label followed
+    by a fixed-length drawn line. Shared verbatim by both PDF builders."""
     style = style or STYLES["fillin"]
-    col_w = available_w / len(fields)
-    try:
-        under_w = pdfmetrics.stringWidth("_", style.fontName, style.fontSize)
-    except Exception:
-        under_w = 0.0
-    under_w = under_w or style.fontSize * 0.6
-    cells = [
-        Paragraph(
-            f"{label} " + "_" * max(4, int((col_w - _prefix_w(label, style) - 6) / under_w)),
-            style,
-        )
-        for label in fields
-    ]
-    tbl = Table([cells], colWidths=[col_w] * len(cells))
-    tbl.setStyle(TableStyle([
+    inners, nat = [], []
+    for label, line_len in _HEADER_FIELDS:
+        label_w = pdfmetrics.stringWidth(label, style.fontName, style.fontSize) + 4
+        inner = Table([[Paragraph(label, style), ""]],
+                      colWidths=[label_w, line_len])
+        inner.setStyle(TableStyle([
+            # the writing line: a bottom border under the empty second cell
+            ("LINEBELOW",     (1, 0), (1, 0), 0.75, colors.black),
+            ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+            ("TOPPADDING",    (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ]))
+        inners.append(inner)
+        nat.append(label_w + line_len)
+    # spread the three fields across the full width; slack becomes the gaps
+    slack = max(0.0, available_w - sum(nat))
+    colw = [w + slack / len(nat) for w in nat]
+    outer = Table([inners], colWidths=colw)
+    outer.setStyle(TableStyle([
         ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
         ("TOPPADDING",    (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
     ]))
-    return tbl
+    return outer
 
 
 # ── Option reflow ────────────────────────────────────────────────────────────
@@ -522,10 +531,12 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        # Compact header: the fill-in fields on ONE line, then "Variant N"
-        # centered between two rules. "Variant N" stays prominent — grading
-        # matches a student's sheet to its answer key by that number.
-        story.append(_fillin_row(available_w))
+        # Header: the three fill-in fields on ONE full-width row (drawn lines,
+        # fixed lengths), then "Variant N" centered between two rules. Built by
+        # the SAME helper the compact builder uses, so both are identical.
+        # "Variant N" stays prominent — grading matches a student's sheet to its
+        # answer key by that number.
+        story.append(_header_fields_table(available_w))
         story.append(Spacer(1, 1.5 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
@@ -715,18 +726,6 @@ def _fit_imgs(markup: str, max_w: float) -> str:
     return _IMG_TAG_RE.sub(_rescale, markup)
 
 
-# Compact header fill-ins, split over TWO rows. Was four stacked rows including
-# "Ball:"; the standard builder collapsed the same fields to ONE line in v0.23,
-# but that does not port literally — a 213pt column leaves "Ism familiya:" a
-# 7.1pt rule (one underscore), unwritable. Two rows keep every rule usable and
-# still halve the header. "Ball:" is dropped for the same reason as the standard
-# builder: the score belongs on the teacher's sheet, not the student's.
-_FILLIN_ROWS_COMPACT = (
-    ("Test nomi:",),
-    ("Ism familiya:", "Guruh:"),
-)
-
-
 def _img_flowable(tag: str, max_w: float) -> RLImage | None:
     """Build a standalone left-aligned Image flowable from an <img …/> tag,
     so a TALL math image gets its own line with correct height (a tall inline
@@ -874,16 +873,34 @@ def _compact_option_line(style: ParagraphStyle, total_w: float):
     return render
 
 
-def _compact_page(canvas, doc) -> None:
-    """Footer + a thin light-gray rule down the gutter (compact layout only)."""
+# Height reserved at the top of a variant's FIRST page for the full-width
+# header band (fields row + "Variant N" between two rules). Measured at 40.9pt;
+# 52 leaves a comfortable buffer so the header can never overflow into the
+# columns below it.
+_COMPACT_HEADER_H = 52.0
+
+
+def _compact_gutter(canvas, doc, top: float) -> None:
+    """Footer + the thin rule down the column gutter, up to `top`."""
     _page_footer(canvas, doc)
     colw = (PAGE_WIDTH - 3 * MARGIN) / 2
     x = MARGIN + colw + MARGIN / 2
     canvas.saveState()
     canvas.setStrokeColor(colors.HexColor("#444444"))
     canvas.setLineWidth(1)
-    canvas.line(x, BOTTOM_MARGIN, x, PAGE_HEIGHT - MARGIN)
+    canvas.line(x, BOTTOM_MARGIN, x, top)
     canvas.restoreState()
+
+
+def _compact_page_cont(canvas, doc) -> None:
+    """Continuation page: the gutter runs the full column height."""
+    _compact_gutter(canvas, doc, PAGE_HEIGHT - MARGIN)
+
+
+def _compact_page_cover(canvas, doc) -> None:
+    """A variant's first page: the gutter stops below the full-width header
+    band, so it divides only the two question columns."""
+    _compact_gutter(canvas, doc, PAGE_HEIGHT - MARGIN - _COMPACT_HEADER_H)
 
 
 def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -> bytes:
@@ -895,6 +912,7 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     never cropped, never dropped to ASCII. The answer key stays single-column.
     """
     buf = io.BytesIO()
+    available_w = PAGE_WIDTH - 2 * MARGIN     # full content width (the header)
     colw = (PAGE_WIDTH - 3 * MARGIN) / 2
     frame_pad = 6
     usable = colw - frame_pad                 # content width inside a column
@@ -903,16 +921,38 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
     # prefix ("10." / "A)") so they never overflow or orphan the number
     stem_max_w = usable - 18
     frame_h = PAGE_HEIGHT - MARGIN - BOTTOM_MARGIN
-    left = Frame(MARGIN, BOTTOM_MARGIN, colw, frame_h,
-                 leftPadding=0, rightPadding=frame_pad, topPadding=0, bottomPadding=0, id="c1")
-    right = Frame(MARGIN + colw + MARGIN, BOTTOM_MARGIN, colw, frame_h,
-                  leftPadding=frame_pad, rightPadding=0, topPadding=0, bottomPadding=0, id="c2")
+    x_right = MARGIN + colw + MARGIN
+
+    def _col(x, h, cid):
+        pad = frame_pad if x > MARGIN else 0
+        return Frame(x, BOTTOM_MARGIN, colw, h,
+                     leftPadding=pad, rightPadding=(0 if x > MARGIN else frame_pad),
+                     topPadding=0, bottomPadding=0, id=cid)
+
+    # COVER template — a variant's first page: a full-width header frame across
+    # the top, then the two question columns BELOW it. The header thus spans the
+    # whole page width (identical to the standard builder), not one column.
+    cover_h = frame_h - _COMPACT_HEADER_H
+    header_frame = Frame(MARGIN, PAGE_HEIGHT - MARGIN - _COMPACT_HEADER_H,
+                         available_w, _COMPACT_HEADER_H,
+                         leftPadding=0, rightPadding=0, topPadding=0,
+                         bottomPadding=0, id="hdr")
+    cover_left = _col(MARGIN, cover_h, "cl")
+    cover_right = _col(x_right, cover_h, "cr")
+    # TWOCOL template — continuation pages: two full-height columns, no header.
+    cont_left = _col(MARGIN, frame_h, "c1")
+    cont_right = _col(x_right, frame_h, "c2")
+
     doc = BaseDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN, topMargin=MARGIN, bottomMargin=BOTTOM_MARGIN,
     )
     doc.addPageTemplates([
-        PageTemplate(id="twocol", frames=[left, right], onPage=_compact_page)
+        # cover is listed FIRST, so page 1 (the first variant) uses it by default
+        PageTemplate(id="cover", frames=[header_frame, cover_left, cover_right],
+                     onPage=_compact_page_cover),
+        PageTemplate(id="twocol", frames=[cont_left, cont_right],
+                     onPage=_compact_page_cont),
     ])
 
     # "Variant N" centered between two rules, as the standard builder prints it
@@ -943,26 +983,29 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                             leftIndent=0, spaceBefore=0, spaceAfter=0)
     ctx_st = ParagraphStyle("c_ctx", parent=STYLES["context"], fontSize=8)
     open_st = ParagraphStyle("c_open", parent=STYLES["open_ended_label"], fontSize=8)
-    fill_st = ParagraphStyle("c_fill", parent=STYLES["fillin"], fontSize=9)
 
     story: list = []
     for vi, variant in enumerate(variants):
         if vi > 0:
-            story.append(PageBreak())  # every variant begins on a fresh page
+            # every variant begins on a fresh COVER page (full-width header)
+            story.append(NextPageTemplate("cover"))
+            story.append(PageBreak())
         vnum      = variant["variant_number"]
         questions = variant.get("questions_data", [])
 
-        # Compact header, same shape as the standard builder's: fill-ins, then
-        # "Variant N" centered between two rules.
-        for fields in _FILLIN_ROWS_COMPACT:
-            story.append(_fillin_row(colw, fields, fill_st))
+        # Full-width header in the header frame — the SAME fields row the
+        # standard builder uses (one row, drawn lines), then "Variant N" centered
+        # between two rules. Then FrameBreak drops into the two question columns
+        # below, and continuation pages switch to the header-less twocol template.
+        story.append(_header_fields_table(available_w))
         story.append(Spacer(1, 1.5 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(Paragraph(f"Variant {vnum}", head))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
-        story.append(Spacer(1, 2 * mm))
+        story.append(NextPageTemplate("twocol"))
+        story.append(FrameBreak())
 
         for q in questions:
             block: list = []
