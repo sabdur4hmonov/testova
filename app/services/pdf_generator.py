@@ -922,7 +922,18 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                           fontSize=10)
     # Parented on question_variant (spaceBefore=4), not question (spaceBefore=8)
     # — the tighter question gap the standard builder took in v0.23.
-    q_st = ParagraphStyle("c_q", parent=STYLES["question_variant"], fontSize=9)
+    # A stem renders as ONE autoLeading paragraph (see below), not as promoted
+    # per-image flowables, so a tall fraction/radical no longer forces the
+    # surrounding prose onto its own lines. autoLeading="max" grows each line to
+    # its tallest fragment, but a tall image on the NEXT line can still reach UP
+    # into the base-leading gap the PREVIOUS (text) line reserved. A 15pt leading
+    # floor closes that gap: measured over all 379 stored stems that carry tall
+    # math, the worst cross-line image/text gap goes from -1.5pt (overlap) to
+    # +1.3pt (clean). 14pt already clears it (+0.3pt); 15 keeps a margin. This is
+    # a LOCAL child style — it never touches STYLES, the option style, or the
+    # answer key.
+    q_st = ParagraphStyle("c_q", parent=STYLES["question_variant"], fontSize=9,
+                          leading=15)
     o_st = ParagraphStyle("c_o", parent=STYLES["option"], fontSize=8, leftIndent=opt_indent)
     # Option INSIDE a grid cell: the indent belongs to the table's leading
     # column, and a Table cell does not apply spaceBefore/After anyway. A CHILD
@@ -985,8 +996,15 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                 block.append(tbl)
                 block.append(Spacer(1, 1.5 * mm))
 
-            block.extend(_compact_flowables(q_text, q_st, stem_max_w, usable,
-                                            prefix=f"{pos}. "))
+            # The stem as ONE flowable. Previously it ran through
+            # _compact_flowables, which promotes every tall math image to its own
+            # line — so "Agar A = a/b va C = c/d bolsa" broke into five lines
+            # (text, fraction, text, fraction, text). A single autoLeading
+            # paragraph keeps the math inline and wraps naturally, exactly as the
+            # standard builder does; the leading floor on q_st (above) keeps it
+            # overlap-free. _compact_flowables is still used for OPTIONS, whose
+            # narrow cells need the promotion — this change is stem-only.
+            block.append(Paragraph(f"{pos}. {q_text}", q_st))
 
             # ── Image block — scaled to fit the column, never cropped ─────────
             if q.get("has_image"):
