@@ -408,8 +408,25 @@ commits:
   the port. Supersedes the v0.25 note above that the compact PDF was
   byte-identical to master (true at v0.25, no longer true by design).
 
-### Deliberately OUT of scope — logged, not fixed
-`_compact_flowables` promoting a tall stem's math splits a STEM across lines
-(e.g. `2. Soddalashtiring:` / fraction / `?` on three lines). This is stem
-behaviour, pre-existing, unrelated to options; pulling it in would be scope
-creep. Its own item.
+### Compact stem math-promotion split — FIXED + SHIPPED v0.28
+`_compact_flowables` promoted every tall stem image to its own line, shattering
+prose around inline math (`Agar A = a/b va C = c/d bolsa` → five lines;
+`2. Soddalashtiring:` / fraction / `?` on three). The stem now renders as ONE
+autoLeading paragraph — exactly what the standard builder does — so math stays
+inline and prose wraps naturally. `_compact_flowables` is UNTOUCHED and still
+serves the options (whose narrow cells need the promotion); this is a stem-only
+change to the one call site.
+
+**The subtlety, measured:** autoLeading grows a line to its tallest fragment,
+but a tall image on the NEXT line can still reach UP into the base-leading gap
+the previous (text) line reserved. A 15pt leading floor on the stem style
+(`c_q`) closes it — measured over all 379 stored stems that carry tall math, the
+worst cross-line image/text gap goes from −1.5pt (overlap) to +1.3pt (clean);
+14pt already clears it. Local child style, never touches `STYLES`.
+
+**Proof:** answer key (`4437a249…`) and standard `variants` (`ee00eb8c…`)
+byte-identical to v0.27 — the change is compact-stem-only. proj40/proj25 stay
+2 pages each. `test_bug1` was rewritten from a solid-rectangle bbox check (which
+false-positived on wide inline math whose tall ink is offset from the prefix —
+verified clean by a +7pt ink gap directly under `10.`) to a line-aware check
+with a padding tolerance.

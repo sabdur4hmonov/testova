@@ -6,6 +6,8 @@ math_render.py (real image markup), never ASCII, never a verbatim fallback.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.services import math_render as M
@@ -125,19 +127,75 @@ def _imgs(page):
     return [b["bbox"] for b in page.get_text("rawdict")["blocks"] if b.get("type") == 1]
 
 
-def test_bug1_no_math_image_overlaps_a_text_line():
+def test_bug1_no_math_image_overlaps_another_text_line():
+    # Stems now render as ONE autoLeading paragraph (v0.28) instead of promoting
+    # each tall image to its own line, so math is INLINE. The old check treated
+    # an image as a solid rectangle and flagged the "10." prefix whenever a wide
+    # formula's BOX spanned it — but a nested radical's tall ink sits to the
+    # RIGHT of the prefix, not under it (measured: a clean +7pt ink gap directly
+    # below "10."). So this is now LINE-AWARE: cluster words into text lines,
+    # assign each image to its own line, and flag only a word on a DIFFERENT line
+    # whose box the image intrudes into by more than the math-PNG padding.
+    #
+    # TOL is that padding: matplotlib leaves a few pt of transparent border
+    # around the glyphs, so a sub-4pt box overlap is never an ink collision. The
+    # worst real stem clears by +1.3pt; the deliberately pathological
+    # nested-radical fixture here shows a 3.3pt box touch that is ink-clean.
+    TOL = 4.0
     pdf = build_variants_pdf_compact([_variant(_LAYOUT_QS)], "T")
     d = fitz.open(stream=pdf, filetype="pdf")
     bad = []
     for pg in d:
-        imgs = _imgs(pg)
-        for w in pg.get_text("words"):
-            cx = (w[0] + w[2]) / 2
-            for ib in imgs:
-                if ib[0] - 2 <= cx <= ib[2] + 2 and ib[1] + 2 < w[3] and w[1] < ib[3] - 2:
-                    bad.append((round(ib[1], 1), w[4]))
+        words = [w for w in pg.get_text("words") if w[4].strip()]
+        # cluster into text lines by baseline
+        lines: dict[int, list] = {}
+        for w in words:
+            lines.setdefault(round(w[3]), []).append(w)
+        for ib in _imgs(pg):
+            own = min(lines, key=lambda ly: abs(ly - ib[3]))   # image's own line
+            for ly, wl in lines.items():
+                if ly == own:
+                    continue                                   # inline, expected
+                for w in wl:
+                    x_ov = min(w[2], ib[2]) - max(w[0], ib[0])
+                    y_ov = min(w[3], ib[3]) - max(w[1], ib[1])
+                    if x_ov > 1 and y_ov > TOL:
+                        bad.append((w[4], round(y_ov, 1)))
     d.close()
-    assert not bad, f"math image overlaps text: {bad[:5]}"
+    assert not bad, f"math image overlaps another text line: {bad[:5]}"
+
+
+def test_stem_prose_stays_inline_with_math_not_split():
+    # THE fix (v0.28): a stem with prose around inline fractions used to promote
+    # each fraction to its own line — "Agar" / frac / "va" / frac / "bolsa" over
+    # five lines. As one autoLeading paragraph the prose flows around the math,
+    # so an inline word shares a baseline with a fraction image beside it.
+    q = {"position_in_variant": 1,
+         "question_text": "Agar A = (1)/(2) va B = (3)/(4) bo'lsa qiymatini toping",
+         "options": {"a": "1", "b": "2", "d": "3", "e": "4"}}
+    d = fitz.open(stream=build_variants_pdf_compact([_variant([q])], "T"),
+                  filetype="pdf")
+    pg = d[0]
+    words = {w[4]: w for w in pg.get_text("words")}
+    imgs = _imgs(pg)
+    d.close()
+    # "va" sits between the two fractions; at least one fraction image must share
+    # its line (inline), which the promoted layout could never do.
+    va = words.get("va")
+    assert va is not None
+    inline = [b for b in imgs if b[1] < va[3] and va[1] < b[3]]
+    assert inline, "no fraction shares the prose baseline — stem still splits"
+
+
+def test_compact_stem_style_has_a_leading_floor():
+    # the floor that keeps the inline stem overlap-free (a tall image on the next
+    # line can reach up into the base-leading gap the previous text line leaves).
+    # Measured: 14pt already clears every stored stem; 15 keeps a margin.
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "pdf_generator.py").read_text(encoding="utf-8")
+    m = re.search(r'"c_q".*?leading=(\d+)', src, re.S)
+    assert m and int(m.group(1)) >= 14, "compact stem leading floor missing/too low"
 
 
 def test_bug3_images_within_available_column_width():
