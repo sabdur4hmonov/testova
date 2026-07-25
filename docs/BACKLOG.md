@@ -93,8 +93,11 @@ failure falls back to that text render — **visible degradation, never silent**
 Approach A (OMML→text linearizer) was rejected: it silently corrupts *positional*
 math (the vertical-subtraction puzzle is stacked/right-aligned with blanks — a
 text form is plausible-but-wrong) and carries unbounded maintenance.
-`Dockerfile` installs `libreoffice-writer`. Supersedes Defect 5's VML-figure
-finding (same root, now rendered).
+`Dockerfile` installs `libreoffice-writer` **and `libreoffice-math`** — the
+Math component is required, proven empirically: writer alone renders the VML
+segment diagram but leaves embedded OMML equations blank (the vertical-
+subtraction puzzle vanished until math was added). Supersedes Defect 5's
+VML-figure finding (same root, now rendered).
 
 #### Deferred (NOT done — recorded here on purpose)
 1. **2000-user conversion hardening.** The simple version spawns one `soffice`
