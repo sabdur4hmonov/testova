@@ -74,18 +74,55 @@ pre-existing (git-confirmed: `docx_to_images` and `math_render` unchanged on the
 grading-unification branch). Defect 1 (superscript loss) is being handled
 pre-merge; these are the carve-offs.
 
-### Defect 3 — `docx_to_images` drops OMML equations & VML shapes (BIG)
-A whole question's content vanished (a vertical subtraction puzzle → only the
-stem stored). `docx_to_images` renders only `paragraph.text` + tables; Word
-equation objects (`m:oMath` / `oMathPara`) and drawing shapes (`v:shape` /
-`w:pict`) are in separate XML namespaces and are silently dropped before Gemini.
-Fix needs an OMML→text linearizer (mini-parser over ~15 element types: `m:f`,
-`m:rad`, `m:sSup`, `m:sSub`, `m:d`, `m:nary`, …) or an OMML→image render (headless
-Word/LibreOffice dep). LARGE — genuinely separate from the Defect 1 run-walk.
-Lower severity than Defect 1: affected puzzles are OPEN (no answer key), so a
-missing puzzle is a *visibly incomplete* question, ungraded — not a silently
-wrong key. Same root also explains the un-extractable figure (Defect 5, a VML
-shape).
+### Defect 3 — `docx_to_images` drops OMML equations & VML shapes — **FIXED + SHIPPED v0.30 (Approach B)**
+
+**Root cause (confirmed):** `docx_to_images` renders only `paragraph.text` +
+tables + inline `<a:blip>` rasters. OMML (`m:oMath`) is not in `para.runs`, and
+VML strokes (`v:shape`/`w:pict`) carry no image relationship — both are skipped
+before Gemini, so a segment diagram printed as `[Rasm]` text and a stacked
+subtraction vanished. Proven DOCX-only: the PDF version of the same test crops
+the figure perfectly via the live path; only DOCX failed.
+
+**Fix — Approach B, headless LibreOffice (chosen over an in-house linearizer):**
+`process_file` probes a DOCX for `<w:pict>`/`<v:shape>`/`<m:oMath>`; when present
+it renders the DOCX → PDF with `soffice` (`file_processor.docx_to_pdf`) and
+treats it as a PDF for the rest of the pipeline, so the shapes become real
+pixels that flow through the proven `attach_images_to_questions` crop path. A
+shape-free DOCX never enters this path (byte-identical text render); a conversion
+failure falls back to that text render — **visible degradation, never silent**.
+Approach A (OMML→text linearizer) was rejected: it silently corrupts *positional*
+math (the vertical-subtraction puzzle is stacked/right-aligned with blanks — a
+text form is plausible-but-wrong) and carries unbounded maintenance.
+`Dockerfile` installs `libreoffice-writer` **and `libreoffice-math`** — the
+Math component is required, proven empirically: writer alone renders the VML
+segment diagram but leaves embedded OMML equations blank (the vertical-
+subtraction puzzle vanished until math was added). Supersedes Defect 5's
+VML-figure finding (same root, now rendered).
+
+#### Deferred (NOT done — recorded here on purpose)
+1. **2000-user conversion hardening.** The simple version spawns one `soffice`
+   subprocess per shape-bearing DOCX at upload time (no Gemini cost, grading
+   path untouched). Under heavy *concurrent* upload load add: a conversion
+   pool / worker cap, per-process memory limits, and a concurrency gate. Not
+   needed at the current user count; revisit in the scaling session.
+2. **Lifecycle-tied figure-crop reaper.** `prune_debug_crops` only reaps
+   diagnostic `debug_*` files. The `q*`/`docximg_` figure crops in
+   `temp_images/` are the de-facto permanent image store (variant generation
+   reads them back at build time, repeatedly), so they cannot be reaped per-run.
+   A proper reaper must key off project lifecycle (`projects.expires_at`) —
+   delete a project's crops when it expires. Until then `temp_images/` still
+   grows (slowly) with real figure crops.
+3. **File 3 raster inconsistency (different defect).** `attach_docx_inline_images`
+   uses an EXACT count-guard (`len(flagged) != len(images) → attach nothing`).
+   When Gemini's `has_image` count varies run-to-run against a DOCX's embedded
+   raster count, a raster-figure DOCX (DrawingML `pic:pic`/`a:blip`, e.g. the
+   orange-rectangle/tree/car test) inconsistently gets all-or-no images. Not the
+   VML/OMML drop; needs its own fix (tolerant pairing or per-question anchoring).
+4. **`wps:` DrawingML shapes not gated.** The shape probe triggers on VML
+   (`v:shape`/`w:pict`) and OMML (`m:oMath`) only — the classes proven to drop in
+   the corpus. Modern DrawingML *non-picture* shapes (`<wps:...>`, WordprocessingML
+   drawing canvas) are not gated and would still drop. None present in the corpus;
+   add `<wps:` (and re-verify File 3 stays out) if such a file appears.
 
 ### Defect 2 — `math_render` mis-scopes a `^` on a fraction denominator — **FIXED + SHIPPED v0.21**
 Fixed by splitting `_term` into `_power` (factor + glued scripts) and `_term`

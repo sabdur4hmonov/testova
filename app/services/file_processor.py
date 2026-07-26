@@ -2,8 +2,14 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -46,6 +52,34 @@ MAX_IMAGE_PAGE_AREA_RATIO = 0.60
 def _ensure_image_dir() -> Path:
     IMAGE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
     return IMAGE_SAVE_DIR
+
+
+def prune_debug_crops(older_than_seconds: int = 3600) -> int:
+    """Delete stale `debug_*` crops from IMAGE_SAVE_DIR. Returns the count.
+
+    save_debug_crops writes diagnostic `debug_*` images that are referenced
+    only from logs. The `q*` / `docximg_` figure crops are DIFFERENT: they are
+    the de-facto image store that variant generation reads back at build time
+    (repeatedly), so they must NOT be reaped here — deleting them would blank
+    diagrams in regenerated variants. Only the debug files are safe, and only
+    when old enough that a concurrent extraction's fresh ones survive. A proper
+    lifecycle-tied reaper for the referenced crops is deferred (see BACKLOG).
+    Best-effort: never raises.
+    """
+    if not IMAGE_SAVE_DIR.exists():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for p in IMAGE_SAVE_DIR.glob("debug_*"):
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("debug_crops_pruned", removed=removed)
+    return removed
 
 
 class PageImage(NamedTuple):
@@ -1463,6 +1497,100 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
         "docx_rendered", pages=len(pages), text_chars=len(text_content)
     )
     return pages, text_content
+
+
+# ── Defect 3: DOCX vector diagrams + equations via headless LibreOffice ──────
+#
+# Legacy VML drawings (<v:shape> inside <w:pict>) and OMML equations
+# (<m:oMath>) live in XML namespaces python-docx's paragraph walker never
+# reads, so docx_to_images drops them silently — a segment diagram prints as
+# "[Rasm]" text and a stacked equation vanishes. We detect those markers in the
+# raw document.xml and, ONLY for such files, render the DOCX to PDF with
+# LibreOffice so the shapes become real pixels that flow through the proven PDF
+# crop path. A shape-free DOCX never enters this path — its page images stay
+# byte-for-byte what docx_to_images produced before.
+_DOCX_SHAPE_MARKERS = (b"<w:pict", b"<v:shape", b"<m:oMath")
+
+# Overridable so a non-standard install / test can point elsewhere.
+SOFFICE_BIN = os.environ.get("SOFFICE_BIN", "soffice")
+# A hung conversion must never block the extraction pipeline.
+SOFFICE_TIMEOUT = 60  # seconds
+
+
+def docx_has_renderable_shapes(docx_bytes: bytes) -> bool:
+    """True when the DOCX carries VML drawings or OMML equations that the
+    paragraph-text renderer would drop (Defect 3).
+
+    Best-effort: any error → False, so a probe failure keeps the current text
+    path rather than forcing a conversion. Never raises.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            xml = z.read("word/document.xml")
+    except Exception as e:
+        logger.warning("docx_shape_probe_failed", error=str(e))
+        return False
+    return any(marker in xml for marker in _DOCX_SHAPE_MARKERS)
+
+
+def docx_to_pdf(docx_bytes: bytes, timeout: int = SOFFICE_TIMEOUT) -> bytes | None:
+    """Render a DOCX to PDF via headless LibreOffice; return the PDF bytes.
+
+    Full-fidelity render: LibreOffice draws the VML/OMML shapes docx_to_images
+    drops, so the resulting PDF can be treated exactly like an uploaded PDF and
+    flow through the proven figure-crop path.
+
+    Returns None on ANY failure — missing binary, timeout, non-zero exit, or
+    absent/invalid output — so the caller falls back to the text render. That
+    is a VISIBLE degradation (the old behaviour), never a crash and never a
+    silently-wrong page.
+
+    Isolated per call: a private temp dir holds the input, the output, and the
+    LibreOffice user profile (`-env:UserInstallation`). Concurrent conversions
+    never collide on the default profile lock, and the non-root app user always
+    has a writable profile HOME.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="docx2pdf_"))
+    try:
+        src = tmp / "in.docx"
+        src.write_bytes(docx_bytes)
+        profile_uri = (tmp / "profile").as_uri()
+        cmd = [
+            SOFFICE_BIN, "--headless", "--norestore", "--nolockcheck",
+            f"-env:UserInstallation={profile_uri}",
+            "--convert-to", "pdf", "--outdir", str(tmp), str(src),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("docx_to_pdf_timeout", timeout=timeout)
+            return None
+        except FileNotFoundError:
+            logger.warning("docx_to_pdf_no_soffice", soffice=SOFFICE_BIN)
+            return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("docx_to_pdf_spawn_failed", error=str(e))
+            return None
+
+        out_pdf = tmp / "in.pdf"
+        if proc.returncode != 0 or not out_pdf.exists():
+            logger.warning(
+                "docx_to_pdf_failed",
+                rc=proc.returncode,
+                stderr=proc.stderr.decode("utf-8", "replace")[:300],
+            )
+            return None
+
+        data = out_pdf.read_bytes()
+        if not data.startswith(b"%PDF"):
+            logger.warning("docx_to_pdf_bad_output", size=len(data))
+            return None
+        logger.info("docx_to_pdf_ok", pdf_bytes=len(data))
+        return data
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _save_docx_image(pic: Image.Image) -> str | None:
