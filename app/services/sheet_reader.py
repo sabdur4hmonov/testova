@@ -210,6 +210,25 @@ def _clean_name(value: Any) -> str | None:
     return s[:100]  # matches CheckResult.student_name / display_name width
 
 
+def _prepare_png(image_bytes: bytes) -> bytes | None:
+    """Decode → preprocess → PNG-encode, all in one shot.
+
+    Pure CPU work (PIL decode, OpenCV deskew/CLAHE, PNG encode). Kept in a
+    single sync function so `read_answer_sheet` can hand the WHOLE block to
+    asyncio.to_thread — otherwise any of these steps would block the event
+    loop and freeze the bot for every other user while one photo is prepared.
+
+    Returns the PNG bytes, or None if the image yields no page.
+    """
+    pages = image_to_pages(image_bytes)
+    if not pages:
+        return None
+    img = preprocess_image(pages[0].image)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def read_answer_sheet(
     image_bytes: bytes, expected_count: int
 ) -> dict[str, Any]:
@@ -241,13 +260,11 @@ async def read_answer_sheet(
         "answers": {}, "texts": {}, "unclear": [],
     }
     try:
-        pages = image_to_pages(image_bytes)
-        if not pages:
+        # Decode + preprocess + PNG-encode is CPU-heavy; run it OFF the event
+        # loop so one teacher's photo never freezes the bot for everyone else.
+        png_bytes = await asyncio.to_thread(_prepare_png, image_bytes)
+        if png_bytes is None:
             return empty
-        img = preprocess_image(pages[0].image)
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG")
-        png_bytes = buf.getvalue()
     except Exception as e:
         logger.warning("sheet_preprocess_failed", error=str(e))
         return empty
