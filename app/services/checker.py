@@ -99,6 +99,75 @@ def is_correct(student: Any, accepted: list[str]) -> bool:
     return False
 
 
+# ── Confirm-worthiness of a WRONG written answer ──────────────────────────────
+#
+# A written answer that isn't is_correct has TWO possible causes the system
+# can't otherwise tell apart: the student really wrote the wrong thing, OR the
+# camera/AI misread a correct one. So the teacher is asked To'g'ri/Xato. But a
+# far-off answer ("APPLE" vs key "BANAN") can't be a misread of the key, so it
+# is a genuine wrong the teacher need not confirm. This decides which band a
+# wrong answer is in, using normalized Levenshtein similarity.
+#
+# THRESHOLD justified by the real stored answer distribution (do not move
+# without re-measuring — the test pins the split): an empty band separates
+# plausible misreads (similarity >= 0.50: BANONA/BANANA, BRVAN/BANAN, 12/13)
+# from genuine wrongs (similarity <= 0.30: "R"/"12", mangled gibberish). 0.40
+# sits in that gap, below the 0.50 misread floor with margin. Lower = more
+# different. BIASED TOWARD ASKING: a false ask costs one tap; a false
+# auto-reject silently mis-grades a misread.
+CONFIRM_SIMILARITY_THRESHOLD = 0.40
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Edit distance (insert/delete/substitute each cost 1)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def similarity_ratio(a: str, b: str) -> float:
+    """Normalized Levenshtein similarity in [0, 1]; 1.0 = identical."""
+    m = max(len(a), len(b))
+    return 1.0 if m == 0 else 1.0 - _levenshtein(a, b) / m
+
+
+def written_confirm_needed(student: Any, accepted: list[str]) -> bool:
+    """True = ask the teacher To'g'ri/Xato (close, possibly a misread);
+    False = far enough to mark wrong without asking.
+
+    Call ONLY for answers is_correct already rejected. Two rules, both biased
+    toward ASKING:
+      * NUMBERS ALWAYS ASK — if the student answer and ANY accepted answer are
+        both plain numbers, return True unconditionally. A digit misread
+        ("12" vs "120") can look far by magnitude yet be a plausible camera
+        error, so a numeric mismatch is never auto-rejected.
+      * Otherwise ask when the similarity to the CLOSEST accepted answer is
+        >= CONFIRM_SIMILARITY_THRESHOLD; only skip the ask when EVERY accepted
+        answer is far.
+    """
+    s = normalize(student)
+    if not s:
+        return False  # blank isn't a written answer (never in texts); defensive
+    s_num = _as_number(s)
+    best = 0.0
+    for a in accepted:
+        a_norm = normalize(a)
+        if s_num is not None and _as_number(a_norm) is not None:
+            return True  # numeric vs numeric → always ask
+        best = max(best, similarity_ratio(s, a_norm))
+    return best >= CONFIRM_SIMILARITY_THRESHOLD
+
+
 def _display(accepted: list[str]) -> str:
     """How the key is shown in the wrong-answer report ('PHONE / TELEPHONE')."""
     return " / ".join(accepted)
