@@ -87,6 +87,13 @@ written answer; the rest are marked options:
 
 _model: genai.GenerativeModel | None = None
 
+# Bound simultaneous grading Gemini calls (Fix 4). Module-level so it is shared
+# across every concurrent read_answer_sheet — a burst of photos can't overwhelm
+# Gemini's rate limits. In Python 3.10+ the Semaphore binds to the running loop
+# lazily on first acquire, so creating it at import is safe. Mirrors the
+# per-instance self._sem pattern in ai_analyzer.
+_grading_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_GRADING)
+
 
 def _get_model() -> genai.GenerativeModel:
     global _model
@@ -276,10 +283,13 @@ async def read_answer_sheet(
     # / 90s — a teacher waiting on a graded photo must not sit through 4.5 min.
     for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
         try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(_call_sync, prompt, png_bytes),
-                timeout=settings.GEMINI_GRADING_TIMEOUT,
-            )
+            # Hold a concurrency slot only for the actual call — released across
+            # the backoff sleep so a waiting photo can proceed meanwhile.
+            async with _grading_sem:
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(_call_sync, prompt, png_bytes),
+                    timeout=settings.GEMINI_GRADING_TIMEOUT,
+                )
             break
         except asyncio.TimeoutError:
             logger.warning("sheet_read_timeout", attempt=attempt + 1)

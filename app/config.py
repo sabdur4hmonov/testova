@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # 2 attempts x 15s + a flat 1s backoff ≈ 31s worst case.
     GEMINI_GRADING_MAX_RETRIES: int = 2
     GEMINI_GRADING_TIMEOUT: int = 15  # seconds, per attempt
+    # Cap simultaneous grading Gemini calls so a burst of photos can't blow past
+    # Gemini's rate limits. Mirrors ai_analyzer's MAX_CONCURRENT (extraction).
+    MAX_CONCURRENT_GRADING: int = 6
     # Cost tracking (read-only). Prices are USD per 1M tokens; so'm via UZS rate.
     GEMINI_PRICE_IN_PER_M: float = 0.30    # gemini-2.5-flash input list price
     GEMINI_PRICE_OUT_PER_M: float = 2.50   # gemini-2.5-flash output list price
