@@ -35,7 +35,12 @@ from app.services import storage
 from app.services.ai_analyzer import AIAnalyzer
 from app.services.answer_checker import check_answers
 from app.services.answer_key_parser import parse_answer_key
-from app.services.checker import accepted_list, compare_with_unclear, grade_for
+from app.services.checker import (
+    accepted_list,
+    compare_with_unclear,
+    grade_for,
+    written_confirm_needed,
+)
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
 from app.services.variant_match import resolve_variant
@@ -595,9 +600,15 @@ async def _score_and_maybe_confirm_saved(
     text_qs = {int(k) for k in (data.get("sheet_texts") or {})}
 
     res = check_answers(student_answers, answer_key)
+    # Confirm a wrong WRITTEN answer only when it is close enough to the key to
+    # be a plausible misread; a far-off answer stays wrong and is never asked
+    # (same rule as the manual flow, via the shared checker function).
     wrong_written = [
         r.position for r in res.question_results
         if r.position in text_qs and not r.is_correct and not r.is_skipped
+        and written_confirm_needed(
+            r.student_answer, accepted_list(answer_key.get(str(r.position)))
+        )
     ]
 
     if wrong_written:
@@ -1067,9 +1078,16 @@ async def _score_and_maybe_confirm(
 
     # Wrong answers whose question was WRITTEN (in manual_texts). Excludes wrong
     # A/B/C/D (marked options are reliable) and all correct answers. res["wrong"]
-    # is already in ascending question order, so this list is too.
+    # is already in ascending question order, so this list is too. A wrong
+    # written answer is confirmed ONLY when it is close enough to the key to be a
+    # plausible misread (written_confirm_needed); a far-off answer stays wrong in
+    # res["wrong"] and is never asked.
     text_qs = {int(k) for k in texts}
-    wrong_written = [w["q"] for w in res["wrong"] if w["q"] in text_qs]
+    wrong_written = [
+        w["q"] for w in res["wrong"]
+        if w["q"] in text_qs
+        and written_confirm_needed(student.get(w["q"]), accepted_list(key_int.get(w["q"])))
+    ]
 
     if not wrong_written:
         await _grade_manual_cached(target, state, db_user, name)   # clean path

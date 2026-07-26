@@ -2,12 +2,18 @@
 Design B: the answer-confirm step in manual "Javob orqali" triggers on WRONG
 WRITTEN answers (derived AFTER scoring), not on Gemini's low_confidence flag.
 Rules exercised here:
-  * a wrong WRITTEN answer IS asked (correct answer shown, To'g'ri/Xato)
+  * a wrong WRITTEN answer CLOSE to the key IS asked (possible misread;
+    correct answer shown, To'g'ri/Xato)
+  * a wrong WRITTEN answer FAR from the key is NOT asked (genuine wrong,
+    marked wrong directly — written_confirm_needed)
   * a wrong A/B/C/D answer is NOT asked (marked options are reliable)
   * a CORRECT written answer is NOT asked
   * tapping To'g'ri/Xato drives the FINAL score (option a re-scoring)
   * NAME confirm still fires independently (null OR name_unclear)
   * no wrong written answers → straight to score (clean path, unchanged)
+
+Wrong-written fixtures use CLOSE misreads (e.g. "PHOME" vs "PHONE") so they
+land in the ask band; far junk would now auto-reject and never reach confirm.
 
 Drives the real handlers with light fakes (no DB, no Gemini, no Telegram); the
 CheckResult persist is stubbed and scores are read from FSM run_results.
@@ -168,7 +174,7 @@ async def test_name_confirm_then_clean_score(reader):
 
 # ── A wrong WRITTEN answer IS asked (correct shown, not the AI read) ──────────
 async def test_wrong_written_is_asked(reader):
-    reader(**_read(texts={22: "SEYYAR"}))   # misread; key says PHONE → wrong
+    reader(**_read(texts={22: "PHOME"}))   # close misread; key PHONE → asked
     st = FakeState({"manual_key": {"22": ["PHONE", "TELEPHONE"]}, "manual_total": 22,
                     "run_results": []})
     msg = FakeMsg()
@@ -177,9 +183,21 @@ async def test_wrong_written_is_asked(reader):
     assert st.state == CheckingStates.waiting_for_confirm
     text, markup = msg.answers[-1]
     assert "PHONE / TELEPHONE" in text     # correct answer shown
-    assert "SEYYAR" not in text            # AI's misread NOT shown
+    assert "PHOME" not in text             # AI's misread NOT shown
     assert markup is not None              # buttons present
     assert st._data.get("run_results") == []   # not graded yet
+
+
+# ── A wrong WRITTEN answer FAR from the key is NOT asked (new behavior) ────────
+async def test_far_wrong_written_not_asked(reader):
+    reader(**_read(texts={22: "APPLE"}))   # far from PHONE — a camera can't misread
+    st = FakeState({"manual_key": {"22": ["PHONE"]}, "manual_total": 22,
+                    "manual_session_id": None, "run_results": []})
+    await C.handle_manual_sheet(FakeMsg(), st, FakeUser(), FakeBot())
+
+    assert st.state == CheckingStates.waiting_for_manual_sheet   # no confirm
+    runs = st._data["run_results"]
+    assert len(runs) == 1 and runs[0]["score"] == 0   # marked wrong, not asked
 
 
 # ── A CORRECT written answer is NOT asked ─────────────────────────────────────
@@ -208,7 +226,7 @@ async def test_wrong_abcd_not_asked(reader):
 
 # ── Tap To'g'ri → wrong-written corrected in the FINAL score ──────────────────
 async def test_tap_correct_marks_right(reader):
-    reader(**_read(texts={22: "GARBAGE"}))   # wrong vs PHONE → asked
+    reader(**_read(texts={22: "PHOME"}))   # close misread vs PHONE → asked
     st = FakeState({"manual_key": {"22": ["PHONE"]}, "manual_total": 22,
                     "manual_session_id": None, "run_results": []})
     msg = FakeMsg()
@@ -222,7 +240,7 @@ async def test_tap_correct_marks_right(reader):
 
 # ── Tap Xato → wrong-written stays wrong ──────────────────────────────────────
 async def test_tap_wrong_marks_wrong(reader):
-    reader(**_read(texts={22: "MISREAD"}))   # wrong vs PHONE → asked
+    reader(**_read(texts={22: "PHOME"}))   # close misread vs PHONE → asked
     st = FakeState({"manual_key": {"22": ["PHONE"]}, "manual_total": 22,
                     "manual_session_id": None, "run_results": []})
     msg = FakeMsg()
@@ -235,7 +253,7 @@ async def test_tap_wrong_marks_wrong(reader):
 
 # ── Multiple wrong-written asked ascending, then scored ───────────────────────
 async def test_multiple_wrong_written_in_order(reader):
-    reader(**_read(texts={5: "X", 22: "Y"}))   # both wrong
+    reader(**_read(texts={5: "FIVR", 22: "TWENTYTVO"}))   # both close misreads
     st = FakeState({"manual_key": {"5": ["FIVE"], "22": ["TWENTYTWO"]},
                     "manual_total": 22, "manual_session_id": None, "run_results": []})
     msg = FakeMsg()
@@ -256,7 +274,7 @@ async def test_multiple_wrong_written_in_order(reader):
 
 # ── Stale/double tap for a non-current question is ignored ────────────────────
 async def test_stale_tap_ignored(reader):
-    reader(**_read(texts={5: "X", 22: "Y"}))   # both wrong
+    reader(**_read(texts={5: "FIVR", 22: "TWENTYTVO"}))   # both close misreads
     st = FakeState({"manual_key": {"5": ["FIVE"], "22": ["TWENTYTWO"]},
                     "manual_total": 22, "manual_session_id": None, "run_results": []})
     msg = FakeMsg()
