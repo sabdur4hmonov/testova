@@ -23,8 +23,11 @@ class Settings(BaseSettings):
 
     # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://testova:password@localhost:5432/testova_db"
-    DATABASE_POOL_SIZE: int = 10
-    DATABASE_MAX_OVERFLOW: int = 20
+    # Sized for many concurrent graders. pool_size + max_overflow = 75 peak
+    # connections — Postgres's own max_connections (default 100) must cover this
+    # plus any other clients, or checkouts will fail under load.
+    DATABASE_POOL_SIZE: int = 25
+    DATABASE_MAX_OVERFLOW: int = 50
     DATABASE_ECHO: bool = False
 
     # ── Redis ─────────────────────────────────────────────────────────────────
@@ -38,6 +41,15 @@ class Settings(BaseSettings):
     # (.env overrides this; live behavior is unchanged.)
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_MAX_RETRIES: int = 3
+    # Grading-only budget (answer-sheet reads). SEPARATE from GEMINI_MAX_RETRIES,
+    # which governs question extraction/generation and must stay generous. A
+    # teacher waiting on a graded photo needs a tight worst case, not 4.5 min:
+    # 2 attempts x 15s + a flat 1s backoff ≈ 31s worst case.
+    GEMINI_GRADING_MAX_RETRIES: int = 2
+    GEMINI_GRADING_TIMEOUT: int = 15  # seconds, per attempt
+    # Cap simultaneous grading Gemini calls so a burst of photos can't blow past
+    # Gemini's rate limits. Mirrors ai_analyzer's MAX_CONCURRENT (extraction).
+    MAX_CONCURRENT_GRADING: int = 6
     # Cost tracking (read-only). Prices are USD per 1M tokens; so'm via UZS rate.
     GEMINI_PRICE_IN_PER_M: float = 0.30    # gemini-2.5-flash input list price
     GEMINI_PRICE_OUT_PER_M: float = 2.50   # gemini-2.5-flash output list price

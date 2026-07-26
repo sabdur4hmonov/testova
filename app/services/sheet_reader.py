@@ -16,6 +16,7 @@ import asyncio
 import io
 import json
 import re
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -86,6 +87,13 @@ written answer; the rest are marked options:
 
 
 _model: genai.GenerativeModel | None = None
+
+# Bound simultaneous grading Gemini calls (Fix 4). Module-level so it is shared
+# across every concurrent read_answer_sheet — a burst of photos can't overwhelm
+# Gemini's rate limits. In Python 3.10+ the Semaphore binds to the running loop
+# lazily on first acquire, so creating it at import is safe. Mirrors the
+# per-instance self._sem pattern in ai_analyzer.
+_grading_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_GRADING)
 
 
 def _get_model() -> genai.GenerativeModel:
@@ -210,6 +218,25 @@ def _clean_name(value: Any) -> str | None:
     return s[:100]  # matches CheckResult.student_name / display_name width
 
 
+def _prepare_png(image_bytes: bytes) -> bytes | None:
+    """Decode → preprocess → PNG-encode, all in one shot.
+
+    Pure CPU work (PIL decode, OpenCV deskew/CLAHE, PNG encode). Kept in a
+    single sync function so `read_answer_sheet` can hand the WHOLE block to
+    asyncio.to_thread — otherwise any of these steps would block the event
+    loop and freeze the bot for every other user while one photo is prepared.
+
+    Returns the PNG bytes, or None if the image yields no page.
+    """
+    pages = image_to_pages(image_bytes)
+    if not pages:
+        return None
+    img = preprocess_image(pages[0].image)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def read_answer_sheet(
     image_bytes: bytes, expected_count: int
 ) -> dict[str, Any]:
@@ -241,31 +268,41 @@ async def read_answer_sheet(
         "answers": {}, "texts": {}, "unclear": [],
     }
     try:
-        pages = image_to_pages(image_bytes)
-        if not pages:
+        # Decode + preprocess + PNG-encode is CPU-heavy; run it OFF the event
+        # loop so one teacher's photo never freezes the bot for everyone else.
+        _t_pre = time.perf_counter()
+        png_bytes = await asyncio.to_thread(_prepare_png, image_bytes)
+        logger.info(
+            "preprocess_timing",
+            preprocess_timing_ms=round((time.perf_counter() - _t_pre) * 1000),
+        )
+        if png_bytes is None:
             return empty
-        img = preprocess_image(pages[0].image)
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG")
-        png_bytes = buf.getvalue()
     except Exception as e:
         logger.warning("sheet_preprocess_failed", error=str(e))
         return empty
 
     prompt = ANSWER_SHEET_PROMPT.format(total=expected_count)
     raw = ""
-    for attempt in range(settings.GEMINI_MAX_RETRIES):
+    # Grading-only budget: tight per-attempt timeout, few retries, flat backoff
+    # (GEMINI_GRADING_*). Extraction/generation keep the generous GEMINI_MAX_RETRIES
+    # / 90s — a teacher waiting on a graded photo must not sit through 4.5 min.
+    for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
         try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(_call_sync, prompt, png_bytes), timeout=90
-            )
+            # Hold a concurrency slot only for the actual call — released across
+            # the backoff sleep so a waiting photo can proceed meanwhile.
+            async with _grading_sem:
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(_call_sync, prompt, png_bytes),
+                    timeout=settings.GEMINI_GRADING_TIMEOUT,
+                )
             break
         except asyncio.TimeoutError:
             logger.warning("sheet_read_timeout", attempt=attempt + 1)
         except Exception as e:
             logger.warning("sheet_read_error", attempt=attempt + 1, error=str(e))
-        if attempt < settings.GEMINI_MAX_RETRIES - 1:
-            await asyncio.sleep(2 ** attempt)
+        if attempt < settings.GEMINI_GRADING_MAX_RETRIES - 1:
+            await asyncio.sleep(1)  # flat 1s backoff — keep the worst case small
     else:
         return empty
 
