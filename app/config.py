@@ -23,8 +23,11 @@ class Settings(BaseSettings):
 
     # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://testova:password@localhost:5432/testova_db"
-    DATABASE_POOL_SIZE: int = 10
-    DATABASE_MAX_OVERFLOW: int = 20
+    # Sized for many concurrent graders. pool_size + max_overflow = 75 peak
+    # connections — Postgres's own max_connections (default 100) must cover this
+    # plus any other clients, or checkouts will fail under load.
+    DATABASE_POOL_SIZE: int = 25
+    DATABASE_MAX_OVERFLOW: int = 50
     DATABASE_ECHO: bool = False
 
     # ── Redis ─────────────────────────────────────────────────────────────────
