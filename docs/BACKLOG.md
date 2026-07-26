@@ -467,3 +467,32 @@ byte-identical to v0.27 — the change is compact-stem-only. proj40/proj25 stay
 false-positived on wide inline math whose tall ink is offset from the prefix —
 verified clean by a +7pt ink gap directly under `10.`) to a line-aware check
 with a padding tolerance.
+
+## Grading vision read is NONDETERMINISTIC — measured v0.33 (investigate later)
+
+**Finding (from the Fix 1 preprocess accuracy proof, 17 real answer sheets):**
+the answer-sheet grading read (`sheet_reader.read_answer_sheet` → Gemini,
+temperature 0.0) is NOT deterministic. Feeding the SAME preprocessed PNG bytes
+twice, the parsed marked answers diverge on ~6/17 sheets (OLD-vs-OLD 6/17,
+NEW-vs-NEW 5/17). The instability concentrates on **mixed 25-question sheets**
+(marked options interleaved with hand-written short answers), where an ENTIRE
+sheet can flip between a full read and an EMPTY read on identical pixels.
+
+**Two consequences:**
+
+1. **Any future accuracy proof MUST measure self-noise as the baseline.**
+   "Identical input → identical output" is false here, so you cannot judge a
+   preprocess/prompt/model change by OLD-vs-NEW diffs alone — you must run
+   OLD-vs-OLD and NEW-vs-NEW first to establish the noise floor, then ask
+   whether the change moved reads *beyond* that floor and in a *systematic*
+   direction. (Fix 1 did not: OLD-vs-NEW 12/17 ≈ two independent ~6/17 noisy
+   draws; NEW was strictly more accurate on the one clean noise-stable sheet.)
+
+2. **A whole-sheet empty↔flip on the same image is a real grading-reliability
+   concern, independent of any optimization.** A student could be graded 0 on a
+   fully-answered sheet on an unlucky read. Worth investigating on its own:
+   candidate directions — retry-and-vote (read N times, take the majority /
+   flag disagreement), a "did you read fewer answers than questions?" sanity
+   re-prompt, or splitting the mixed-sheet read into marked-options and
+   written-answers passes. Touches VISION_PROMPT / model call → gated work,
+   separate from this speed stack.

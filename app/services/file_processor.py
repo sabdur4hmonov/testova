@@ -43,6 +43,12 @@ DPI = 200  # must match pdf_to_images DPI
 # pdf_generator sizes images assuming this density — keep them in sync.
 CROP_DPI = 400
 
+# Answer-sheet/scan preprocess downscale cap (long edge, px). Deskew/CLAHE run on
+# the resized image. No-op for Telegram photos (already <=1280px); only shrinks
+# uncompressed document uploads, and only to a size still above Gemini's
+# proven-good ~1280px. See preprocess_image / docs/BACKLOG.md.
+PREPROCESS_MAX_DIM = 1600
+
 # ── BUG FIX: Max ratio of image area vs page area.
 # If an embedded image covers >60% of the page, it's a scanned/watermarked
 # background page — NOT a question diagram. Skip it.
@@ -1692,11 +1698,23 @@ def image_to_pages(image_bytes: bytes) -> list[PageImage]:
     return [PageImage(page_number=1, image=img)]
 
 
-def preprocess_image(img: Image.Image) -> Image.Image:
+def preprocess_image(img: Image.Image, max_dim: int = PREPROCESS_MAX_DIM) -> Image.Image:
     import numpy as np
     import cv2
 
     arr = np.array(img)
+
+    # Resize DOWN first: deskew/CLAHE on a smaller image is far cheaper. On real
+    # Telegram photos (<=1280px) this is a NO-OP; it only shrinks the rare
+    # uncompressed document-upload path, and only to max_dim (>= the ~1280px
+    # Gemini already reads well), so it costs no measurable accuracy.
+    h0, w0 = arr.shape[:2]
+    if max(h0, w0) > max_dim:
+        scale = max_dim / max(h0, w0)
+        arr = cv2.resize(
+            arr, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA
+        )
+
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
     coords = np.column_stack(np.where(gray < 200))
@@ -1715,8 +1733,12 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
-    rgb = cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB)
+    # fastNlMeansDenoising REMOVED: it was ~the entire cost (1395ms -> 70ms) and
+    # bought no measurable accuracy. Proven on 17 real answer sheets: NEW is as
+    # stable as OLD (self-noise 5/17 vs 6/17 on identical bytes) and strictly
+    # more accurate on the one clean noise-stable sheet (denoising had reintroduced
+    # two misreads that CLAHE-only reads correctly). See docs/BACKLOG.md.
+    rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
     return Image.fromarray(rgb)
 
 
