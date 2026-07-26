@@ -39,6 +39,8 @@ from app.services.checker import (
     accepted_list,
     compare_with_unclear,
     grade_for,
+    normalize,
+    similarity_ratio,
     written_confirm_needed,
 )
 from app.services.file_processor import image_to_pages, preprocess_image
@@ -1171,7 +1173,46 @@ async def handle_confirm_answer(
     overrides = dict(data.get("confirm_overrides") or {})
     overrides[str(q)] = (verdict == "ok")
     await state.update_data(confirm_pending=pending[1:], confirm_overrides=overrides)
+
+    # Part 2: append-only log of this decision (ground truth for tuning the
+    # similarity threshold). Pure logging — never affects grading; wrapped so a
+    # DB hiccup can't break the confirm flow.
+    await _log_confirm_decision(db_user, data, q, verdict == "ok")
+
     await _advance_confirm(callback.message, state, db_user)
+
+
+async def _log_confirm_decision(
+    db_user: User, data: dict, q: int, teacher_correct: bool
+) -> None:
+    """Persist one teacher To'g'ri/Xato decision with the context that produced
+    the ask. Read by nothing in grading — validation data only. Never raises."""
+    try:
+        saved = data.get("confirm_flow") == "saved"
+        flow = "saved" if saved else "manual"
+        texts = (data.get("sheet_texts") if saved else data.get("manual_texts")) or {}
+        key_src = (data.get("sheet_answer_key") if saved else data.get("manual_key")) or {}
+        student_ans = texts.get(str(q))
+        accepted = accepted_list(key_src.get(str(q)))
+        s_norm = normalize(student_ans)
+        sim = (
+            max((similarity_ratio(s_norm, normalize(a)) for a in accepted), default=None)
+            if s_norm else None
+        )
+        from app.models.confirm_decision import ConfirmDecision
+        async with async_session_factory() as session:
+            session.add(ConfirmDecision(
+                user_id=db_user.telegram_id,
+                flow=flow,
+                question_number=q,
+                student_answer=(student_ans or None),
+                correct_answer=(" / ".join(accepted) or None),
+                similarity=sim,
+                teacher_correct=teacher_correct,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning("confirm_decision_log_failed", error=str(e))
 
 
 async def _grade_manual_cached(

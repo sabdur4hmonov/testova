@@ -287,6 +287,47 @@ async def test_stale_tap_ignored(reader):
     assert st._data.get("run_results") == []             # not graded
 
 
+# ── Part 2: the teacher's decision is logged (append-only, ground truth) ──────
+class _CaptureSession:
+    added: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def add(self, x):
+        _CaptureSession.added.append(x)
+
+    async def commit(self):
+        pass
+
+
+async def test_confirm_decision_is_logged(reader, monkeypatch):
+    from app.models.confirm_decision import ConfirmDecision
+
+    _CaptureSession.added = []
+    monkeypatch.setattr(C, "async_session_factory", lambda: _CaptureSession())
+
+    reader(**_read(texts={22: "PHOME"}))   # close misread → asked
+    st = FakeState({"manual_key": {"22": ["PHONE"]}, "manual_total": 22,
+                    "manual_session_id": None, "run_results": []})
+    msg = FakeMsg()
+    await C.handle_manual_sheet(msg, st, FakeUser(), FakeBot())
+    await C.handle_confirm_answer(FakeCallback("chk:conf:22:ok", msg), st, FakeUser())
+
+    decs = [x for x in _CaptureSession.added if isinstance(x, ConfirmDecision)]
+    assert len(decs) == 1
+    d = decs[0]
+    assert d.flow == "manual"
+    assert d.question_number == 22
+    assert d.student_answer == "PHOME"
+    assert d.correct_answer == "PHONE"
+    assert d.teacher_correct is True            # tapped To'g'ri
+    assert 0.7 <= d.similarity <= 0.9           # PHOME vs PHONE ≈ 0.8
+
+
 # ── tiny helper: a text message for the name-entry handler ────────────────────
 def _text_msg(text):
     m = FakeMsg()
