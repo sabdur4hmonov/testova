@@ -9,6 +9,7 @@ from app.models.admin_log import AdminLog
 from app.models.gemini_usage import GeminiUsage
 from app.models.check_result import CheckResult
 from app.models.manual_check_session import ManualCheckSession
+from app.models.confirm_decision import ConfirmDecision
 
 __all__ = [
     "User",
@@ -27,4 +28,5 @@ __all__ = [
     "GeminiUsage",
     "CheckResult",
     "ManualCheckSession",
+    "ConfirmDecision",
 ]

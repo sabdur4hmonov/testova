@@ -35,7 +35,14 @@ from app.services import storage
 from app.services.ai_analyzer import AIAnalyzer
 from app.services.answer_checker import check_answers
 from app.services.answer_key_parser import parse_answer_key
-from app.services.checker import accepted_list, compare_with_unclear, grade_for
+from app.services.checker import (
+    accepted_list,
+    compare_with_unclear,
+    grade_for,
+    normalize,
+    similarity_ratio,
+    written_confirm_needed,
+)
 from app.services.file_processor import image_to_pages, preprocess_image
 from app.services.sheet_reader import read_answer_sheet
 from app.services.variant_match import resolve_variant
@@ -595,9 +602,15 @@ async def _score_and_maybe_confirm_saved(
     text_qs = {int(k) for k in (data.get("sheet_texts") or {})}
 
     res = check_answers(student_answers, answer_key)
+    # Confirm a wrong WRITTEN answer only when it is close enough to the key to
+    # be a plausible misread; a far-off answer stays wrong and is never asked
+    # (same rule as the manual flow, via the shared checker function).
     wrong_written = [
         r.position for r in res.question_results
         if r.position in text_qs and not r.is_correct and not r.is_skipped
+        and written_confirm_needed(
+            r.student_answer, accepted_list(answer_key.get(str(r.position)))
+        )
     ]
 
     if wrong_written:
@@ -1067,9 +1080,16 @@ async def _score_and_maybe_confirm(
 
     # Wrong answers whose question was WRITTEN (in manual_texts). Excludes wrong
     # A/B/C/D (marked options are reliable) and all correct answers. res["wrong"]
-    # is already in ascending question order, so this list is too.
+    # is already in ascending question order, so this list is too. A wrong
+    # written answer is confirmed ONLY when it is close enough to the key to be a
+    # plausible misread (written_confirm_needed); a far-off answer stays wrong in
+    # res["wrong"] and is never asked.
     text_qs = {int(k) for k in texts}
-    wrong_written = [w["q"] for w in res["wrong"] if w["q"] in text_qs]
+    wrong_written = [
+        w["q"] for w in res["wrong"]
+        if w["q"] in text_qs
+        and written_confirm_needed(student.get(w["q"]), accepted_list(key_int.get(w["q"])))
+    ]
 
     if not wrong_written:
         await _grade_manual_cached(target, state, db_user, name)   # clean path
@@ -1153,7 +1173,46 @@ async def handle_confirm_answer(
     overrides = dict(data.get("confirm_overrides") or {})
     overrides[str(q)] = (verdict == "ok")
     await state.update_data(confirm_pending=pending[1:], confirm_overrides=overrides)
+
+    # Part 2: append-only log of this decision (ground truth for tuning the
+    # similarity threshold). Pure logging — never affects grading; wrapped so a
+    # DB hiccup can't break the confirm flow.
+    await _log_confirm_decision(db_user, data, q, verdict == "ok")
+
     await _advance_confirm(callback.message, state, db_user)
+
+
+async def _log_confirm_decision(
+    db_user: User, data: dict, q: int, teacher_correct: bool
+) -> None:
+    """Persist one teacher To'g'ri/Xato decision with the context that produced
+    the ask. Read by nothing in grading — validation data only. Never raises."""
+    try:
+        saved = data.get("confirm_flow") == "saved"
+        flow = "saved" if saved else "manual"
+        texts = (data.get("sheet_texts") if saved else data.get("manual_texts")) or {}
+        key_src = (data.get("sheet_answer_key") if saved else data.get("manual_key")) or {}
+        student_ans = texts.get(str(q))
+        accepted = accepted_list(key_src.get(str(q)))
+        s_norm = normalize(student_ans)
+        sim = (
+            max((similarity_ratio(s_norm, normalize(a)) for a in accepted), default=None)
+            if s_norm else None
+        )
+        from app.models.confirm_decision import ConfirmDecision
+        async with async_session_factory() as session:
+            session.add(ConfirmDecision(
+                user_id=db_user.telegram_id,
+                flow=flow,
+                question_number=q,
+                student_answer=(student_ans or None),
+                correct_answer=(" / ".join(accepted) or None),
+                similarity=sim,
+                teacher_correct=teacher_correct,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning("confirm_decision_log_failed", error=str(e))
 
 
 async def _grade_manual_cached(
