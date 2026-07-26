@@ -271,18 +271,22 @@ async def read_answer_sheet(
 
     prompt = ANSWER_SHEET_PROMPT.format(total=expected_count)
     raw = ""
-    for attempt in range(settings.GEMINI_MAX_RETRIES):
+    # Grading-only budget: tight per-attempt timeout, few retries, flat backoff
+    # (GEMINI_GRADING_*). Extraction/generation keep the generous GEMINI_MAX_RETRIES
+    # / 90s — a teacher waiting on a graded photo must not sit through 4.5 min.
+    for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
         try:
             raw = await asyncio.wait_for(
-                asyncio.to_thread(_call_sync, prompt, png_bytes), timeout=90
+                asyncio.to_thread(_call_sync, prompt, png_bytes),
+                timeout=settings.GEMINI_GRADING_TIMEOUT,
             )
             break
         except asyncio.TimeoutError:
             logger.warning("sheet_read_timeout", attempt=attempt + 1)
         except Exception as e:
             logger.warning("sheet_read_error", attempt=attempt + 1, error=str(e))
-        if attempt < settings.GEMINI_MAX_RETRIES - 1:
-            await asyncio.sleep(2 ** attempt)
+        if attempt < settings.GEMINI_GRADING_MAX_RETRIES - 1:
+            await asyncio.sleep(1)  # flat 1s backoff — keep the worst case small
     else:
         return empty
 

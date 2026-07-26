@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # (.env overrides this; live behavior is unchanged.)
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_MAX_RETRIES: int = 3
+    # Grading-only budget (answer-sheet reads). SEPARATE from GEMINI_MAX_RETRIES,
+    # which governs question extraction/generation and must stay generous. A
+    # teacher waiting on a graded photo needs a tight worst case, not 4.5 min:
+    # 2 attempts x 15s + a flat 1s backoff ≈ 31s worst case.
+    GEMINI_GRADING_MAX_RETRIES: int = 2
+    GEMINI_GRADING_TIMEOUT: int = 15  # seconds, per attempt
     # Cost tracking (read-only). Prices are USD per 1M tokens; so'm via UZS rate.
     GEMINI_PRICE_IN_PER_M: float = 0.30    # gemini-2.5-flash input list price
     GEMINI_PRICE_OUT_PER_M: float = 2.50   # gemini-2.5-flash output list price
