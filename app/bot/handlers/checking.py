@@ -10,6 +10,7 @@ Flow:
 from __future__ import annotations
 
 import html
+import time
 import uuid
 from datetime import date
 
@@ -401,7 +402,12 @@ async def handle_answer_sheet_upload(
     # Read the sheet ONCE (variant + name + answers). Cached in state so the
     # optional name prompt and the variant picker never trigger a 2nd Gemini call.
     thinking = await message.answer(_CHECKING.get(lang, _CHECKING["uz"]))
+    _t_grade = time.perf_counter()
     read = await read_answer_sheet(content, expected_count)
+    logger.info(
+        "grade_one_sheet",
+        grade_one_sheet_total_ms=round((time.perf_counter() - _t_grade) * 1000),
+    )
     await thinking.delete()
 
     # Keyed by position STRING to match check_answers / the stored answer key.
@@ -1018,7 +1024,12 @@ async def handle_manual_sheet(
         tg_file = await bot.get_file(file_id)
         file_bytes_io = await bot.download_file(tg_file.file_path)
         content = file_bytes_io.read()
+        _t_grade = time.perf_counter()
         read = await read_answer_sheet(content, total)
+        logger.info(
+            "grade_one_sheet",
+            grade_one_sheet_total_ms=round((time.perf_counter() - _t_grade) * 1000),
+        )
     except Exception as e:
         code = "#CHK-" + uuid.uuid4().hex[:4].upper()
         logger.warning("manual_read_failed", code=code, error=str(e))

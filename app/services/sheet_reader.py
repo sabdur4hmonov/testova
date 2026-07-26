@@ -16,6 +16,7 @@ import asyncio
 import io
 import json
 import re
+import time
 from typing import Any
 
 import google.generativeai as genai
@@ -269,7 +270,12 @@ async def read_answer_sheet(
     try:
         # Decode + preprocess + PNG-encode is CPU-heavy; run it OFF the event
         # loop so one teacher's photo never freezes the bot for everyone else.
+        _t_pre = time.perf_counter()
         png_bytes = await asyncio.to_thread(_prepare_png, image_bytes)
+        logger.info(
+            "preprocess_timing",
+            preprocess_timing_ms=round((time.perf_counter() - _t_pre) * 1000),
+        )
         if png_bytes is None:
             return empty
     except Exception as e:
