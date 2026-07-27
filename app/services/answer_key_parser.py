@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 
-from app.services.option_letters import canonical_letter, is_option_letter
+from app.services.option_letters import canonical_letter
 
 # Cyrillic → Latin uppercasing used only to make the letter-path regex match a
 # teacher typing look-alikes on a Cyrillic keyboard. The STORED letter value is
@@ -62,16 +62,27 @@ _WRITTEN_ON_LETTER_LINE = re.compile(r"\d+\s*:\s*[^\d\s]{2,}")
 # FIRST char is a DIGIT (a written numeric answer — never an MC letter, whose
 # value would be a letter), and normalise it to colon form so the tested written
 # path handles it. Letter answers ("19 a", "1-A 2-B"), colon lines and a bare
-# "19-" skip are left exactly as typed; a written WORD still needs the colon.
+# "19-" skip are left exactly as typed.
 _WRITTEN_NONCOLON = re.compile(r"^(\s*)(\d+)[\s.\-)]+(\d.*?)\s*$")
+
+# BUG A (word truncation): a written WORD typed with a non-colon separator —
+# "13.Temurbek", "13-Temurbek", "13)Temurbek" — used to hit the letter parser,
+# whose single-letter capture truncated it to "13T" and then rejected it. Detect
+# a single leading number, a dot/dash/paren separator, then a SINGLE multi-char
+# token whose first char is a LETTER (2+ chars, no internal space → not a bare
+# option letter like "13.F", not a multi-answer line, not a numeric). Bare SPACE
+# is deliberately EXCLUDED here so "1 A" stays a letter answer and a spaced
+# numeric like "20 8,23" is handled by _WRITTEN_NONCOLON, never mis-split.
+_WRITTEN_NONCOLON_WORD = re.compile(r"^(\s*)(\d+)[.\-)]\s*([^\W\d]\S+)\s*$", re.UNICODE)
 
 
 def _to_colon_written(text: str) -> str:
-    """Rewrite non-colon numeric written answers to '<num>: <value>' (see
-    _WRITTEN_NONCOLON). Idempotent — colon lines already match nothing."""
+    """Rewrite non-colon written answers (numeric OR single word) to
+    '<num>: <value>' so the tested written path handles them. Idempotent — colon
+    lines and letter runs ("1A 2B") match neither pattern and pass through."""
     out: list[str] = []
     for line in text.splitlines():
-        m = _WRITTEN_NONCOLON.match(line)
+        m = _WRITTEN_NONCOLON.match(line) or _WRITTEN_NONCOLON_WORD.match(line)
         out.append(
             f"{m.group(1)}{m.group(2)}: {m.group(3).strip()}" if m else line
         )
@@ -122,33 +133,24 @@ def _parse_letters(text: str) -> tuple[dict[int, str], str]:
     # bare run of letters.
     labelled = _LABELLED_RE.findall(folded)
     if labelled:
-        key: dict[int, str] = {}
-        bad: list[str] = []
-        for num_s, letter in labelled:
-            if not is_option_letter(letter):
-                bad.append(f"{num_s}{letter}")
-                continue
-            key[int(num_s)] = canonical_letter(letter)
-        if bad:
-            return {}, (
-                "Faqat A, B, C, D javoblari qabul qilinadi. "
-                "Xato: " + ", ".join(bad)
-            )
+        # Accept ANY single letter as a candidate option label — do NOT gate on a
+        # hardcoded A–E set (that wrongly rejected F and gapped-set letters). The
+        # manual flow has no stored options to validate against, so it accepts any
+        # letter and lets grading decide; the upload/photo flow re-validates each
+        # letter against the question's REAL options downstream (_resolve_saved_key).
+        # Cyrillic look-alikes fold via canonical_letter (shared with generation).
+        key = {int(num_s): canonical_letter(letter) for num_s, letter in labelled}
         if not key:
             return {}, "Javob kaliti aniqlanmadi. Masalan: 1A 2B 3C"
         return key, ""
 
-    # ── Shape 2: bare "ABCDABCD" — letters only, numbered from 1.
+    # ── Shape 2: bare "ABCDABCD" — letters only, numbered from 1. Any Latin
+    # letter is accepted (option-membership is re-checked downstream where the
+    # test's real options are known); no hardcoded A–E wall here.
     letters_only = re.sub(r"[^A-Z]", "", folded)
     if not letters_only:
         return {}, "Javob kaliti aniqlanmadi. Masalan: 1A 2B 3C yoki ABCD"
 
-    bad_letters = sorted({c for c in letters_only if not is_option_letter(c)})
-    if bad_letters:
-        return {}, (
-            "Faqat A, B, C, D javoblari qabul qilinadi. "
-            "Xato harf(lar): " + ", ".join(bad_letters)
-        )
     return {i + 1: canonical_letter(c) for i, c in enumerate(letters_only)}, ""
 
 
