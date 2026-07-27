@@ -159,13 +159,13 @@ def test_bare_dash_is_still_a_skip_not_a_written_answer():
     assert 19 not in key   # no written value invented
 
 
-def test_invalid_letter_line_alongside_word_still_rejected():
-    # A genuinely invalid letter (X) on a letter line rejects the whole key,
-    # even next to a valid written answer. (E is now a valid option letter, so
-    # this uses X to exercise rejection.)
+def test_letter_line_alongside_word_accepts_both():
+    # A letter line and a written line mix freely; the parser accepts any single
+    # letter (X included) — validity against a question's real options is decided
+    # downstream (_resolve_saved_key), not by a hardcoded A–E wall here.
     key, reason = parse_answer_key("5: TOSHKENT\n1A 2X")
-    assert key == {}
-    assert "A, B, C, D" in reason
+    assert key == {1: ["A"], 2: ["X"], 5: ["TOSHKENT"]}
+    assert reason == ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════

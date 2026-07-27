@@ -27,6 +27,20 @@ def test_mc_letter_not_on_paper_rejected():
     assert bad == [(1, "bad_letter")]
 
 
+def test_mc_accepts_e_and_f_when_question_offers_them():
+    # FIX 1 core: valid letters are derived from the question's REAL options, so
+    # a question offering a,b,d,e,f accepts e AND f (no A–E wall) while still
+    # rejecting a letter it does NOT offer (c). Proves widening didn't become a
+    # bigger hardcoded set.
+    labels = {1: ["a", "b", "d", "e", "f"]}
+    good, bad = _resolve_saved_key({1: ["E"]}, set(), labels)
+    assert good == {"1": ["e"]} and bad == []
+    good, bad = _resolve_saved_key({1: ["F"]}, set(), labels)
+    assert good == {"1": ["f"]} and bad == []
+    good, bad = _resolve_saved_key({1: ["C"]}, set(), labels)  # c not offered
+    assert good == {} and bad == [(1, "bad_letter")]
+
+
 def test_open_question_takes_written_answer():
     good, bad = _resolve_saved_key({19: ["8,23"]}, set(), LABELS)
     assert good == {"19": ["8,23"]}

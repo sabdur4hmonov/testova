@@ -54,28 +54,35 @@ def test_out_of_order_labelled_preserves_numbers():
     assert key == {1: ["A"], 2: ["B"], 3: ["C"]}
 
 
-def test_invalid_letter_labelled_rejected():
-    # E is a valid option letter now; F is not — and F must be REJECTED with a
-    # message, never silently skipped (the old [A-E] regex dropped it quietly).
+def test_labelled_accepts_any_single_letter():
+    # The parser no longer enforces a hardcoded A–E set — it accepts ANY single
+    # letter (E, F, and gapped-set letters included). Whether a letter is a REAL
+    # option for a given question is decided downstream against that question's
+    # stored options (_resolve_saved_key, see test_saved_key_entry.py); the pure
+    # manual flow has no options and accepts any letter, letting grading decide.
     key, reason = parse_answer_key("1A 2E 3F")
-    assert key == {}
-    assert reason  # non-empty explanation
-    assert "A, B, C, D" in reason
+    assert key == {1: ["A"], 2: ["E"], 3: ["F"]}
+    assert reason == ""
 
 
-def test_silent_drop_of_invalid_letter_is_rejected():
-    # KNOWN-OPEN #2 hardening: a genuinely invalid labelled letter must reject
-    # the whole key with a clear message — never parse the rest and drop it.
-    for bad in ("1A 2X", "1A 2Z 3B", "5F"):
-        key, reason = parse_answer_key(bad)
-        assert key == {}, f"{bad!r} should be rejected, got {key}"
-        assert reason
+def test_labelled_accepts_letters_beyond_ad():
+    # Previously X/Z/F were rejected by the A–E wall; now every single letter is
+    # kept (never silently dropped, never a "Faqat A,B,C,D" rejection).
+    for text, expected in (
+        ("1A 2X", {1: ["A"], 2: ["X"]}),
+        ("1A 2Z 3B", {1: ["A"], 2: ["Z"], 3: ["B"]}),
+        ("5F", {5: ["F"]}),
+    ):
+        key, reason = parse_answer_key(text)
+        assert key == expected, f"{text!r} -> {key}"
+        assert reason == ""
 
 
-def test_invalid_letter_bare_rejected():
+def test_bare_accepts_any_letters():
+    # Bare run "ABXD" numbers letters 1..N; no A–E wall.
     key, reason = parse_answer_key("ABXD")
-    assert key == {}
-    assert "A, B, C, D" in reason
+    assert key == {1: ["A"], 2: ["B"], 3: ["X"], 4: ["D"]}
+    assert reason == ""
 
 
 def test_empty():

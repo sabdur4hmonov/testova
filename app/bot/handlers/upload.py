@@ -36,7 +36,7 @@ from app.models.variant import Variant
 from app.services import access, storage
 from app.services.answer_key_parser import parse_answer_key, _to_colon_written
 from app.services.option_letters import (
-    OPTION_LETTER_CLASS, canonical_letter, is_option_letter,
+    OPTION_LETTER_CLASS, canonical_letter,
 )
 from app.services.ai_analyzer import (
     AIAnalyzer,
@@ -326,7 +326,13 @@ def _resolve_saved_key(
             reals: list[str] = []
             ok = True
             for item in accepted:
-                real = canon_to_real.get(canonical_letter(item)) if is_option_letter(item) else None
+                # Option membership is the ONLY authority: an item is valid iff
+                # its canonical form matches one of THIS question's real option
+                # labels (so a genuinely-offered "f"/"g" is accepted, an
+                # unoffered "c" is rejected). No hardcoded A–E gate — a
+                # multi-char word canonicalises to itself and never matches a
+                # single-letter label, so words are still rejected on MC.
+                real = canon_to_real.get(canonical_letter(item))
                 if real is None:
                     ok = False
                     break
@@ -543,8 +549,12 @@ async def apply_key_text(
                 # Accepted answers list (008). Keep the legacy single-letter
                 # column in sync when it's one MC letter (fits String(4)).
                 r.correct_answers = list(val)
+                # Keep the legacy single-letter column in sync for ANY single
+                # option letter (a,b,d,e,f,…), not just A–E — the authoritative
+                # value lives in correct_answers (jsonb) either way.
                 r.correct_answer = (
-                    val[0] if len(val) == 1 and is_option_letter(val[0]) else None
+                    val[0] if len(val) == 1 and len(val[0]) == 1 and val[0].isalpha()
+                    else None
                 )
         await session.commit()
 
