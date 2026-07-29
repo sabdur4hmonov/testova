@@ -19,9 +19,8 @@ from app.bot.keyboards.inline import revoke_confirm_keyboard
 from app.config import settings
 from app.database import async_session_factory
 from app.models.gemini_usage import GeminiUsage
-from app.models.project import Project
 from app.models.user import User
-from app.services import admin_users
+from app.services import admin_stats, admin_users
 from app.services.usage_log import estimate_cost
 from app.utils.logging import get_logger
 
@@ -220,15 +219,21 @@ async def cmd_user(message: Message, command: CommandObject, db_user: User) -> N
         return
     async with async_session_factory() as session:
         detail = await admin_users.user_detail(session, parts[0])
-    if detail is None:
-        await message.answer("Bunday foydalanuvchi topilmadi.")
-        return
+        if detail is None:
+            await message.answer("Bunday foydalanuvchi topilmadi.")
+            return
+        cost = await admin_stats.user_cost(session, detail.user.telegram_id)
     text = _fmt_user(detail.user)
     if detail.has_active_session:
         charged = "use hisoblangan" if detail.session_charged else "use hisoblanmagan"
         text += f"\n📚 Aktiv sessiya: bor, {charged}"
     else:
         text += "\n📚 Aktiv sessiya: yo‘q"
+    c = cost["cost"]
+    text += (
+        f"\n💵 Xarajat (30 kun): {cost['calls']} chaqiruv, "
+        f"${c['usd']:.4f} ≈ {c['som']:,.0f} so‘m"
+    )
     await message.answer(text, parse_mode="HTML")
 
 
@@ -266,36 +271,19 @@ async def cmd_stats(message: Message, db_user: User) -> None:
     if not _is_admin(db_user):
         await message.answer(REFUSED)
         return
-    now = _now()
     async with async_session_factory() as session:
-        total_users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
-        blocked = (await session.execute(
-            select(func.count()).select_from(User).where(User.is_blocked.is_(True))
-        )).scalar_one()
-        with_access = (await session.execute(
-            select(func.count()).select_from(User).where(
-                User.is_blocked.is_(False),
-                (User.access_until.is_(None)) | (User.access_until > now),
-                (User.uses_left.is_(None)) | (User.uses_left > 0),
-            )
-        )).scalar_one()
-        week = (await session.execute(
-            select(func.count()).select_from(Project).where(
-                Project.created_at > now - timedelta(days=7)
-            )
-        )).scalar_one()
-        month = (await session.execute(
-            select(func.count()).select_from(Project).where(
-                Project.created_at > now - timedelta(days=30)
-            )
-        )).scalar_one()
+        s = await admin_stats.compute_stats(session)
+    ct = s["cost_today"]["cost"]
+    cm = s["cost_month"]["cost"]
     await message.answer(
         "📊 <b>Statistika</b>\n"
-        f"👥 Foydalanuvchilar: {total_users}\n"
-        f"✅ Aktiv (accessli): {with_access}\n"
-        f"⛔ Bloklangan: {blocked}\n"
-        f"📤 Yuklamalar (7 kun): {week}\n"
-        f"📤 Yuklamalar (30 kun): {month}",
+        f"👥 Foydalanuvchilar: {s['total_users']} "
+        f"(✅ aktiv {s['with_access']}, ⛔ blok {s['blocked']})\n"
+        f"🟢 Faol: bugun {s['active_today']}, 7 kun {s['active_week']}\n"
+        f"📤 Testlar: jami {s['tests_total']}, 7 kun {s['tests_week']}\n"
+        f"📝 Tekshirilgan varaqlar: jami {s['graded_total']}, bugun {s['graded_today']}\n"
+        f"💵 Xarajat bugun: ${ct['usd']:.4f} ≈ {ct['som']:,.0f} so‘m\n"
+        f"💵 Xarajat 30 kun: ${cm['usd']:.4f} ≈ {cm['som']:,.0f} so‘m",
         parse_mode="HTML",
     )
 
