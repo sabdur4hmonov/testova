@@ -1517,6 +1517,25 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
 # byte-for-byte what docx_to_images produced before.
 _DOCX_SHAPE_MARKERS = (b"<w:pict", b"<v:shape", b"<m:oMath")
 
+# Modern DrawingML vector shapes that carry NO VML fallback (the encoding
+# Google Docs / LibreOffice / converters emit, where Word would also write a
+# <v:shape>). The paragraph-text renderer drops these exactly like VML, so they
+# must trigger the same LibreOffice conversion. Matched by LOCAL-NAME, any
+# namespace prefix (or none), because the prefix is producer-dependent:
+#   wsp = wordprocessingShape  (AutoShape, text-box shape)
+#   wgp = wordprocessingGroup  (grouped shapes)
+#   wpc = wordprocessingCanvas (drawing canvas)
+# DELIBERATELY EXCLUDED — do NOT add these: a:graphic / a:graphicData /
+# wp:inline / wp:anchor / pic:pic / a:blip / a:prstGeom / graphicFrame. Those
+# wrap PLAIN INLINE RASTER images too (proven: every one of them appears in a
+# text+photo DOCX in the real corpus that extracts correctly on the python-docx
+# path). Matching them would force a needless LibreOffice conversion of a
+# working file — and they add no detection power, since a real shape already
+# contains wsp/wgp/wpc INSIDE its a:graphic wrapper. (Charts / SmartArt would
+# need c:chart / dgm:relIds, not a:graphic — add those only if a real sample
+# ever appears.)
+_DOCX_DRAWINGML_SHAPE_RE = re.compile(rb"<(?:[A-Za-z0-9]+:)?(?:wsp|wgp|wpc)\b")
+
 # Overridable so a non-standard install / test can point elsewhere.
 SOFFICE_BIN = os.environ.get("SOFFICE_BIN", "soffice")
 # A hung conversion must never block the extraction pipeline.
@@ -1524,8 +1543,11 @@ SOFFICE_TIMEOUT = 60  # seconds
 
 
 def docx_has_renderable_shapes(docx_bytes: bytes) -> bool:
-    """True when the DOCX carries VML drawings or OMML equations that the
-    paragraph-text renderer would drop (Defect 3).
+    """True when the DOCX carries VML drawings, OMML equations, or DrawingML
+    vector shapes that the paragraph-text renderer would drop (Defect 3).
+
+    Reads ONLY the document body (`word/document.xml`), so shapes living in
+    headers/footers can never false-trigger a conversion of the body text.
 
     Best-effort: any error → False, so a probe failure keeps the current text
     path rather than forcing a conversion. Never raises.
@@ -1536,7 +1558,9 @@ def docx_has_renderable_shapes(docx_bytes: bytes) -> bool:
     except Exception as e:
         logger.warning("docx_shape_probe_failed", error=str(e))
         return False
-    return any(marker in xml for marker in _DOCX_SHAPE_MARKERS)
+    if any(marker in xml for marker in _DOCX_SHAPE_MARKERS):
+        return True
+    return bool(_DOCX_DRAWINGML_SHAPE_RE.search(xml))
 
 
 def docx_to_pdf(docx_bytes: bytes, timeout: int = SOFFICE_TIMEOUT) -> bytes | None:
