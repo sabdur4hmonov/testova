@@ -13,6 +13,7 @@ Only the Gemini call, this prompt, and the defensive JSON parse are new.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import json
 import re
@@ -26,6 +27,24 @@ from app.services.option_letters import is_option_letter
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# The telegram_id whose grading read is in flight, for per-user cost attribution
+# in gemini_usage. Set at the top of read_answer_sheet; read inside the blocking
+# _call_sync where the usage row is written. A ContextVar (not a parameter) keeps
+# _call_sync/_read_once signatures unchanged AND is isolated per grading task —
+# asyncio.to_thread propagates the current context to the worker thread, so the
+# value set here is visible where the Gemini response is logged. None = no
+# attribution (older rows, or a caller that omits user_id).
+_grade_user_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "grade_user_id", default=None
+)
+
+
+def set_grade_user(user_id: int | None) -> None:
+    """Attribute the grading read(s) that follow in THIS task to `user_id`
+    (telegram_id), for per-user cost tracking. Call right before
+    read_answer_sheet. Isolated per grading task; None clears attribution."""
+    _grade_user_id.set(user_id)
 
 # NOTE: this module deliberately does NOT use google-generativeai. The grading
 # call goes over REST so thinking can be disabled (see _call_sync). Extraction
@@ -211,7 +230,10 @@ def _call_sync(prompt: str, png_bytes: bytes) -> tuple[str, int]:
     # Cost accounting only — kind="grade". Wrapped so it can NEVER crash grading.
     try:
         from app.services.usage_log import log_gemini_usage
-        log_gemini_usage(response, kind="grade", model=settings.GEMINI_MODEL)
+        log_gemini_usage(
+            response, kind="grade", model=settings.GEMINI_MODEL,
+            user_id=_grade_user_id.get(),
+        )
     except Exception:
         pass
     candidates = payload.get("candidates") or []
@@ -473,6 +495,9 @@ async def read_answer_sheet(
 
     On any Gemini/parse failure returns an empty read (the caller treats an empty
     read as "unreadable — ask for a clearer photo"). NEVER raises.
+
+    Per-user cost attribution rides a ContextVar set by the caller via
+    set_grade_user() — this function's signature stays stable for callers/mocks.
     """
     empty = _empty_read()
     try:

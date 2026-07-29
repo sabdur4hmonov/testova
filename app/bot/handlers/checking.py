@@ -45,7 +45,7 @@ from app.services.checker import (
     written_confirm_needed,
 )
 from app.services.file_processor import image_to_pages, preprocess_image
-from app.services.sheet_reader import read_answer_sheet
+from app.services.sheet_reader import read_answer_sheet, set_grade_user
 from app.services.variant_match import resolve_variant
 from app.utils.caption_parser import (
     NAME_TOO_LONG, parse_caption, parse_name_input, validate_test_name,
@@ -452,6 +452,7 @@ async def handle_answer_sheet_upload(
     # optional name prompt and the variant picker never trigger a 2nd Gemini call.
     thinking = await message.answer(_CHECKING.get(lang, _CHECKING["uz"]))
     _t_grade = time.perf_counter()
+    set_grade_user(db_user.telegram_id)  # attribute this grade's Gemini cost
     read = await read_answer_sheet(
         content, expected_count,
         option_labels=await _project_option_labels(project_id),
@@ -1079,8 +1080,9 @@ async def handle_manual_sheet(
         file_bytes_io = await bot.download_file(tg_file.file_path)
         content = file_bytes_io.read()
         _t_grade = time.perf_counter()
+        set_grade_user(db_user.telegram_id)  # attribute this grade's Gemini cost
         read = await read_answer_sheet(
-            content, total, option_labels=_labels_from_key(key_raw)
+            content, total, option_labels=_labels_from_key(key_raw),
         )
         logger.info(
             "grade_one_sheet",

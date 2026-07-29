@@ -455,7 +455,8 @@ def _section_suspicious(quality: dict, sec: int) -> list:
 
 
 async def run_pipeline_with_heartbeat(
-    status_msg, content: bytes, file_type: str, project_id: str
+    status_msg, content: bytes, file_type: str, project_id: str,
+    user_id: int | None = None,
 ) -> PipelineResult:
     """Run the shared extraction pipeline while keeping the status message
     alive. Used by BOTH the single-file flow and the Multi-Source Builder."""
@@ -474,7 +475,7 @@ async def run_pipeline_with_heartbeat(
 
     hb_task = asyncio.create_task(_heartbeat())
     try:
-        return await process_file(content, file_type, project_id)
+        return await process_file(content, file_type, project_id, user_id=user_id)
     finally:
         stop_hb.set()
         hb_task.cancel()
@@ -787,7 +788,9 @@ async def _run_extraction(
     """Run the pipeline and drive the post-extraction prompts. Shared entry
     used after the format choice."""
     status_msg = await message.answer(t("analyzing", lang))
-    result = await run_pipeline_with_heartbeat(status_msg, content, file_type, project_id)
+    result = await run_pipeline_with_heartbeat(
+        status_msg, content, file_type, project_id, user_id=db_user.telegram_id
+    )
 
     if result.status == "no_questions":
         await status_msg.edit_text(t("no_q", lang))
@@ -900,7 +903,7 @@ async def handle_reextract(
             {"question_number": r.question_number, "page_number": r.page_number}
             for r in rows
         ]
-        analyzer = AIAnalyzer()
+        analyzer = AIAnalyzer(user_id=db_user.telegram_id)
         fresh = await analyzer.reextract_questions(nums, qdicts, images)
     except Exception as e:
         logger.error("reextract_error", project_id=project_id, error=str(e))

@@ -527,7 +527,9 @@ async def _process_builder_file(
         ))
         await session.commit()
 
-    result = await run_pipeline_with_heartbeat(status_msg, content, file_type, project_id)
+    result = await run_pipeline_with_heartbeat(
+        status_msg, content, file_type, project_id, user_id=db_user.telegram_id
+    )
 
     if result.status == "refused_multi_section":
         await state.set_state(BuilderStates.waiting_for_file)

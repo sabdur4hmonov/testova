@@ -76,6 +76,48 @@ async def _insert(row: dict) -> None:
         await engine.dispose()
 
 
+async def usage_summary(session, since, telegram_id: int | None = None) -> dict:
+    """Aggregate real recorded Gemini usage from `since` onward.
+
+    Sums the actual token counts stored in gemini_usage (not an estimate) and
+    computes cost from them via `estimate_cost`. When `telegram_id` is given the
+    sum is scoped to that user (rows with user_id = telegram_id); otherwise it is
+    the total across everyone. Historical rows written before per-user
+    attribution have user_id NULL, so they count in the total but in no user.
+
+    Returns: {calls, prompt_tokens, output_tokens, cost: {usd, som, ...}}.
+    output_tokens already folds in thinking tokens.
+    """
+    from sqlalchemy import func, select
+
+    from app.models.gemini_usage import GeminiUsage
+
+    stmt = select(
+        func.count(),
+        func.coalesce(func.sum(GeminiUsage.prompt_tokens), 0),
+        func.coalesce(
+            func.sum(GeminiUsage.output_tokens + GeminiUsage.thinking_tokens), 0
+        ),
+    ).where(GeminiUsage.created_at >= since)
+    if telegram_id is not None:
+        stmt = stmt.where(GeminiUsage.user_id == telegram_id)
+
+    calls, in_tok, out_tok = (await session.execute(stmt)).one()
+    calls, in_tok, out_tok = int(calls), int(in_tok), int(out_tok)
+    # out_tok already includes thinking → pass thinking=0 to the cost fn.
+    cost = estimate_cost(
+        in_tok, out_tok, 0,
+        settings.GEMINI_PRICE_IN_PER_M, settings.GEMINI_PRICE_OUT_PER_M,
+        settings.UZS_PER_USD,
+    )
+    return {
+        "calls": calls,
+        "prompt_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cost": cost,
+    }
+
+
 def log_gemini_usage(
     response: Any,
     kind: str = "extract",

@@ -17,6 +17,9 @@ from app.services.file_processor import PageImage
 
 
 class _FakeAnalyzer:
+    def __init__(self, user_id=None):
+        self.user_id = user_id
+
     async def extract_all_questions(self, images, page_infos=None):
         return [{
             "question_number": 1, "question_text": "q", "options": {},

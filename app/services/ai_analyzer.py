@@ -1031,11 +1031,14 @@ def _white_ratio(img: Image.Image) -> float:
 
 
 class AIAnalyzer:
-    def __init__(self) -> None:
+    def __init__(self, user_id: int | None = None) -> None:
         self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
         self._sem = asyncio.Semaphore(MAX_CONCURRENT)
         # cost cache: md5(page image bytes) → extracted questions (this session)
         self._page_cache: dict[str, list[dict]] = {}
+        # telegram_id of the teacher whose extraction this is, for per-user cost
+        # attribution in gemini_usage. None = unattributed (e.g. dead paths).
+        self._user_id = user_id
 
     # ── Gemini call ─────────────────────────────────────────────────────────────
 
@@ -1059,7 +1062,10 @@ class AIAnalyzer:
         # Instrumentation only — read-only usage accounting, never crashes.
         try:
             from app.services.usage_log import log_gemini_usage
-            log_gemini_usage(response, kind="extract", model=settings.GEMINI_MODEL)
+            log_gemini_usage(
+                response, kind="extract", model=settings.GEMINI_MODEL,
+                user_id=self._user_id,
+            )
         except Exception:
             pass
         fr = 0

@@ -258,7 +258,7 @@ async def test_3_failed_extraction_no_charge(monkeypatch):
 
     charged = {"n": 0}
 
-    async def fake_pipeline(status, content, file_type, project_id):
+    async def fake_pipeline(status, content, file_type, project_id, user_id=None):
         return PipelineResult(status="no_questions")
 
     async def fake_charge(*a, **k):
@@ -284,6 +284,7 @@ async def test_3_failed_extraction_no_charge(monkeypatch):
 
     class _U:
         id = uuid.uuid4()
+        telegram_id = 5037603460
         is_admin = False
         uses_left = 1
         language = type("L", (), {"value": "uz"})()

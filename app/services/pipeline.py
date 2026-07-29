@@ -121,6 +121,7 @@ async def process_file(
     content: bytes,
     file_type: str,
     project_id: str,
+    user_id: int | None = None,
 ) -> PipelineResult:
     """
     Run the FULL extraction pipeline for one uploaded file and persist its
@@ -180,7 +181,7 @@ async def process_file(
         )
 
     # ── Extract via Gemini Vision ─────────────────────────────────────────────
-    analyzer = AIAnalyzer()
+    analyzer = AIAnalyzer(user_id=user_id)
     all_questions = await analyzer.extract_all_questions(
         images=images, page_infos=page_infos
     )
