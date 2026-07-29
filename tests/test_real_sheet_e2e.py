@@ -54,7 +54,7 @@ EXPECTED_KEY = {
     6: ["A"], 7: ["B"], 8: ["D"], 9: ["E"], 10: ["A"],
     11: ["B"], 12: ["F"], 13: ["TEMURBEK"], 14: ["E"], 15: ["C"],
     16: ["A"], 17: ["B"], 18: ["D"], 19: ["A"], 20: ["8,23"],
-    21: ["E"], 22: ["C"], 23: ["B"], 24: ["A"], 25: ["F"],
+    21: ["E"], 22: ["C"], 23: ["В"], 24: ["A"], 25: ["F"],
 }
 
 
@@ -67,7 +67,10 @@ def test_real_sheet_parses_25_of_25_zero_rejections():
     assert key[12] == ["F"]           # F was "Faqat A,B,C,D" rejected
     assert key[13] == ["TEMURBEK"]    # was truncated to "13T" and rejected
     assert key[20] == ["8,23"]        # written decimal
-    assert key[23] == ["B"]           # Cyrillic В folded to Latin B
+    # Cyrillic В is STORED as В (real label) and still grades equal to Latin B.
+    assert key[23] == ["В"]
+    from app.services.checker import is_correct
+    assert is_correct("B", key[23])
 
 
 def test_real_sheet_grades_25_of_25_end_to_end():

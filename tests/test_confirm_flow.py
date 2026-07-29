@@ -110,7 +110,7 @@ def reader(monkeypatch):
     monkeypatch.setattr(C, "async_session_factory", lambda: _FakeSession())
 
     def set_read(**read):
-        async def fake(content, total):
+        async def fake(content, total, option_labels=None):
             return read
         monkeypatch.setattr(C, "read_answer_sheet", fake)
 

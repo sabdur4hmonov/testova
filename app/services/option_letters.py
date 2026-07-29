@@ -50,6 +50,10 @@ _CANON = {
 # need to capture candidate letters before validating).
 OPTION_LETTER_CLASS = "A-F" + "".join(sorted(_CYRILLIC))
 
+# The Cyrillic option letters as a plain string, for callers that need to KEEP
+# them while stripping other characters (e.g. a bare "АБВГ" answer-key run).
+CYRILLIC_OPTION_LETTERS = "".join(sorted(_CYRILLIC))
+
 
 def is_option_letter(ch: str | None) -> bool:
     """True if `ch` is a single plausible option label (Latin or Cyrillic)."""

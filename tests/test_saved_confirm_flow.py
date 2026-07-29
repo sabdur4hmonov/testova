@@ -203,7 +203,7 @@ async def test_name_unclear_triggers_confirm(monkeypatch):
         return {1, 2}, 2
     monkeypatch.setattr(C, "_project_variants", _variants)
 
-    async def _read(content, total):
+    async def _read(content, total, option_labels=None):
         return {"variant": None, "student_name": "SATDAR BAR", "name_unclear": True,
                 "answers": {"1": "A"}, "texts": {}, "unclear": []}
     monkeypatch.setattr(C, "read_answer_sheet", _read)

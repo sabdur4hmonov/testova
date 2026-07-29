@@ -21,28 +21,23 @@ never treated as a new question. If a one-line split is not confident (numbers
 not consecutive, or an empty segment), we REJECT with a clear message rather
 than guess — never silently drop or mis-parse an answer.
 
-Cyrillic look-alikes (А В С Д Е) are folded to Latin ONLY for a SINGLE-letter
-answer. A word is NEVER transliterated — Cyrillic "ТОШКЕНТ" stays Cyrillic;
-folding it would mangle a real answer into mixed script.
+The teacher's REAL label is stored, in the script they typed: a Cyrillic "В"
+stays "В" and is reported back as "В", never as Latin "B". Cross-script matching
+(Cyrillic "В" == Latin "B") happens at COMPARISON time in checker.is_correct,
+which folds both sides — so storing the real label costs nothing in matching and
+keeps a genuine Б-vs-В difference visible instead of hiding it behind one symbol.
+Words are never transliterated either — Cyrillic "ТОШКЕНТ" stays Cyrillic.
 """
 from __future__ import annotations
 
 import re
 
-from app.services.option_letters import canonical_letter
-
-# Cyrillic → Latin uppercasing used only to make the letter-path regex match a
-# teacher typing look-alikes on a Cyrillic keyboard. The STORED letter value is
-# canonicalised via the shared option_letters helper (one source of truth).
-_CYRILLIC_MAP = {
-    "А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E",
-    "а": "A", "в": "B", "с": "C", "д": "D", "е": "E",
-}
+from app.services.option_letters import CYRILLIC_OPTION_LETTERS
 
 # A labelled token: a question number followed by ONE letter, e.g. "12A",
 # "12) A", "12 - a", "12Б". Separators are optional. Matches ANY single letter
-# (Latin or Cyrillic) so an invalid one is REJECTED by is_option_letter below —
-# never silently skipped (a [A-E]-only regex used to drop F, X, Б, Г quietly).
+# (Latin or Cyrillic); option-membership is validated downstream where the
+# test's real options are known (upload/photo flow), never by a fixed set here.
 _LABELLED_RE = re.compile(r"(\d+)\s*[).\-:]?\s*([^\W\d_])", re.UNICODE)
 
 # A WRITTEN line starts with "<number>:" (that routes it to the written path).
@@ -105,11 +100,6 @@ _AMBIGUOUS = {
 }
 
 
-def _fold(text: str) -> str:
-    """Whole-text Cyrillic fold + upper. LETTER paths only — never words."""
-    return "".join(_CYRILLIC_MAP.get(ch, ch) for ch in text).upper()
-
-
 def _norm_item(s: str) -> str:
     """
     One accepted answer: upper-cased + whitespace-collapsed, capped.
@@ -118,40 +108,46 @@ def _norm_item(s: str) -> str:
     multiple-choice answer). Multi-character answers keep their script exactly.
     """
     s = " ".join(s.split()).upper()
-    if len(s) == 1:
-        # A single-letter answer is a multiple-choice label → canonicalise for
-        # matching (shared helper). Multi-char answers are never folded.
-        s = canonical_letter(s)
+    # The REAL label is stored, never the folded form: a teacher who typed
+    # Cyrillic "В" must see "В" in the report, not "B". Cross-script matching is
+    # done at COMPARISON time by checker.is_correct, which folds both sides — so
+    # storing the real label costs nothing in matching and keeps a genuine
+    # Б-vs-В difference visible instead of hiding it behind a shared symbol.
     return s[:_MAX_ITEM]
 
 
 def _parse_letters(text: str) -> tuple[dict[int, str], str]:
-    """LEGACY letter parsing — rules unchanged. Labelled wins over bare."""
-    folded = _fold(text.strip())
+    """LEGACY letter parsing — rules unchanged. Labelled wins over bare.
+
+    Case is normalised but the SCRIPT is never converted: a Cyrillic "В" stays
+    "В" (see _norm_item). Matching folds both sides at comparison time.
+    """
+    upper = text.strip().upper()
 
     # ── Shape 1: labelled "1A 2B ..." — wins so "1A 2B" is never misread as a
     # bare run of letters.
-    labelled = _LABELLED_RE.findall(folded)
+    labelled = _LABELLED_RE.findall(upper)
     if labelled:
         # Accept ANY single letter as a candidate option label — do NOT gate on a
         # hardcoded A–E set (that wrongly rejected F and gapped-set letters). The
         # manual flow has no stored options to validate against, so it accepts any
         # letter and lets grading decide; the upload/photo flow re-validates each
         # letter against the question's REAL options downstream (_resolve_saved_key).
-        # Cyrillic look-alikes fold via canonical_letter (shared with generation).
-        key = {int(num_s): canonical_letter(letter) for num_s, letter in labelled}
+        key = {int(num_s): letter for num_s, letter in labelled}
         if not key:
             return {}, "Javob kaliti aniqlanmadi. Masalan: 1A 2B 3C"
         return key, ""
 
     # ── Shape 2: bare "ABCDABCD" — letters only, numbered from 1. Any Latin
     # letter is accepted (option-membership is re-checked downstream where the
-    # test's real options are known); no hardcoded A–E wall here.
-    letters_only = re.sub(r"[^A-Z]", "", folded)
+    # test's real options are known); no hardcoded A–E wall here. Cyrillic option
+    # letters are KEPT too — stripping to [A-Z] silently dropped a bare "АБВГ"
+    # run's Б and Г (they have no Latin look-alike to fold to).
+    letters_only = re.sub(r"[^A-Z" + CYRILLIC_OPTION_LETTERS + r"]", "", upper)
     if not letters_only:
         return {}, "Javob kaliti aniqlanmadi. Masalan: 1A 2B 3C yoki ABCD"
 
-    return {i + 1: canonical_letter(c) for i, c in enumerate(letters_only)}, ""
+    return {i + 1: c for i, c in enumerate(letters_only)}, ""
 
 
 def _items(segment: str) -> list[str]:

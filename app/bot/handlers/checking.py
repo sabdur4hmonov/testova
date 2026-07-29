@@ -125,6 +125,55 @@ _NO_KEY = {
 }
 
 
+def _labels_from_key(key: dict) -> list[str]:
+    """The single-letter option labels a typed answer key actually uses.
+
+    Given to the sheet reader as a hint so it reads marks in the test's OWN
+    alphabet (Cyrillic А/Б/В/Г vs Latin A/B/C/D) instead of free-forming letters
+    the test never offers. Written answers (multi-char) are ignored. The set may
+    be INCOMPLETE — a key need not use every offered option — which is why the
+    reader treats it as a hint plus a "?" escape, never a forced choice.
+    """
+    seen: set[str] = set()
+    for value in key.values():
+        for item in (value if isinstance(value, list) else [value]):
+            s = str(item).strip()
+            if len(s) == 1 and s.isalpha():
+                seen.add(s.upper())
+    return sorted(seen)
+
+
+async def _project_option_labels(project_id: str | None) -> list[str]:
+    """Real option labels offered by a project's questions (union, any script).
+
+    The saved/photo flow grades against a stored test, so the TRUE option set is
+    known — unlike the manual flow, which can only infer it from the typed key.
+    """
+    if not project_id:
+        return []
+    import uuid as _uuid
+    from sqlalchemy import select
+    from app.models.question import Question
+    labels: set[str] = set()
+    try:
+        async with async_session_factory() as session:
+            res = await session.execute(
+                select(Question).where(
+                    Question.project_id == _uuid.UUID(project_id),
+                    Question.is_deleted.is_(False),
+                )
+            )
+            for q in res.scalars().all():
+                for o in q.options_ordered:
+                    s = str(o.get("letter", "")).strip()
+                    if len(s) == 1 and s.isalpha():
+                        labels.add(s.upper())
+    except Exception as e:  # never block grading on a hint lookup
+        logger.warning("option_labels_lookup_failed", error=str(e))
+        return []
+    return sorted(labels)
+
+
 async def _project_variants(project_id: str | None, user_id) -> tuple[set[int], int]:
     """Valid variant numbers for the teacher's project + the question count.
 
@@ -403,7 +452,10 @@ async def handle_answer_sheet_upload(
     # optional name prompt and the variant picker never trigger a 2nd Gemini call.
     thinking = await message.answer(_CHECKING.get(lang, _CHECKING["uz"]))
     _t_grade = time.perf_counter()
-    read = await read_answer_sheet(content, expected_count)
+    read = await read_answer_sheet(
+        content, expected_count,
+        option_labels=await _project_option_labels(project_id),
+    )
     logger.info(
         "grade_one_sheet",
         grade_one_sheet_total_ms=round((time.perf_counter() - _t_grade) * 1000),
@@ -619,14 +671,16 @@ async def _score_and_maybe_confirm_saved(
         )
     ]
 
-    if wrong_written:
-        # Confirm each wrong WRITTEN answer before the final result (Design B).
+    pending = sorted(set(wrong_written))
+
+    if pending:
+        # Confirm each queued question before the final result (Design B).
         # confirm_flow tags the queue as "saved" so the shared _advance_confirm
-        # routes back to _grade_saved_cached. Wrong A/B/C/D and correct answers
-        # are never asked (marked options are reliable).
+        # routes back to _grade_saved_cached. Correct answers and confidently-read
+        # wrong marked options are never asked.
         await state.update_data(
             confirm_flow="saved",
-            confirm_pending=wrong_written,
+            confirm_pending=pending,
             confirm_overrides={},
         )
         await _advance_confirm(target, state, db_user)
@@ -1025,7 +1079,9 @@ async def handle_manual_sheet(
         file_bytes_io = await bot.download_file(tg_file.file_path)
         content = file_bytes_io.read()
         _t_grade = time.perf_counter()
-        read = await read_answer_sheet(content, total)
+        read = await read_answer_sheet(
+            content, total, option_labels=_labels_from_key(key_raw)
+        )
         logger.info(
             "grade_one_sheet",
             grade_one_sheet_total_ms=round((time.perf_counter() - _t_grade) * 1000),
@@ -1102,11 +1158,13 @@ async def _score_and_maybe_confirm(
         and written_confirm_needed(student.get(w["q"]), accepted_list(key_int.get(w["q"])))
     ]
 
-    if not wrong_written:
+    pending = sorted(set(wrong_written))
+
+    if not pending:
         await _grade_manual_cached(target, state, db_user, name)   # clean path
         return
 
-    await state.update_data(confirm_pending=wrong_written, confirm_overrides={})
+    await state.update_data(confirm_pending=pending, confirm_overrides={})
     await _advance_confirm(target, state, db_user)
 
 

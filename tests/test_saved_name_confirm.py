@@ -81,7 +81,7 @@ def saved_env(monkeypatch):
     monkeypatch.setattr(C, "_project_variants", _variants)
 
     def set_read(**read):
-        async def fake(content, total):
+        async def fake(content, total, option_labels=None):
             return read
         monkeypatch.setattr(C, "read_answer_sheet", fake)
 

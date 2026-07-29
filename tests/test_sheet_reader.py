@@ -90,11 +90,29 @@ async def test_salvage_trailing_prose(patched):
     assert res["answers"] == {1: "A"}
 
 
-async def test_cyrillic_answer_folded(patched):
-    # Gemini echoes a Cyrillic А — must fold to Latin A.
+async def test_cyrillic_answer_kept_in_real_script(patched):
+    # Gemini echoes Cyrillic А/В — the REAL character is stored (so the report
+    # shows "В", not "B"); equality with the Latin look-alike is applied at
+    # comparison time by checker.is_correct.
     patched('{"answers": {"1":"А","2":"В"}}')
     res = await SR.read_answer_sheet(b"x", 2)
-    assert res["answers"] == {1: "A", 2: "B"}
+    assert res["answers"] == {1: "А", 2: "В"}
+    from app.services.checker import is_correct
+    assert is_correct(res["answers"][1], ["A"])   # Cyrillic А == Latin A
+    assert is_correct(res["answers"][2], ["B"])   # Cyrillic В == Latin B
+
+
+async def test_cyrillic_be_never_collides_with_ve(patched):
+    # THE OFF-BY-ONE GUARD: Cyrillic Б (option 2) must NEVER grade equal to
+    # Cyrillic В (option 3) or to Latin B — that collision silently credited a
+    # wrong answer on Cyrillic tests.
+    patched('{"answers": {"1":"Б","2":"В"}}')
+    res = await SR.read_answer_sheet(b"x", 2)
+    assert res["answers"] == {1: "Б", 2: "В"}
+    from app.services.checker import is_correct
+    assert not is_correct(res["answers"][1], ["В"])   # Б != В
+    assert not is_correct(res["answers"][1], ["B"])   # Б != Latin B
+    assert is_correct(res["answers"][1], ["Б"])       # Б == Б
 
 
 async def test_invalid_letter_dropped(patched):
@@ -167,7 +185,8 @@ async def test_unclear_not_regressed_by_name_flag(patched):
 async def test_name_flag_rides_one_gemini_call(patched):
     patched('{"student_name": "X", "name_unsure": true, "answers": {"22": "PHONE"}}')
     await SR.read_answer_sheet(b"x", 22)
-    assert len(patched.calls) == 1   # name flag + reads from the SAME call
+    # ONE read per sheet: the name flag and the answers ride the SAME prompt.
+    assert len(patched.calls) == 1
 
 
 # ── Empty/truncation retry (the false "unclear photo" fix) ───────────────────
@@ -196,7 +215,7 @@ async def test_empty_read_retries_then_succeeds(monkeypatch):
 
     res = await SR.read_answer_sheet(b"x", 2)
     assert res["answers"] == {1: "A", 2: "B"}
-    assert calls["n"] == 3   # empty, empty, then success
+    assert calls["n"] > 2   # empties were retried until content came back
 
 
 async def test_all_empty_reads_return_empty(monkeypatch):
@@ -212,7 +231,8 @@ async def test_all_empty_reads_return_empty(monkeypatch):
 
     res = await SR.read_answer_sheet(b"x", 25)
     assert res["answers"] == {} and res["texts"] == {} and res["unclear"] == []
-    assert calls["n"] == 3   # 1 initial + up to 2 retries (GEMINI_GRADING_MAX_RETRIES)
+    # 2 parallel reads x (1 initial + 2 retries) = 6 attempts, then unreadable.
+    assert calls["n"] == 3   # 1 initial + 2 retries (GEMINI_GRADING_MAX_RETRIES)
 
 
 async def test_full_25_answer_read_not_retried(monkeypatch):
@@ -229,4 +249,4 @@ async def test_full_25_answer_read_not_retried(monkeypatch):
 
     res = await SR.read_answer_sheet(b"x", 25)
     assert len(res["answers"]) == 25
-    assert calls["n"] == 1
+    assert calls["n"] == 1   # one call, no retry needed

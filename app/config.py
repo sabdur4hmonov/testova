@@ -47,7 +47,13 @@ class Settings(BaseSettings):
     # TOTAL attempts (1 initial + up to 2 retries) — retried on timeout/error AND
     # on an empty/truncated read: 3 x 15s + 2 x 1s backoff ≈ 47s worst case.
     GEMINI_GRADING_MAX_RETRIES: int = 3
-    GEMINI_GRADING_TIMEOUT: int = 15  # seconds, per attempt
+    # Per-attempt seconds. MEASURED (thinking disabled, real sheets, n=10):
+    # p50 7.4s, p90 11.1s, max 12.3s — so 25s is >2x p90 headroom. The old 15s
+    # was too tight: with thinking ON a 25-question sheet took ~26s, so it
+    # ALWAYS timed out, retried, and could end up empty — surfacing as a FALSE
+    # "Rasm aniq chiqmagan" on a perfectly readable photo. Abandoning a slow but
+    # valid call is worse than waiting: the teacher gets a bogus retake request.
+    GEMINI_GRADING_TIMEOUT: int = 25
     # Cap simultaneous grading Gemini calls so a burst of photos can't blow past
     # Gemini's rate limits. Mirrors ai_analyzer's MAX_CONCURRENT (extraction).
     MAX_CONCURRENT_GRADING: int = 6

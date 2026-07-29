@@ -90,7 +90,7 @@ def wired(monkeypatch):
         monkeypatch.setattr(C, "_project_variants", fake_project_variants)
 
     def set_read(variant, student_name, answers, unclear=None, texts=None):
-        async def fake_read(content, expected_count):
+        async def fake_read(content, expected_count, option_labels=None):
             return {
                 "variant": variant, "student_name": student_name,
                 "answers": answers, "texts": texts or {}, "unclear": unclear or [],
