@@ -1,6 +1,157 @@
 # TESTOVA — PROJECT HANDOFF (continue from here)
 
-> **Handoff updated: 18 July 2026 — reconciled through v0.17.** Supersedes the previous handoff. Reconciled against the real git log (now pushed to GitHub: `github.com/sabdur4hmonov/testova`). Since v0.12, grading got a lot smarter: **v0.13 short-answer grading** (word/number answers + multiple accepted answers), **v0.14 uncertainty flagging**, **v0.15 flag-caching fix**, **v0.16 To'g'ri/Xato confirm buttons + aggressive name flagging + DESIGN B** (the key architectural call — see its section), and **v0.17** removing the now-dead answer-side flagging. **Generate AND grade is real, timed, auto-identified, and now self-correcting** (the teacher confirms wrong written answers). The next big piece is still **VPS deployment** — see NEXT. Two known bugs are queued (one-line parser + E/C letters) — see KNOWN-OPEN ITEMS.
+> **Handoff updated: 29 July 2026 — current through v0.38.** The CURRENT STATE section immediately below is the live state; everything from the CONTEXT heading onward is retained history (accurate up to v0.17) — where the two disagree, **the CURRENT STATE section wins**. Repo: `github.com/sabdur4hmonov/testova`.
+
+# 🟢 CURRENT STATE — v0.38 (29 July 2026)
+
+**HEAD:** `master` @ v0.38 + one docs commit. **Suite: 783 passed + 3 errors.**
+Those 3 errors are `tests/test_subscription.py` needing a live Postgres login —
+**environmental, NOT regressions.** "783 passed, 3 errors" is the green baseline;
+if you see a different passed count, something changed.
+
+**⚠️ The bot must be RESTARTED to pick up v0.38** — the thread-pool sizing happens
+once at startup in `main.py`. Code changes never hot-reload.
+
+## What shipped v0.34 → v0.38
+
+| ver | what | proof that mattered |
+|---|---|---|
+| **v0.34** | Typed answer-key parser widened: any separator (`12:F` `12.F` `12 F` `12)F` `12-F`), any letter (F, gapped sets), written answers routed to open questions. Upload/saved flow derives valid letters **per question from `questions.options`**; the pure manual flow has no options so it accepts any letter. | Real screenshot sheet pinned e2e: 25/25 parse, 25/25 grade |
+| **v0.35** | False "Rasm aniq chiqmagan" fixed. Root cause: `max_output_tokens=2048` + hidden thinking tokens → `finish_reason=2` truncation → empty read → retake message on a *readable* photo. Cap → 8192, and an empty/truncated read is now retried. | The sheet that read 5/6 empty now reads 5/5 |
+| **v0.36** | Photo path reads E/F. `ANSWER_SHEET_PROMPT` no longer hardcodes "A, B, C or D"; `is_option_letter` A–E → A–F. | E/F captured 21 → 40 across 17 sheets |
+| **v0.37** | **Cyrillic correctness + thinking-off for grading.** Prompt names Cyrillic labels and forbids transliteration; the **real label is stored** and the cross-script fold moved to **compare time**; each test's actual option labels are passed as a hint. Grading now calls **REST with `thinkingBudget: 0`**. | Cyrillic 9/10 on 3/3 runs (identical), zero false-CORRECT, Latin found all 6 E's (v0.36 missed Q12's). 3.3–4.6× cheaper, up to 2.8× faster |
+| **v0.38** | Scaling: grading semaphore 6→16 **and** thread pool 12→32 (both, or neither helps). Cost meter now captures thinking tokens. | 30 sheets: 38.5s → 16.2s (2.4×) |
+
+### The Cyrillic bug, stated once (it was misdiagnosed twice)
+The cross-script fold was **always symmetric and correct**. The bug was that Gemini
+**transliterated before the code ever saw the mark** — Cyrillic `Б` came back as Latin
+`B`, which is the canonical form of `В`. So a student who marked `Б` (wrong) could be
+**silently CREDITED** against a `В` key. Fixed at the prompt, not the fold.
+
+## Infrastructure facts (measured 29 Jul 2026)
+
+* **Gemini Tier 1: 1,000 RPM / 1M TPM / 10,000 RPD.** Peak observed usage: **8 RPM**.
+  Gemini is *not* the bottleneck. **RPD 10,000/day is the real ceiling** (~10,000
+  gradings/day at one call each) — watch the daily count, not the rate.
+* **Grading latency (thinking off):** p50 7.4s, p90 11.1s. `GEMINI_GRADING_TIMEOUT`
+  is 25s for that reason — the old 15s always timed out on 25-question sheets.
+* **Postgres `max_connections = 100`; pool is 25+50 = 75.** Fine for ONE process.
+  **Two processes would need 150 > 100 and would break** — raise it before ever
+  going multi-process.
+* **Redis:** was never running (not a config bug). Started via
+  `docker compose up -d redis` → `storage_redis`, FSM now survives restarts.
+  `testova-pg` is NOT compose-managed, so compose won't touch it.
+* **True Gemini spend was 2.8× the reported figure** before v0.38 ($1.09 shown vs
+  $3.07 real) because the SDK omits `thoughts_token_count` while `total` includes it.
+
+## 🔴 REJECTED EXPERIMENTS — DO NOT RETRY BLINDLY
+
+All three were **built, measured on real data, and reverted.** Full rationale is in
+`docs/BACKLOG.md`. Retrying any of them without new evidence repeats paid work and
+risks shipping a regression.
+
+### 1. Extraction with thinking disabled → **invents questions from an answer key**
+Grading is better without thinking, so the same change was tried on extraction. On a
+real math test, page 4 is a **"JAVOBLAR JADVALI"** answer-key grid (number → letter).
+With thinking **ON** the model recognises it isn't questions and extracts **nothing**
+(40 total, correct). With thinking **OFF** it pattern-matches the grid into **40
+phantom question stubs** with empty text — **80 questions for a 40-question test.**
+Also flipped a sign inside a math formula (`- 6n` → `+ 6n`) and introduced a word typo.
+**Principle: grading is TRANSCRIPTION (no reasoning needed); extraction is STRUCTURING
+(reasoning is exactly what decides "is this page questions or an answer key?").**
+Do not retry without first solving non-question-page rejection.
+
+### 2. JPEG instead of PNG for the graded photo → **degraded reads**
+Halves the upload, but Gemini **bills by image dimensions, not bytes**, so the only
+gain was latency. Measured: the Cyrillic Q8 mark went `Г` → `С` in 2 of 3 runs, and
+the lowercase `e` on a Latin sheet's Q3 stopped being detected (2 of 2). Faint pencil
+is exactly what JPEG quantisation smooths away. Lossless WebP is the untried
+alternative — it would need the same accuracy proof.
+
+### 3. Two-read cross-check → **correlated reads, 1-in-3 benefit, made things worse**
+Reading each sheet twice and flagging disagreements caught the target silent misread
+in only **1 of 3 runs**, doubled cost, and — the killer — when one read came back
+empty, **every question "disagreed"** and the whole sheet was flagged. Two calls on
+identical pixels are **not independent**; they tend to be wrong the same way, so
+agreement is not evidence of correctness. If ever revisited it needs a genuinely
+independent signal (different prompt, different preprocessing, different model),
+not a repeat of the same call.
+
+## 🗄️ `temp_images/` IS A PERMANENT STORE, NOT SCRATCH
+
+`file_processor.IMAGE_SAVE_DIR = Path("temp_images")` holds the figure crops
+(`q*_p*.png`, `docximg_*`). **`pdf_generator._load_image_bytes()` reads those paths
+back at VARIANT-BUILD time**, every time a variant PDF is generated — which can be
+long after upload. The name is a lie.
+
+* **Deleting it blanks diagrams in regenerated variants.**
+* `prune_debug_crops()` deliberately reaps **only `debug_*`** files — never the
+  `q*` / `docximg_` crops. Don't "tidy" that up.
+* **In any deployment this MUST be a mounted volume**, not container-local storage,
+  or every redeploy silently loses figures.
+
+## ⛔ DO-NOT-FIX TRAPS (in addition to principles 1–15 below)
+
+* **`VISION_PROMPT` is protected** (T-108 gate). The answer-sheet reader has its own
+  `ANSWER_SHEET_PROMPT` — the two must never merge. Prompt #9 below still holds.
+* **Celery / `app/tasks/file_tasks.py` / `services/ocr_pipeline.py` are DEAD CODE.**
+  Both fail on `ImportError: cannot import name 'merge_questions'`. Measurements show
+  a queue isn't needed at target scale. Reviving them is a trap (principle #11).
+* **`_parse_answer_input` in `upload.py` is dead** (defined, never called) and still
+  contains an A–E-era regex. Don't "fix" it into the live path.
+* **Don't raise `MAX_CONCURRENT_GRADING` without raising `THREAD_POOL_MAX_WORKERS`.**
+  Every in-flight Gemini call holds a thread for its whole duration; moving one alone
+  just relocates the bottleneck. Proven.
+* **Webhook mode**: not worth it (minor gain, real TLS/domain complexity). Polling did
+  not show up in any profile.
+
+## 📋 OPEN ITEMS — and why each is still open
+
+* **P4 file-hash dedup** (re-uploading the same test re-extracts at full cost).
+  *Skipped deliberately:* needs a schema migration (no `file_hash` column) **and** a
+  UX decision — does a re-upload reuse the old project, or create a new one sharing
+  extracted questions? Also **the benefit is unquantified** — nothing currently
+  records how often teachers re-upload the same file.
+* **`usage_log` per-call DB engine** (~200k connect/disconnect cycles per month at
+  target volume). *Skipped:* the clean fix is a shared **sync** engine, but only the
+  async `asyncpg` driver is installed — `psycopg2` is absent. So it needs either a new
+  dependency or a queue drained on the main loop. Wasteful, **not incorrect**.
+* **DOCX figure handling is UNTESTED on this host.** LibreOffice is **not installed on
+  Windows** (`soffice` not on PATH), so the shape-gated DOCX→PDF conversion (Defect 3)
+  cannot run here. It is in the Docker image — **verify it in Docker, not locally**,
+  before trusting DOCX tests with shapes.
+* **Extraction cost** stays ~42% above the theoretical floor, correctly — see
+  rejected experiment #1.
+
+## 🧭 HOW TO WORK ON THIS PROJECT (the discipline that kept it clean)
+
+This is a **grading** bot. A silent mis-grade is the one failure that matters, and it
+is invisible without proof. The rules below are why there are zero shipped silent
+regressions — they cost time and are worth it.
+
+1. **Investigate READ-ONLY first, propose, and STOP for approval before writing code.**
+2. **PROVE, don't assert.** Run the real code on real data and paste the real output.
+   Never predict what a test or parser will do. "Should work" is not evidence.
+3. **VERIFY EVERY PREMISE before acting on it** — including premises in the task you
+   were just handed. Line numbers and values go stale across versions. During this
+   work, several confidently-stated premises turned out not to exist in the codebase
+   (a hardcoded `{"A","B","C","D"}` set, a blur/quality gate, a `_recent_images` spam
+   guard, a post-read discard bug). Each was checked and found absent. **Check first;
+   if a premise is false, say so and stop** rather than building on it.
+4. **Refuse to record claims you cannot reproduce.** Don't write a commit message,
+   tag, or doc asserting a result you didn't measure — even if asked to. A false line
+   in a grading bot's history is worse than a slow session. If numbers you're given
+   don't match your run, say so plainly and show your own output.
+5. **Measure before optimising.** Every win this session came from measurement
+   (thinking tokens, the semaphore ceiling, the timeout) and every rejection came from
+   measuring a plausible-sounding idea and finding it harmful.
+6. **Separate commits, `--no-ff` merges, annotated tags, full suite green between
+   each.** Report the REAL test count, never a predicted one.
+7. **Nondeterminism is real.** The grading read differs run-to-run on identical bytes
+   (~6/17 sheets). Any accuracy claim needs a **self-noise baseline** (A-vs-A) before
+   an A-vs-B diff means anything. "Identical output" is not an achievable bar here.
+
+---
 
 ## CONTEXT
 
@@ -223,7 +374,9 @@ Read the sheet ONCE and cache it (one Gemini call per sheet). A variant is used 
 ### 13. (v0.13) Short-answer matching is PYTHON, never Gemini — and never strips meaning
 Correctness is decided in `checker.is_correct` (casefold + whitespace-collapse ONLY). **Never** ask Gemini to judge if an answer is right (unreliable — see Design B), and **never** strip punctuation in `normalize`: `-5` must stay ≠ `5` and `x=5` must stay intact (this is principle #1 applied to short answers). A wrong written answer is caught by the score and confirmed by the teacher (Design B), not by fuzzy matching. Multiple accepted answers are the escape hatch — the teacher lists variants (`PHONE / TELEPHONE`), the code never guesses spelling.
 
-### 14. (v0.13) Cyrillic folding is for LETTERS ONLY, never words
+### 14. (v0.13, AMENDED v0.37) Cyrillic folding is for LETTERS ONLY, never words
+> **⚠️ AMENDED v0.37 — read this first.** The letters-only rule still holds, but the fold NO LONGER happens at storage. The **real label** the teacher typed / the student marked is stored (Cyrillic `В` stays `В` and is reported as `В`), and the cross-script fold is applied at COMPARISON time inside `checker.is_correct`, on both sides. Folding at storage hid a collision: a transliterated `Б` became Latin `B`, which is the canonical form of `В`, silently CREDITING a wrong answer. Do not move the fold back into the parser or the reader.
+
 `А В С Д Е → A B C D E` folding applies only to a single-letter answer (a multiple-choice option). A WORD is never transliterated: Cyrillic `ТОШКЕНТ` stays Cyrillic. Folding a word would mangle a real answer into mixed script. Same rule as the v0.12 name transcription.
 
 ### 15. (v0.16) Answer-confirm triggers on WRONG-WRITTEN (Design B); NAME flagging stays aggressive
