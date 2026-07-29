@@ -544,3 +544,40 @@ quantisation smooths away. A ~2x smaller upload on a ~7s call is not worth any
 accuracy risk on a grading path. If revisited, try lossless WebP (smaller than
 PNG, no quantisation) and re-run the same accuracy proof — quality knobs above
 q92 were not explored because the upside is only latency.
+
+## Extraction thinking-off — IMPLEMENTED, PROVEN HARMFUL, REVERTED (v0.38+)
+
+Grading runs with thinking disabled (v0.37: cheaper, faster, MORE accurate).
+The same change was applied to EXTRACTION and measured field-by-field on four
+real stored tests (Cyrillic DOCX, math PDF, gapped-label PDF, figures PDF),
+2 runs per config, comparing question_text / option letters / option text /
+has_image / is_open_ended. It FAILED and must not be shipped.
+
+**1. Disqualifying: an ANSWER-KEY page becomes 40 phantom questions.**
+The math test's page 4 is a "JAVOBLAR JADVALI" grid (question number -> correct
+letter, marked "for the teacher"). With thinking ON the model recognises it is
+not a question page and extracts NOTHING from it (40 questions total, correct).
+With thinking OFF it pattern-matches the number/letter grid into 40 question
+stubs with EMPTY text and NO options — 80 questions for a 40-question test.
+Reasoning is exactly what is needed to tell "answer key" from "questions", and
+that is what thinking buys.
+
+**2. Math content diverged.** On the figures test, q5 came back as
+`(m^2 - 6n + 3m + 2mn)` with thinking ON and `(m^2 + 6n + 3m + 2mn)` with it
+OFF — a sign flip inside a formula. Silent and unverifiable without the source.
+
+**3. Text quality dropped.** q15 "jumlalardan" (ON) -> "jumladalardan" (OFF).
+
+**4. The non-negotiable failed on 2 of 4 files.** Option letters differed on the
+Cyrillic q8 (ON mixed scripts `A,Б,В,Г`; OFF all-Cyrillic `А,Б,В,Г` — OFF is
+arguably BETTER here) and on the gapped test's q18 (`a,b,d,e` -> `a,b,d,E`,
+a case inconsistency).
+
+**Honest mixed signal:** thinking-off was FASTER (8s vs 14s; 13.5s vs 29s) and
+more *stable* run-to-run on two files (the gapped test dropped 2 questions in
+one thinking-ON run but never with it off). None of that outweighs inventing
+40 questions from an answer key.
+
+**Conclusion:** grading is a transcription task and does not need reasoning;
+extraction is a *structuring* task and does. Keep thinking ON for extraction.
+Do not retry without a way to make the model reject non-question pages first.
