@@ -104,6 +104,16 @@ async def test_invalid_letter_dropped(patched):
     assert res["unclear"] == []
 
 
+async def test_ef_read_as_marked_options(patched):
+    # E and F are real option letters (tests use up to F, often gapped a,b,d,e).
+    # Both must land in answers as MARKED OPTIONS — not dropped, not routed to
+    # written text. Pins the photo-path fix for the E/F "Aniqlanmadi" bug.
+    patched('{"answers": {"1":"E","12":"F","3":"D"}}')
+    res = await SR.read_answer_sheet(b"x", 12)
+    assert res["answers"] == {1: "E", 12: "F", 3: "D"}
+    assert res["texts"] == {}
+
+
 async def test_variant_from_text(patched):
     patched('{"variant": "Variant 5", "answers": {"1":"A"}}')
     res = await SR.read_answer_sheet(b"x", 1)

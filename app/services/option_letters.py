@@ -30,7 +30,12 @@ _CYR_DE = "Д"  # Д
 _CYR_IE = "Е"  # Е
 _CYR_ES = "С"  # С (Es — visual twin of Latin C)
 
-_LATIN = set("ABCDE")
+# A–F: real tests use up to F (six options), often gapped (a, b, d, e). Kept as
+# a fixed generous set because the photo classifier has no per-question option
+# context; a letter that isn't a real option for a question just grades wrong via
+# is_correct, same as any wrong answer. (F has no Cyrillic look-alike, so it only
+# joins the Latin set.)
+_LATIN = set("ABCDEF")
 _CYRILLIC = {_CYR_A, _CYR_BE, _CYR_VE, _CYR_GHE, _CYR_DE, _CYR_IE, _CYR_ES}
 _OPTION_LETTERS = _LATIN | _CYRILLIC
 
@@ -43,7 +48,7 @@ _CANON = {
 
 # Regex character class covering every accepted option letter (for callers that
 # need to capture candidate letters before validating).
-OPTION_LETTER_CLASS = "A-E" + "".join(sorted(_CYRILLIC))
+OPTION_LETTER_CLASS = "A-F" + "".join(sorted(_CYRILLIC))
 
 
 def is_option_letter(ch: str | None) -> bool:
