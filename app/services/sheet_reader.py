@@ -103,14 +103,22 @@ def _get_model() -> genai.GenerativeModel:
     return _model
 
 
-def _call_sync(prompt: str, png_bytes: bytes) -> str:
-    """Blocking Gemini call. Runs on a worker thread via asyncio.to_thread."""
+def _call_sync(prompt: str, png_bytes: bytes) -> tuple[str, int]:
+    """Blocking Gemini call. Returns (text, finish_reason); runs on a worker
+    thread via asyncio.to_thread.
+
+    max_output_tokens is generous (8192, not 2048): gemini-2.5-flash spends
+    hidden 'thinking' tokens out of the SAME budget, so a tight cap truncated the
+    JSON mid-object (finish_reason=2 MAX_TOKENS) on longer sheets — that parsed to
+    an empty read and showed a FALSE 'unclear photo' retake for a perfectly
+    readable sheet. finish_reason is surfaced so the caller can retry a truncation.
+    """
     model = _get_model()
     response = model.generate_content(
         [prompt, {"mime_type": "image/png", "data": png_bytes}],
         generation_config=genai.GenerationConfig(
             temperature=0.0,
-            max_output_tokens=2048,
+            max_output_tokens=8192,
             response_mime_type="application/json",
         ),
     )
@@ -120,7 +128,14 @@ def _call_sync(prompt: str, png_bytes: bytes) -> str:
         log_gemini_usage(response, kind="grade", model=settings.GEMINI_MODEL)
     except Exception:
         pass
-    return response.text
+    finish_reason = 0
+    if response.candidates:
+        finish_reason = int(response.candidates[0].finish_reason)
+    try:
+        text = response.text
+    except Exception:
+        text = ""  # blocked/empty candidate → empty text; caller retries
+    return text, finish_reason
 
 
 def _try_json(text: str) -> Any:
@@ -237,6 +252,47 @@ def _prepare_png(image_bytes: bytes) -> bytes | None:
     return buf.getvalue()
 
 
+def _build_read(raw: str) -> dict[str, Any]:
+    """Parse a raw Gemini grading response into the read dict.
+
+    A marked option canonicalises to a letter; "?" is unclear; anything else is a
+    written short answer. An empty/truncated response yields empty
+    answers/texts/unclear — the caller treats that as retryable, then unreadable.
+    """
+    data = _parse_response(raw)
+    answers: dict[int, str] = {}
+    texts: dict[int, str] = {}
+    unclear: list[int] = []
+    for k, v in (data.get("answers") or {}).items():
+        try:
+            q = int(k)
+        except (TypeError, ValueError):
+            continue
+        letter = _norm_letter(v)
+        if letter == "?":
+            unclear.append(q)
+        elif letter is not None:
+            answers[q] = letter          # a marked option
+        else:
+            txt = _clean_text(v)
+            if txt:
+                texts[q] = txt           # a written short answer
+
+    # NAME confidence flag. A missing name is not "unclear" — only a
+    # present-but-doubtful name is worth asking the teacher to confirm.
+    name = _clean_name(data.get("student_name"))
+    name_unclear = _as_bool(data.get("name_unsure")) and name is not None
+
+    return {
+        "variant": _coerce_variant(data.get("variant")),
+        "student_name": name,
+        "name_unclear": name_unclear,
+        "answers": answers,
+        "texts": texts,
+        "unclear": sorted(unclear),
+    }
+
+
 async def read_answer_sheet(
     image_bytes: bytes, expected_count: int
 ) -> dict[str, Any]:
@@ -283,58 +339,31 @@ async def read_answer_sheet(
         return empty
 
     prompt = ANSWER_SHEET_PROMPT.format(total=expected_count)
-    raw = ""
-    # Grading-only budget: tight per-attempt timeout, few retries, flat backoff
-    # (GEMINI_GRADING_*). Extraction/generation keep the generous GEMINI_MAX_RETRIES
-    # / 90s — a teacher waiting on a graded photo must not sit through 4.5 min.
+    # Grading-only budget: tight per-attempt timeout, few attempts, flat backoff
+    # (GEMINI_GRADING_*). A read is retryable not only on timeout/error but also
+    # when it comes back EMPTY or TRUNCATED (finish_reason=2): the photo is fine,
+    # the model just cut the JSON short on this draw, so one more call recovers it.
+    # Only after EVERY attempt is empty does the caller show the retake message.
     for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
         try:
             # Hold a concurrency slot only for the actual call — released across
             # the backoff sleep so a waiting photo can proceed meanwhile.
             async with _grading_sem:
-                raw = await asyncio.wait_for(
+                raw, finish_reason = await asyncio.wait_for(
                     asyncio.to_thread(_call_sync, prompt, png_bytes),
                     timeout=settings.GEMINI_GRADING_TIMEOUT,
                 )
-            break
+            result = _build_read(raw)
+            if result["answers"] or result["texts"] or result["unclear"]:
+                return result  # got content → done (partial reads are kept, not lost)
+            logger.warning(
+                "sheet_read_empty", attempt=attempt + 1, finish_reason=finish_reason
+            )
         except asyncio.TimeoutError:
             logger.warning("sheet_read_timeout", attempt=attempt + 1)
         except Exception as e:
             logger.warning("sheet_read_error", attempt=attempt + 1, error=str(e))
         if attempt < settings.GEMINI_GRADING_MAX_RETRIES - 1:
             await asyncio.sleep(1)  # flat 1s backoff — keep the worst case small
-    else:
-        return empty
 
-    data = _parse_response(raw)
-    answers: dict[int, str] = {}
-    texts: dict[int, str] = {}
-    unclear: list[int] = []
-    for k, v in (data.get("answers") or {}).items():
-        try:
-            q = int(k)
-        except (TypeError, ValueError):
-            continue
-        letter = _norm_letter(v)
-        if letter == "?":
-            unclear.append(q)
-        elif letter is not None:
-            answers[q] = letter          # a marked option
-        else:
-            txt = _clean_text(v)
-            if txt:
-                texts[q] = txt           # a written short answer
-
-    # NAME confidence flag. A missing name is not "unclear" — only a
-    # present-but-doubtful name is worth asking the teacher to confirm.
-    name = _clean_name(data.get("student_name"))
-    name_unclear = _as_bool(data.get("name_unsure")) and name is not None
-
-    return {
-        "variant": _coerce_variant(data.get("variant")),
-        "student_name": name,
-        "name_unclear": name_unclear,
-        "answers": answers,
-        "texts": texts,
-        "unclear": sorted(unclear),
-    }
+    return empty  # every attempt came back empty → genuinely unreadable

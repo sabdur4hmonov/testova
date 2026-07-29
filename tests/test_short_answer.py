@@ -314,10 +314,10 @@ def patched(monkeypatch):
 
     calls = []
 
-    def set_response(text: str):
+    def set_response(text: str, finish_reason: int = 1):
         def fake(prompt, png):
             calls.append(prompt)
-            return text
+            return text, finish_reason   # _call_sync now returns (text, finish_reason)
         monkeypatch.setattr(SR, "_call_sync", fake)
 
     set_response.calls = calls
