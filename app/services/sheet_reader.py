@@ -32,15 +32,19 @@ genai.configure(api_key=settings.GEMINI_API_KEY)
 
 # NEW prompt — do NOT reuse VISION_PROMPT. Reads MARKED answers, never guesses.
 ANSWER_SHEET_PROMPT = """You are reading a photo of a student's exam ANSWER SHEET.
-The test has {total} questions. For MOST questions the student marks ONE option:
-A, B, C or D. Some questions have NO options — for those the student WRITES a
-short answer by hand (a word, a number, or a very short phrase), usually in
-BLOCK CAPITAL LETTERS.
+The test has {total} questions. For MOST questions the student marks ONE option,
+labelled with a LETTER. Many tests use A, B, C, D, but a test may offer MORE
+options (E, F) and may SKIP letters (e.g. a, b, d, e). The label may be Latin or
+Cyrillic. Some questions have NO options — for those the student WRITES a short
+answer by hand (a word, a number, or a very short phrase), usually in BLOCK
+CAPITAL LETTERS.
 
 Rules:
 - Report ONLY what the student actually marked or wrote — read the sheet, do NOT
   solve the test and do NOT guess.
-- For a MARKED option, output just the letter: "A", "B", "C" or "D".
+- For a MARKED option, output JUST the letter the student actually marked —
+  whichever it is (A, B, C, D, E or F). Do NOT force it into A-D: if the student
+  clearly marked E or F, output "E" or "F". Preserve the script as written.
 - For a WRITTEN answer, output the text EXACTLY as written, letter by letter.
   Do NOT correct spelling, do NOT translate, do NOT transliterate between
   scripts (Latin stays Latin, Cyrillic stays Cyrillic), do NOT expand
