@@ -496,3 +496,32 @@ sheet can flip between a full read and an EMPTY read on identical pixels.
    re-prompt, or splitting the mixed-sheet read into marked-options and
    written-answers passes. Touches VISION_PROMPT / model call → gated work,
    separate from this speed stack.
+
+## Two-read cross-check — BUILT, MEASURED, REJECTED (v0.37)
+
+**Idea:** read every answer sheet TWICE in parallel and flag any question where
+the two reads disagree, so a CONFIDENT misread (which no single read can
+self-report) gets asked instead of silently graded.
+
+**Why it was rejected, measured on the real SARDOR sheet:**
+
+1. **Weak catch rate.** It caught the target failure (a Q3/Q4 row swap that
+   silently credited a wrong answer) in only **1 of 3 runs**.
+2. **Correlated reads.** Two calls on identical pixels are NOT independent — they
+   tend to be wrong the SAME way, so agreement is not evidence of correctness.
+   The independence assumption the design rests on does not hold.
+3. **An empty read poisoned the whole sheet.** When one of the two reads came
+   back empty (a known truncation/timeout mode), EVERY question "disagreed" and
+   the entire sheet was flagged — worse than not having the check.
+4. **Doubled cost and tail latency.** 2x tokens per grade, and two independent
+   retry loops meant a slow call could stack to ~47s.
+
+**What replaced it:** the reader's own `"?"` ambiguity flag (routes to the
+"Aniqlanmadi — qo'lda tekshiring" list) plus the per-question option-label hint,
+which removed the impossible-letter class outright.
+
+**If it is ever revisited:** with thinking disabled (v0.37) a second read is
+cheap — projected ~$427/mo at 2000 teachers vs ~$907/mo for today's single
+thinking-enabled read. Affordable, but it needs a genuinely independent signal
+(different prompt phrasing, different image preprocessing, or a different model)
+for agreement to mean anything. Repeating the same call is not that.
