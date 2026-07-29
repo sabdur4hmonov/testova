@@ -54,9 +54,20 @@ class Settings(BaseSettings):
     # "Rasm aniq chiqmagan" on a perfectly readable photo. Abandoning a slow but
     # valid call is worse than waiting: the teacher gets a bogus retake request.
     GEMINI_GRADING_TIMEOUT: int = 25
-    # Cap simultaneous grading Gemini calls so a burst of photos can't blow past
-    # Gemini's rate limits. Mirrors ai_analyzer's MAX_CONCURRENT (extraction).
-    MAX_CONCURRENT_GRADING: int = 6
+    # Cap simultaneous grading Gemini calls. SIZED AGAINST THE REAL QUOTA
+    # (Tier 1: 1000 RPM / 1M TPM / 10k RPD) and the measured p50 of 7.4s per
+    # call: 16 concurrent = ~2.2 grades/s = ~130 RPM, i.e. 13% of the RPM quota,
+    # leaving deliberate headroom rather than running at the limit. It absorbs a
+    # class-sized burst (30 sheets in ~14s) instead of queueing them.
+    # NOTE: RPD 10,000/day is the binding ceiling, not RPM — that is ~10,000
+    # gradings/day at one call per sheet. Watch the daily count, not the rate.
+    MAX_CONCURRENT_GRADING: int = 16
+    # asyncio.to_thread runs on the loop's DEFAULT executor, whose default size
+    # is min(32, cpu+4) = 12 here. Every in-flight Gemini call holds a thread for
+    # its whole duration, so raising the semaphore alone would just move the
+    # bottleneck onto the thread pool. Sized to cover grading (16) + extraction
+    # (ai_analyzer MAX_CONCURRENT=4) + preprocess with room to spare.
+    THREAD_POOL_MAX_WORKERS: int = 32
     # Cost tracking (read-only). Prices are USD per 1M tokens; so'm via UZS rate.
     GEMINI_PRICE_IN_PER_M: float = 0.30    # gemini-2.5-flash input list price
     GEMINI_PRICE_OUT_PER_M: float = 2.50   # gemini-2.5-flash output list price
