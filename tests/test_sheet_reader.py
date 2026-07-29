@@ -22,10 +22,10 @@ def patched(monkeypatch):
 
     calls = []
 
-    def set_response(text: str):
+    def set_response(text: str, finish_reason: int = 1):
         def fake(prompt, png):
             calls.append(prompt)
-            return text
+            return text, finish_reason   # _call_sync now returns (text, finish_reason)
         monkeypatch.setattr(SR, "_call_sync", fake)
 
     set_response.calls = calls
@@ -158,3 +158,65 @@ async def test_name_flag_rides_one_gemini_call(patched):
     patched('{"student_name": "X", "name_unsure": true, "answers": {"22": "PHONE"}}')
     await SR.read_answer_sheet(b"x", 22)
     assert len(patched.calls) == 1   # name flag + reads from the SAME call
+
+
+# ── Empty/truncation retry (the false "unclear photo" fix) ───────────────────
+
+def _stub_image(monkeypatch):
+    img = Image.new("RGB", (4, 4), "white")
+    monkeypatch.setattr(SR, "image_to_pages", lambda b: [_Page(img)])
+    monkeypatch.setattr(SR, "preprocess_image", lambda i: img)
+
+    async def _no_sleep(_):
+        return None
+    monkeypatch.setattr(SR.asyncio, "sleep", _no_sleep)  # keep the test instant
+
+
+async def test_empty_read_retries_then_succeeds(monkeypatch):
+    # A truncated/empty first draw (finish_reason=2) is RETRIED; a later full read
+    # is used — a good photo is never falsely rejected on one unlucky draw.
+    _stub_image(monkeypatch)
+    seq = [("", 2), ("", 2), ('{"answers": {"1":"A","2":"B"}}', 1)]
+    calls = {"n": 0}
+
+    def fake(prompt, png):
+        i = calls["n"]; calls["n"] += 1
+        return seq[i]
+    monkeypatch.setattr(SR, "_call_sync", fake)
+
+    res = await SR.read_answer_sheet(b"x", 2)
+    assert res["answers"] == {1: "A", 2: "B"}
+    assert calls["n"] == 3   # empty, empty, then success
+
+
+async def test_all_empty_reads_return_empty(monkeypatch):
+    # If EVERY attempt is empty, the read is empty and the caller shows the retake
+    # message — the genuinely-unreadable case still degrades gracefully.
+    _stub_image(monkeypatch)
+    calls = {"n": 0}
+
+    def fake(prompt, png):
+        calls["n"] += 1
+        return "", 2   # always truncated/empty
+    monkeypatch.setattr(SR, "_call_sync", fake)
+
+    res = await SR.read_answer_sheet(b"x", 25)
+    assert res["answers"] == {} and res["texts"] == {} and res["unclear"] == []
+    assert calls["n"] == 3   # 1 initial + up to 2 retries (GEMINI_GRADING_MAX_RETRIES)
+
+
+async def test_full_25_answer_read_not_retried(monkeypatch):
+    # A clean full read on the first attempt is used immediately — a 25-answer
+    # sheet is not truncated (8192 cap) and costs exactly one Gemini call.
+    _stub_image(monkeypatch)
+    full = '{"answers": {' + ",".join(f'"{i}":"A"' for i in range(1, 26)) + "}}"
+    calls = {"n": 0}
+
+    def fake(prompt, png):
+        calls["n"] += 1
+        return full, 1
+    monkeypatch.setattr(SR, "_call_sync", fake)
+
+    res = await SR.read_answer_sheet(b"x", 25)
+    assert len(res["answers"]) == 25
+    assert calls["n"] == 1
