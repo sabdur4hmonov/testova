@@ -68,7 +68,7 @@ class FakeUser:
 
 
 async def test_read_is_cached_into_fsm(monkeypatch):
-    async def fake_read(content, total):
+    async def fake_read(content, total, option_labels=None):
         return {
             "variant": None, "student_name": None, "name_unclear": False,
             "answers": {}, "texts": {22: "PHONE"}, "unclear": [],

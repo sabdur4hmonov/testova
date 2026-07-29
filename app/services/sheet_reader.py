@@ -19,32 +19,40 @@ import re
 import time
 from typing import Any
 
-import google.generativeai as genai
-
 from app.config import settings
 from app.services.file_processor import image_to_pages, preprocess_image
-from app.services.option_letters import canonical_letter, is_option_letter
+from app.services.checker import is_correct, normalize
+from app.services.option_letters import is_option_letter
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-genai.configure(api_key=settings.GEMINI_API_KEY)
+# NOTE: this module deliberately does NOT use google-generativeai. The grading
+# call goes over REST so thinking can be disabled (see _call_sync). Extraction
+# (ai_analyzer) still uses the SDK and configures it independently.
 
 # NEW prompt — do NOT reuse VISION_PROMPT. Reads MARKED answers, never guesses.
 ANSWER_SHEET_PROMPT = """You are reading a photo of a student's exam ANSWER SHEET.
-The test has {total} questions. For MOST questions the student marks ONE option,
-labelled with a LETTER. Many tests use A, B, C, D, but a test may offer MORE
-options (E, F) and may SKIP letters (e.g. a, b, d, e). The label may be Latin or
-Cyrillic. Some questions have NO options — for those the student WRITES a short
-answer by hand (a word, a number, or a very short phrase), usually in BLOCK
-CAPITAL LETTERS.
+{labels}The test has {total} questions. For MOST questions the student marks ONE option,
+labelled with a LETTER. The label may be LATIN (A, B, C, D, E, F) or CYRILLIC
+(А, Б, В, Г, Д, Е). A test may offer more than four options and may SKIP letters
+(e.g. a, b, d, e). Some questions have NO options — for those the student WRITES
+a short answer by hand (a word, a number, or a very short phrase), usually in
+BLOCK CAPITAL LETTERS.
 
 Rules:
 - Report ONLY what the student actually marked or wrote — read the sheet, do NOT
   solve the test and do NOT guess.
-- For a MARKED option, output JUST the letter the student actually marked —
-  whichever it is (A, B, C, D, E or F). Do NOT force it into A-D: if the student
-  clearly marked E or F, output "E" or "F". Preserve the script as written.
+- For a MARKED option, output the EXACT character the student wrote, copied
+  letter-for-letter from the sheet: one of A, B, C, D, E, F or А, Б, В, Г, Д, Е.
+- NEVER TRANSLITERATE OR CONVERT BETWEEN SCRIPTS. This is the most important
+  rule for Cyrillic sheets. If the student wrote Cyrillic "Б", output "Б" — NOT
+  "B". If the student wrote Cyrillic "В", output "В" — NOT "B" and NOT "C". If
+  the student wrote Cyrillic "Г", output "Г" — NOT "G" and NOT "D". Do not
+  convert a letter to its sound-alike, to its look-alike, or to the letter at
+  the same POSITION in the other alphabet. Copy the character exactly as drawn.
+- Do NOT force a mark into A-D: if the student clearly marked E or F, output
+  "E" or "F".
 - For a WRITTEN answer, output the text EXACTLY as written, letter by letter.
   Do NOT correct spelling, do NOT translate, do NOT transliterate between
   scripts (Latin stays Latin, Cyrillic stays Cyrillic), do NOT expand
@@ -53,6 +61,16 @@ Rules:
 - If a mark is ambiguous, erased, crossed-out, or the student marked TWO or more
   options for the same question, output "?" for that question. NEVER guess a
   single letter in that case.
+- HANDWRITING AMBIGUITY — output "?" instead of guessing. If a mark could
+  plausibly be more than ONE letter in this student's handwriting, output "?".
+  Common look-alike pairs: Cyrillic Г vs А vs С; Latin E vs F; D vs O; B vs 8;
+  Cyrillic Б vs В. Ask yourself "could a careful human read this as a different
+  letter?" — if yes, output "?".
+  WHY: a "?" is sent to the teacher to check by hand, which is the CORRECT and
+  harmless outcome. A GUESSED letter that turns out wrong is silently marked
+  wrong and the student unfairly loses a point. So when in real doubt, "?" is
+  always the better answer than a guess. Do NOT use "?" for marks you can read
+  confidently — only for genuinely ambiguous ones.
 - If a question is left completely blank (nothing marked and nothing written),
   output null.
 - Also read the VARIANT NUMBER if it is written anywhere on the sheet
@@ -85,12 +103,16 @@ Rules:
   doubt, flag it. Only set "name_unsure" to false when every letter is
   unmistakable. If the name is null, "name_unsure" must be false.
 
-Return ONLY valid JSON, no markdown, no explanation. Question 22 below is a
-written answer; the rest are marked options:
-{{"variant": 3, "student_name": "Ali Valiyev", "name_unsure": false, "answers": {{"1": "A", "2": "?", "3": null, "4": "C", "22": "SMARTPHONE"}}}}"""
+Return ONLY valid JSON, no markdown, no explanation.
 
+Example for a LATIN sheet (question 22 is a written answer, the rest are marked
+options):
+{{"variant": 3, "student_name": "Ali Valiyev", "name_unsure": false, "answers": {{"1": "A", "2": "?", "3": null, "4": "C", "22": "SMARTPHONE"}}}}
 
-_model: genai.GenerativeModel | None = None
+Example for a CYRILLIC sheet — note the letters are copied EXACTLY as written,
+never converted to Latin:
+{{"variant": 29, "student_name": "САРДОР", "name_unsure": false, "answers": {{"1": "А", "2": "Б", "3": "Г", "4": "В", "5": "Д"}}}}"""
+
 
 # Bound simultaneous grading Gemini calls (Fix 4). Module-level so it is shared
 # across every concurrent read_answer_sheet — a burst of photos can't overwhelm
@@ -100,45 +122,104 @@ _model: genai.GenerativeModel | None = None
 _grading_sem = asyncio.Semaphore(settings.MAX_CONCURRENT_GRADING)
 
 
-def _get_model() -> genai.GenerativeModel:
-    global _model
-    if _model is None:
-        _model = genai.GenerativeModel(settings.GEMINI_MODEL)
-    return _model
+class _RestUsage:
+    """usage_metadata shim so log_gemini_usage reads the REST counts unchanged.
+
+    Bonus over the SDK path: the REST response DOES return thoughtsTokenCount,
+    which google-generativeai 0.8.3 omits — so grading cost is now logged
+    accurately instead of silently undercounting the thinking tokens.
+    """
+    __slots__ = ("prompt_token_count", "candidates_token_count",
+                 "thoughts_token_count", "total_token_count")
+
+    def __init__(self, um: dict) -> None:
+        def g(name: str) -> int:
+            try:
+                return int(um.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        self.prompt_token_count = g("promptTokenCount")
+        self.candidates_token_count = g("candidatesTokenCount")
+        self.thoughts_token_count = g("thoughtsTokenCount")
+        self.total_token_count = g("totalTokenCount")
+
+
+class _RestResponse:
+    """Minimal stand-in carrying only what the usage logger touches."""
+    def __init__(self, um: dict) -> None:
+        self.usage_metadata = _RestUsage(um)
+
+
+# finishReason arrives as a STRING over REST; map to the int contract the
+# caller already uses (2 == MAX_TOKENS/truncated, 1 == STOP).
+_FINISH_REASONS = {"STOP": 1, "MAX_TOKENS": 2, "SAFETY": 3, "RECITATION": 4}
+
+_REST_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{settings.GEMINI_MODEL}:generateContent"
+)
 
 
 def _call_sync(prompt: str, png_bytes: bytes) -> tuple[str, int]:
     """Blocking Gemini call. Returns (text, finish_reason); runs on a worker
     thread via asyncio.to_thread.
 
-    max_output_tokens is generous (8192, not 2048): gemini-2.5-flash spends
-    hidden 'thinking' tokens out of the SAME budget, so a tight cap truncated the
-    JSON mid-object (finish_reason=2 MAX_TOKENS) on longer sheets — that parsed to
-    an empty read and showed a FALSE 'unclear photo' retake for a perfectly
-    readable sheet. finish_reason is surfaced so the caller can retry a truncation.
+    Uses the REST endpoint DIRECTLY rather than google-generativeai, for ONE
+    reason: the installed SDK (0.8.3) cannot set thinkingConfig, and grading does
+    not need thinking. Measured on real sheets, thinkingBudget=0 is 3.3-4.6x
+    CHEAPER, up to 2.8x FASTER, and MORE accurate (Cyrillic 7/10 -> 9/10,
+    identical across runs) than the thinking default. It also structurally
+    removes the MAX_TOKENS truncation class, since no hidden thinking tokens can
+    eat the output budget. Extraction still uses the SDK and is untouched.
+
+    max_output_tokens stays generous (8192) as belt-and-braces; the retry loop
+    still handles an empty/truncated read.
     """
-    model = _get_model()
-    response = model.generate_content(
-        [prompt, {"mime_type": "image/png", "data": png_bytes}],
-        generation_config=genai.GenerationConfig(
-            temperature=0.0,
-            max_output_tokens=8192,
-            response_mime_type="application/json",
-        ),
+    import base64
+
+    import requests
+
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(png_bytes).decode("ascii"),
+                }},
+            ],
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
+            # THE POINT OF THE REST PATH: no thinking on the grading read.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    # Bound the socket too: asyncio.wait_for abandons the await but cannot kill
+    # the worker thread, so without this a hung request would leak a thread.
+    http = requests.post(
+        _REST_URL,
+        params={"key": settings.GEMINI_API_KEY},
+        json=body,
+        timeout=settings.GEMINI_GRADING_TIMEOUT,
     )
+    http.raise_for_status()
+    payload = http.json()
+    response = _RestResponse(payload.get("usageMetadata") or {})
     # Cost accounting only — kind="grade". Wrapped so it can NEVER crash grading.
     try:
         from app.services.usage_log import log_gemini_usage
         log_gemini_usage(response, kind="grade", model=settings.GEMINI_MODEL)
     except Exception:
         pass
-    finish_reason = 0
-    if response.candidates:
-        finish_reason = int(response.candidates[0].finish_reason)
-    try:
-        text = response.text
-    except Exception:
-        text = ""  # blocked/empty candidate → empty text; caller retries
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return "", 0  # blocked/empty response → caller retries, then asks for a retake
+    finish_reason = _FINISH_REASONS.get(str(candidates[0].get("finishReason", "")), 0)
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
     return text, finish_reason
 
 
@@ -184,7 +265,11 @@ def _norm_letter(value: Any) -> str | None:
         return "?"
     if not is_option_letter(s):
         return None  # a written word (or non-option char) is not a marked option
-    return canonical_letter(s)
+    # Store the REAL character the student marked (script preserved), so the
+    # report shows "Б" as "Б" and a Б-vs-В difference stays visible. Cross-script
+    # equality is applied at COMPARISON time by checker.is_correct, which folds
+    # both sides — matching is unchanged, only storage/display becomes honest.
+    return s.upper()
 
 
 def _clean_text(value: Any) -> str | None:
@@ -256,6 +341,70 @@ def _prepare_png(image_bytes: bytes) -> bytes | None:
     return buf.getvalue()
 
 
+def _empty_read() -> dict[str, Any]:
+    return {
+        "variant": None, "student_name": None, "name_unclear": False,
+        "answers": {}, "texts": {}, "unclear": [],
+    }
+
+
+def _has_content(r: dict[str, Any]) -> bool:
+    return bool(r["answers"] or r["texts"] or r["unclear"])
+
+
+async def _read_once(prompt: str, png_bytes: bytes) -> dict[str, Any]:
+    """ONE read of the sheet, with the grading retry budget.
+
+    Grading-only budget: tight per-attempt timeout, few attempts, flat backoff
+    (GEMINI_GRADING_*). A read is retryable not only on timeout/error but also
+    when it comes back EMPTY or TRUNCATED (finish_reason=2): the photo is fine,
+    the model just cut the JSON short on this draw, so one more call recovers it.
+    """
+    for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
+        try:
+            # Hold a concurrency slot only for the actual call — released across
+            # the backoff sleep so a waiting photo can proceed meanwhile.
+            async with _grading_sem:
+                raw, finish_reason = await asyncio.wait_for(
+                    asyncio.to_thread(_call_sync, prompt, png_bytes),
+                    timeout=settings.GEMINI_GRADING_TIMEOUT,
+                )
+            result = _build_read(raw)
+            if _has_content(result):
+                return result  # got content → done (partial reads kept, not lost)
+            logger.warning(
+                "sheet_read_empty", attempt=attempt + 1, finish_reason=finish_reason
+            )
+        except asyncio.TimeoutError:
+            logger.warning("sheet_read_timeout", attempt=attempt + 1)
+        except Exception as e:
+            logger.warning("sheet_read_error", attempt=attempt + 1, error=str(e))
+        if attempt < settings.GEMINI_GRADING_MAX_RETRIES - 1:
+            await asyncio.sleep(1)  # flat 1s backoff — keep the worst case small
+    return _empty_read()  # every attempt empty → genuinely unreadable
+
+
+def _labels_block(option_labels: list[str] | None) -> str:
+    """Prompt preamble naming THIS test's real option labels, or "" if unknown.
+
+    Deliberately a strong HINT paired with the "?" escape, never a forced choice:
+    the manual flow derives labels from the typed key, which may not cover every
+    option the paper offers. Forcing a mark into an incomplete set could turn a
+    genuinely different mark into a listed one — and a wrong answer that lands on
+    the key letter would be silently CREDITED. "?" removes that risk.
+    """
+    if not option_labels:
+        return ""
+    listed = ", ".join(option_labels)
+    return (
+        f'THIS TEST\'S OPTION LABELS ARE: {listed}\n'
+        f'A marked option on this sheet is normally one of: {listed}. Output the '
+        f'one the student marked, EXACTLY as listed (same script). If you cannot '
+        f'tell WHICH of them a mark is, output "?" — never pick one at random, '
+        f'and never invent a letter that is not in this list.\n\n'
+    )
+
+
 def _build_read(raw: str) -> dict[str, Any]:
     """Parse a raw Gemini grading response into the read dict.
 
@@ -298,7 +447,9 @@ def _build_read(raw: str) -> dict[str, Any]:
 
 
 async def read_answer_sheet(
-    image_bytes: bytes, expected_count: int
+    image_bytes: bytes,
+    expected_count: int,
+    option_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Read a student's answer sheet.
@@ -308,25 +459,22 @@ async def read_answer_sheet(
         "variant": int | None,       # variant number if visible on the sheet
         "student_name": str | None,  # handwritten name, RAW (unnormalized)
         "name_unclear": bool,        # True = name read is doubtful — ask to confirm
-        "answers": {int: "A".."D"},  # confidently-read MARKED options
-        "texts": {int: str},         # WRITTEN short answers, RAW (unnormalized)
-        "unclear": [int],            # questions marked "?" (ambiguous/blank-mark)
+        "answers": {int: str},       # MARKED options BOTH reads agreed on
+        "texts": {int: str},         # WRITTEN short answers BOTH reads agreed on
+        "unclear": [int],            # questions BOTH reads marked "?"
       }
 
     `name_unclear` is the reader's self-reported uncertainty about the NAME (it
     drives the teacher name-confirm). `student_name`/`texts` still hold the
     best-guess transcription — the flag never withholds the value.
 
-    Marked options and written answers come from the SAME single vision call —
-    there is no second Gemini request.
+    ONE Gemini call per sheet. Marked options and written answers both come from
+    that single call.
 
     On any Gemini/parse failure returns an empty read (the caller treats an empty
     read as "unreadable — ask for a clearer photo"). NEVER raises.
     """
-    empty = {
-        "variant": None, "student_name": None, "name_unclear": False,
-        "answers": {}, "texts": {}, "unclear": [],
-    }
+    empty = _empty_read()
     try:
         # Decode + preprocess + PNG-encode is CPU-heavy; run it OFF the event
         # loop so one teacher's photo never freezes the bot for everyone else.
@@ -342,32 +490,13 @@ async def read_answer_sheet(
         logger.warning("sheet_preprocess_failed", error=str(e))
         return empty
 
-    prompt = ANSWER_SHEET_PROMPT.format(total=expected_count)
-    # Grading-only budget: tight per-attempt timeout, few attempts, flat backoff
-    # (GEMINI_GRADING_*). A read is retryable not only on timeout/error but also
-    # when it comes back EMPTY or TRUNCATED (finish_reason=2): the photo is fine,
-    # the model just cut the JSON short on this draw, so one more call recovers it.
-    # Only after EVERY attempt is empty does the caller show the retake message.
-    for attempt in range(settings.GEMINI_GRADING_MAX_RETRIES):
-        try:
-            # Hold a concurrency slot only for the actual call — released across
-            # the backoff sleep so a waiting photo can proceed meanwhile.
-            async with _grading_sem:
-                raw, finish_reason = await asyncio.wait_for(
-                    asyncio.to_thread(_call_sync, prompt, png_bytes),
-                    timeout=settings.GEMINI_GRADING_TIMEOUT,
-                )
-            result = _build_read(raw)
-            if result["answers"] or result["texts"] or result["unclear"]:
-                return result  # got content → done (partial reads are kept, not lost)
-            logger.warning(
-                "sheet_read_empty", attempt=attempt + 1, finish_reason=finish_reason
-            )
-        except asyncio.TimeoutError:
-            logger.warning("sheet_read_timeout", attempt=attempt + 1)
-        except Exception as e:
-            logger.warning("sheet_read_error", attempt=attempt + 1, error=str(e))
-        if attempt < settings.GEMINI_GRADING_MAX_RETRIES - 1:
-            await asyncio.sleep(1)  # flat 1s backoff — keep the worst case small
-
-    return empty  # every attempt came back empty → genuinely unreadable
+    prompt = ANSWER_SHEET_PROMPT.format(
+        total=expected_count, labels=_labels_block(option_labels)
+    )
+    # ONE read. A two-read cross-check was built and measured, then REJECTED —
+    # see docs/BACKLOG.md: it caught a real silent misread in only 1 of 3 runs,
+    # doubled token cost, and made an empty read poison the whole sheet (one
+    # failed read made every question "disagree"). Its independence assumption is
+    # also weak: two calls on identical pixels are correlated, so they tend to be
+    # wrong the SAME way. Uncertainty is surfaced by the reader's own "?" instead.
+    return await _read_once(prompt, png_bytes)
