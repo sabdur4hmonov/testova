@@ -43,9 +43,10 @@ class Settings(BaseSettings):
     GEMINI_MAX_RETRIES: int = 3
     # Grading-only budget (answer-sheet reads). SEPARATE from GEMINI_MAX_RETRIES,
     # which governs question extraction/generation and must stay generous. A
-    # teacher waiting on a graded photo needs a tight worst case, not 4.5 min:
-    # 2 attempts x 15s + a flat 1s backoff ≈ 31s worst case.
-    GEMINI_GRADING_MAX_RETRIES: int = 2
+    # teacher waiting on a graded photo needs a tight worst case, not 4.5 min.
+    # TOTAL attempts (1 initial + up to 2 retries) — retried on timeout/error AND
+    # on an empty/truncated read: 3 x 15s + 2 x 1s backoff ≈ 47s worst case.
+    GEMINI_GRADING_MAX_RETRIES: int = 3
     GEMINI_GRADING_TIMEOUT: int = 15  # seconds, per attempt
     # Cap simultaneous grading Gemini calls so a burst of photos can't blow past
     # Gemini's rate limits. Mirrors ai_analyzer's MAX_CONCURRENT (extraction).
