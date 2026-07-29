@@ -55,3 +55,8 @@ class ExamTimerStates(StatesGroup):
 
 class SettingsStates(StatesGroup):
     waiting_for_language = State()
+
+
+class BroadcastStates(StatesGroup):
+    """Admin broadcast: confirm before sending to everyone."""
+    confirming = State()  # gate shown; pending text held in FSM data

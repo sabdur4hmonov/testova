@@ -10,17 +10,19 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
-from app.bot.keyboards.inline import revoke_confirm_keyboard
+from app.bot.keyboards.inline import broadcast_confirm_keyboard, revoke_confirm_keyboard
+from app.bot.states.forms import BroadcastStates
 from app.config import settings
 from app.database import async_session_factory
 from app.models.gemini_usage import GeminiUsage
 from app.models.user import User
-from app.services import admin_stats, admin_users
+from app.services import admin_stats, admin_users, broadcast
 from app.services.usage_log import estimate_cost
 from app.utils.logging import get_logger
 
@@ -333,6 +335,85 @@ async def cmd_usage(message: Message, db_user: User) -> None:
     )
 
 
+# ── /broadcast, /announce, /broadcast_active (confirmation-gated) ──────────────
+
+@router.message(Command("broadcast", "announce"))
+async def cmd_broadcast(
+    message: Message, command: CommandObject, db_user: User, state: FSMContext
+) -> None:
+    await _start_broadcast(message, command, db_user, state, active_only=False)
+
+
+@router.message(Command("broadcast_active"))
+async def cmd_broadcast_active(
+    message: Message, command: CommandObject, db_user: User, state: FSMContext
+) -> None:
+    await _start_broadcast(message, command, db_user, state, active_only=True)
+
+
+async def _start_broadcast(
+    message: Message, command: CommandObject, db_user: User,
+    state: FSMContext, active_only: bool,
+) -> None:
+    """Show the confirmation gate. Nothing is sent here — the pending text is
+    stashed in FSM state and sent only on an explicit Ha."""
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    text = (command.args or "").strip()
+    if not text:
+        cmd = "/broadcast_active" if active_only else "/broadcast"
+        await message.answer(f"Foydalanish: {cmd} <xabar matni>")
+        return
+    async with async_session_factory() as session:
+        ids = await broadcast.recipients(session, active_only=active_only)
+    if not ids:
+        await message.answer("Yuboriladigan foydalanuvchi yo‘q.")
+        return
+    await state.set_state(BroadcastStates.confirming)
+    await state.update_data(bc_text=text, bc_scope="active" if active_only else "all")
+    scope_label = "faol foydalanuvchiga" if active_only else "foydalanuvchiga"
+    await message.answer(
+        f"Bu xabar {len(ids)} ta {scope_label} yuboriladi. Tasdiqlaysizmi?\n\n"
+        f"{broadcast.PREFIX}\n{text}",
+        reply_markup=broadcast_confirm_keyboard(),
+    )
+
+
+@router.callback_query(BroadcastStates.confirming, F.data == "adm:bc:no")
+async def cmd_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("❌ Bekor qilindi. Xabar yuborilmadi.")
+
+
+@router.callback_query(BroadcastStates.confirming, F.data == "adm:bc:ok")
+async def cmd_broadcast_send(
+    callback: CallbackQuery, state: FSMContext, db_user: User, bot: Bot
+) -> None:
+    await callback.answer()
+    if not _is_admin(db_user):
+        await state.clear()
+        await callback.message.edit_text(REFUSED)
+        return
+    data = await state.get_data()
+    text = data.get("bc_text")
+    scope = data.get("bc_scope", "all")
+    await state.clear()
+    if not text:
+        await callback.message.edit_text("Xabar topilmadi. Qaytadan /broadcast yuboring.")
+        return
+    await callback.message.edit_text("📤 Yuborilmoqda...")
+    async with async_session_factory() as session:
+        ids = await broadcast.recipients(session, active_only=(scope == "active"))
+    sent, failed = await broadcast.run_broadcast(bot, ids, text)
+    async with async_session_factory() as session:
+        await broadcast.log_broadcast(session, db_user.telegram_id, text, sent, failed, scope=scope)
+    await callback.message.edit_text(
+        f"✅ {sent} ta yuborildi, {failed} ta yetkazib bo‘lmadi (bloklagan)."
+    )
+
+
 # ── /help_admin ───────────────────────────────────────────────────────────────
 
 @router.message(Command("help_admin"))
@@ -352,6 +433,8 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"
         "<code>/users [sahifa]</code> — ro‘yxat (20 tadan)\n"
         "<code>/stats</code> — umumiy statistika\n"
-        "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)",
+        "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)\n"
+        "<code>/broadcast &lt;matn&gt;</code> — hammaga e’lon (tasdiq so‘raladi)\n"
+        "<code>/broadcast_active &lt;matn&gt;</code> — faqat faol foydalanuvchilarga",
         parse_mode="HTML",
     )

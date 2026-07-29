@@ -54,6 +54,17 @@ def revoke_confirm_keyboard(tg_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
+    """[✅ Ha] [❌ Yo'q] gate before sending a broadcast. The pending message text
+    is too large for callback data, so it is held in FSM state; these buttons
+    just carry the verdict."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Ha", callback_data="adm:bc:ok")
+    builder.button(text="❌ Yo'q", callback_data="adm:bc:no")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def delete_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """Confirm deleting the question(s) the teacher marked with a bare dash."""
     labels = {
