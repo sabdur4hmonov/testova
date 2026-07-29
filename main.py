@@ -59,6 +59,19 @@ async def main() -> None:
     global logger
     logger = get_logger("main")
 
+    # Widen the default thread pool BEFORE any work starts. asyncio.to_thread
+    # (the Gemini calls and image preprocessing) runs here, and the stdlib
+    # default of min(32, cpu+4) — 12 on this host — would cap concurrency below
+    # MAX_CONCURRENT_GRADING and silently queue calls behind threads.
+    import concurrent.futures
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=settings.THREAD_POOL_MAX_WORKERS,
+            thread_name_prefix="testova",
+        )
+    )
+    logger.info("thread_pool_sized", max_workers=settings.THREAD_POOL_MAX_WORKERS)
+
     bot = create_bot()
     dp = create_dispatcher()
 
