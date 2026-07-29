@@ -64,10 +64,12 @@ def test_cyrillic_word_is_NOT_transliterated():
     assert "A" not in key[4][0]  # no Latin letters smuggled in
 
 
-def test_cyrillic_single_letter_IS_folded():
+def test_cyrillic_single_letter_kept_raw_but_matches_latin():
     key, reason = parse_answer_key("1: А")  # Cyrillic А
     assert reason == ""
-    assert key == {1: ["A"]}  # Latin A
+    assert key == {1: ["А"]}  # REAL Cyrillic label stored, not folded
+    from app.services.checker import is_correct
+    assert is_correct("A", key[1])   # ...but still grades equal to Latin A
 
 
 def test_mixed_letters_and_words():

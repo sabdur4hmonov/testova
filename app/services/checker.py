@@ -17,6 +17,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.services.option_letters import canonical_letter
+
 # A PLAIN number: optional sign, digits, and ONE decimal separator (comma OR dot).
 # A slash ("2/3"), a second comma ("1,2,3"), letters or spaces make it NOT plain,
 # so fractions/ratios/lists/words stay literal text and match exactly.
@@ -79,19 +81,31 @@ def is_correct(student: Any, accepted: list[str]) -> bool:
     """True if the student's answer matches ANY accepted answer.
 
     Exact (casefold + whitespace) match first. If that fails and BOTH sides are
-    plain numbers, they match on Decimal value — so comma/dot decimals and
-    trailing zeros are equal ("2,3" == "2.3" == "2,30", "5" == "5.0"). Anything
-    that isn't a plain number (fractions "2/3", lists "1000 g, 400 g, 600 g",
-    words, "-5" vs "5") stays exact-match-only.
+    SINGLE letters, they match on their canonical form, so a Latin letter and its
+    Cyrillic look-alike grade equal (Cyrillic "В" == Latin "B"). The fold happens
+    HERE, at comparison time, so the key and the read can each STORE the real
+    label the teacher/student actually used — the report shows "В", not "B", and
+    a genuine Б-vs-В difference stays visible instead of being hidden by storage.
+    Applied to BOTH sides, so it can never make two DIFFERENT options equal:
+    Б folds to Б, В folds to B — they stay distinct.
+
+    If that fails and BOTH sides are plain numbers, they match on Decimal value —
+    so comma/dot decimals and trailing zeros are equal ("2,3" == "2.3" == "2,30",
+    "5" == "5.0"). Anything that isn't a plain number (fractions "2/3", lists
+    "1000 g, 400 g, 600 g", words, "-5" vs "5") stays exact-match-only.
     """
     s = normalize(student)
     if not s:
         return False
     s_num = _as_number(s)
+    s_letter = canonical_letter(s).casefold() if len(s) == 1 else None
     for a in accepted:
         a_norm = normalize(a)
         if s == a_norm:
             return True
+        if s_letter is not None and len(a_norm) == 1:
+            if s_letter == canonical_letter(a_norm).casefold():
+                return True
         if s_num is not None:
             a_num = _as_number(a_norm)
             if a_num is not None and s_num == a_num:

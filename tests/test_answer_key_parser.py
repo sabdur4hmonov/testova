@@ -1,10 +1,13 @@
-"""parse_answer_key: labelled + bare formats, Cyrillic folding, junk, empty.
+"""parse_answer_key: labelled + bare formats, Cyrillic handling, junk, empty.
 
 Every answer is a LIST of accepted strings — a letter is a one-item list.
+The teacher's REAL label is stored (script preserved); cross-script equality is
+applied at comparison time by checker.is_correct.
 """
 from __future__ import annotations
 
 from app.services.answer_key_parser import parse_answer_key
+from app.services.checker import is_correct
 
 
 def test_labelled_spaces():
@@ -35,17 +38,33 @@ def test_bare_lowercase_with_spaces():
     assert key[1] == ["A"] and key[8] == ["D"]
 
 
-def test_cyrillic_labelled():
-    # Cyrillic А В С Д → Latin A B C D
+def test_cyrillic_labelled_keeps_real_script():
+    # The REAL Cyrillic label is STORED (so the report shows "В", not "B") ...
     key, reason = parse_answer_key("1А 2В 3С 4Д")
     assert reason == ""
-    assert key == {1: ["A"], 2: ["B"], 3: ["C"], 4: ["D"]}
+    assert key == {1: ["А"], 2: ["В"], 3: ["С"], 4: ["Д"]}
+    # ... and each still grades equal to its Latin look-alike, and only to it.
+    assert is_correct("A", key[1]) and is_correct("B", key[2])
+    assert is_correct("C", key[3]) and is_correct("D", key[4])
+    assert not is_correct("B", key[1])   # А is not B
 
 
-def test_cyrillic_bare():
+def test_cyrillic_bare_keeps_real_script():
     key, reason = parse_answer_key("АВСД")
     assert reason == ""
-    assert key == {1: ["A"], 2: ["B"], 3: ["C"], 4: ["D"]}
+    assert key == {1: ["А"], 2: ["В"], 3: ["С"], 4: ["Д"]}
+    assert is_correct("A", key[1]) and is_correct("D", key[4])
+
+
+def test_cyrillic_bare_keeps_letters_without_latin_twin():
+    # Б and Г have NO Latin look-alike; a [A-Z] strip used to DROP them from a
+    # bare run, silently shortening the key.
+    key, reason = parse_answer_key("АБВГ")
+    assert reason == ""
+    assert key == {1: ["А"], 2: ["Б"], 3: ["В"], 4: ["Г"]}
+    # Б and В must stay DISTINCT — this is the off-by-one collision guard.
+    assert not is_correct("Б", key[3])   # Б is not В
+    assert not is_correct("B", key[2])   # Latin B is not Б
 
 
 def test_out_of_order_labelled_preserves_numbers():
