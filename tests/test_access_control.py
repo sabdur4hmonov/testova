@@ -333,6 +333,122 @@ async def test_7_non_admin_grant_refused(monkeypatch):
     assert any("admin" in a.lower() for a in answers)
 
 
+# ── revoke confirmation-gate (no DB — service layer stubbed) ─────────────────
+
+class _EditMsg:
+    """Fake message that records edit_text/answer calls (with reply_markup)."""
+    def __init__(self):
+        self.edits: list[str] = []
+        self.answers: list = []
+        self.markups: list = []
+    async def edit_text(self, text, **k):
+        self.edits.append(text)
+    async def answer(self, text, reply_markup=None, **k):
+        self.answers.append(text)
+        self.markups.append(reply_markup)
+
+
+class _CB:
+    """Fake CallbackQuery: carries .data and a .message with edit_text."""
+    def __init__(self, data):
+        self.data = data
+        self.message = _EditMsg()
+    async def answer(self, *a, **k):
+        pass
+
+
+async def test_revoke_command_shows_gate_does_not_block(monkeypatch):
+    # /revoke must NOT act — it only shows a Ha/Yo'q gate naming the target,
+    # with the target id in the callback data. set_blocked must NOT be called.
+    from app.bot.handlers import admin
+    from aiogram.filters import CommandObject
+
+    async def fake_find(session, ident):
+        return _user(telegram_id=555)
+
+    blocked_calls = []
+
+    async def spy_set_blocked(*a, **k):
+        blocked_calls.append((a, k))
+
+    monkeypatch.setattr(admin.admin_users, "find_user", fake_find)
+    monkeypatch.setattr(admin.admin_users, "set_blocked", spy_set_blocked)
+    # find_user is stubbed, so the session opened for it can be a no-op
+    monkeypatch.setattr(admin, "async_session_factory", lambda: _NoOpCtx())
+
+    msg = _EditMsg()
+    admin_user = _user(is_admin=True)
+    await admin.cmd_revoke(msg, CommandObject(command="revoke", args="555"), admin_user)
+
+    assert blocked_calls == []                     # nothing blocked yet
+    assert msg.markups and msg.markups[0] is not None
+    cbs = [b.callback_data for row in msg.markups[0].inline_keyboard for b in row]
+    assert "adm:rev:ok:555" in cbs and "adm:rev:no:555" in cbs
+
+
+async def test_revoke_confirm_ha_blocks_noq_does_not(monkeypatch):
+    from app.bot.handlers import admin
+
+    calls = []
+
+    async def spy_set_blocked(session, admin_id, tg_id, blocked):
+        calls.append((tg_id, blocked))
+
+    monkeypatch.setattr(admin.admin_users, "set_blocked", spy_set_blocked)
+    monkeypatch.setattr(admin, "async_session_factory", lambda: _NoOpCtx())
+    admin_user = _user(is_admin=True)
+
+    # Yo'q → no block, message says cancelled
+    cb_no = _CB("adm:rev:no:777")
+    await admin.handle_revoke_confirm(cb_no, admin_user)
+    assert calls == []
+    assert any("Bekor" in e or "❌" in e for e in cb_no.message.edits)
+
+    # Ha → exactly one block(True) for the encoded target
+    cb_ok = _CB("adm:rev:ok:777")
+    await admin.handle_revoke_confirm(cb_ok, admin_user)
+    assert calls == [(777, True)]
+
+
+async def test_non_admin_revoke_callback_refused(monkeypatch):
+    # A non-admin who somehow taps the gate is refused; set_blocked never runs.
+    from app.bot.handlers import admin
+
+    def boom(*a, **k):
+        raise AssertionError("DB / service must not be touched")
+
+    monkeypatch.setattr(admin, "async_session_factory", boom)
+    monkeypatch.setattr(admin.admin_users, "set_blocked", boom)
+
+    non_admin = _user(is_admin=False)
+    non_admin.telegram_id = 999
+    cb = _CB("adm:rev:ok:123")
+    await admin.handle_revoke_confirm(cb, non_admin)
+    assert any("admin" in e.lower() for e in cb.message.edits)
+
+
+async def test_non_admin_revoke_command_refused(monkeypatch):
+    from app.bot.handlers import admin
+    from aiogram.filters import CommandObject
+
+    def boom(*a, **k):
+        raise AssertionError("DB must not be touched")
+
+    monkeypatch.setattr(admin, "async_session_factory", boom)
+    msg = _EditMsg()
+    non_admin = _user(is_admin=False)
+    non_admin.telegram_id = 999
+    await admin.cmd_revoke(msg, CommandObject(command="revoke", args="123"), non_admin)
+    assert any("admin" in a.lower() for a in msg.answers)
+
+
+class _NoOpCtx:
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+
+
 # ── (8) grant → revoke → unblock lifecycle (real handlers, local engine) ──────
 
 async def test_8_grant_revoke_unblock_lifecycle(monkeypatch):
@@ -364,8 +480,14 @@ async def test_8_grant_revoke_unblock_lifecycle(monkeypatch):
             assert u.uses_left == 5 and u.note == "Ali maktab"
             assert access.has_access(u) is True
 
-        # revoke → blocked, no access
+        # revoke is now confirmation-gated: /revoke shows a Ha/Yo'q gate and does
+        # NOT block on its own — the block happens only on an explicit Ha via the
+        # callback. Drive the full gate here.
         await admin.cmd_revoke(_M(), CommandObject(command="revoke", args=str(tg)), admin_user)
+        async with sm() as s:  # gate shown only → still unblocked
+            u = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
+            assert u.is_blocked is False
+        await admin.handle_revoke_confirm(_CB(f"adm:rev:ok:{tg}"), admin_user)  # Ha
         async with sm() as s:
             u = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
             assert u.is_blocked is True and access.has_access(u) is False

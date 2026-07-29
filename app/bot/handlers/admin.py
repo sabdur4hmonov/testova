@@ -1,6 +1,10 @@
 """
 Admin access-control commands. Admin = User.is_admin OR telegram_id in
 ADMIN_IDS. Every mutating action is written to admin_log.
+
+Handlers here are THIN: all DB logic lives in `app.services.admin_users`
+(so a future web admin panel calls the same functions). Handlers parse the
+command, enforce the admin check, call the service, and format the reply.
 """
 from __future__ import annotations
 
@@ -8,16 +12,16 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
+from app.bot.keyboards.inline import revoke_confirm_keyboard
 from app.config import settings
 from app.database import async_session_factory
-from app.models.admin_log import AdminLog
-from app.models.builder import BuilderSession, BuilderStatus
 from app.models.gemini_usage import GeminiUsage
 from app.models.project import Project
 from app.models.user import User
+from app.services import admin_users
 from app.services.usage_log import estimate_cost
 from app.utils.logging import get_logger
 
@@ -33,20 +37,6 @@ def _is_admin(db_user: User) -> bool:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-async def _log(session, admin_id: int, action: str, target: int | None, **params) -> None:
-    session.add(AdminLog(admin_id=admin_id, action=action, target=target, params=params))
-
-
-async def _get_or_create_target(session, tg_id: int) -> User:
-    res = await session.execute(select(User).where(User.telegram_id == tg_id))
-    user = res.scalar_one_or_none()
-    if user is None:
-        user = User(telegram_id=tg_id, username=None, full_name=f"user {tg_id}")
-        session.add(user)
-        await session.flush()
-    return user
 
 
 def _fmt_user(u: User) -> str:
@@ -97,16 +87,9 @@ async def cmd_grant(message: Message, command: CommandObject, db_user: User) -> 
     note = " ".join(parts[note_start:]) or None
 
     async with async_session_factory() as session:
-        user = await _get_or_create_target(session, tg_id)
-        user.access_until = _now() + timedelta(days=days)
-        user.uses_left = uses           # None = unlimited
-        user.is_blocked = False
-        if note:
-            user.note = note
-        await _log(session, db_user.telegram_id, "grant", tg_id,
-                   days=days, uses=uses, note=note)
-        await session.commit()
-        await session.refresh(user)  # load server-default cols (updated_at)
+        user = await admin_users.grant(
+            session, db_user.telegram_id, tg_id, days=days, uses=uses, note=note
+        )
         text = _fmt_user(user)
     await message.answer(f"✅ Berildi:\n{text}", parse_mode="HTML")
 
@@ -128,12 +111,7 @@ async def cmd_extend(message: Message, command: CommandObject, db_user: User) ->
         await message.answer("user_id va days butun son bo‘lishi kerak.")
         return
     async with async_session_factory() as session:
-        user = await _get_or_create_target(session, tg_id)
-        base = max(_now(), user.access_until or _now())
-        user.access_until = base + timedelta(days=days)
-        await _log(session, db_user.telegram_id, "extend", tg_id, days=days)
-        await session.commit()
-        await session.refresh(user)
+        user = await admin_users.extend(session, db_user.telegram_id, tg_id, days)
         text = _fmt_user(user)
     await message.answer(f"✅ Uzaytirildi:\n{text}", parse_mode="HTML")
 
@@ -155,34 +133,69 @@ async def cmd_setuses(message: Message, command: CommandObject, db_user: User) -
         await message.answer("Sonlar noto‘g‘ri.")
         return
     async with async_session_factory() as session:
-        user = await _get_or_create_target(session, tg_id)
-        user.uses_left = None if n < 0 else n
-        await _log(session, db_user.telegram_id, "setuses", tg_id, n=n)
-        await session.commit()
-        await session.refresh(user)
+        user = await admin_users.set_uses(session, db_user.telegram_id, tg_id, n)
         text = _fmt_user(user)
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
 
 
-# ── /revoke, /unblock ─────────────────────────────────────────────────────────
+# ── /revoke (confirmation-gated) ────────────────────────────────────────────────
 
 @router.message(Command("revoke"))
 async def cmd_revoke(message: Message, command: CommandObject, db_user: User) -> None:
-    await _block(message, command, db_user, block=True)
+    """Destructive: do NOT act here — show a Ha/Yo'q gate naming the target so a
+    mistyped id can't silently cut off a paying teacher. The actual block happens
+    in handle_revoke_confirm only on an explicit Ha."""
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    parts = _args(command)
+    if not parts:
+        await message.answer("Foydalanish: /revoke <user_id yoki @username>")
+        return
+    async with async_session_factory() as session:
+        user = await admin_users.find_user(session, parts[0])
+    if user is None:
+        await message.answer("Bunday foydalanuvchi topilmadi.")
+        return
+    await message.answer(
+        f"⚠️ <b>{user.full_name}</b> (<code>{user.telegram_id}</code>) "
+        f"foydalanuvchining ruxsati bekor qilinadi.\nTasdiqlaysizmi?",
+        reply_markup=revoke_confirm_keyboard(user.telegram_id),
+        parse_mode="HTML",
+    )
 
+
+@router.callback_query(F.data.startswith("adm:rev:"))
+async def handle_revoke_confirm(callback: CallbackQuery, db_user: User) -> None:
+    """Ha → block; Yo'q → no-op. Admin is RE-checked here (callbacks aren't
+    gated by the access middleware, so a non-admin tap must be refused)."""
+    await callback.answer()
+    if not _is_admin(db_user):
+        await callback.message.edit_text(REFUSED)
+        return
+    parts = callback.data.split(":")  # ["adm","rev","ok"|"no","<tg_id>"]
+    try:
+        verdict, tg_id = parts[2], int(parts[3])
+    except (IndexError, ValueError):
+        return
+    if verdict != "ok":
+        await callback.message.edit_text("❌ Bekor qilindi. Hech nima o‘zgarmadi.")
+        return
+    async with async_session_factory() as session:
+        await admin_users.set_blocked(session, db_user.telegram_id, tg_id, True)
+    await callback.message.edit_text(f"⛔ Bloklandi: {tg_id}")
+
+
+# ── /unblock (not destructive → no gate) ────────────────────────────────────────
 
 @router.message(Command("unblock"))
 async def cmd_unblock(message: Message, command: CommandObject, db_user: User) -> None:
-    await _block(message, command, db_user, block=False)
-
-
-async def _block(message: Message, command: CommandObject, db_user: User, block: bool) -> None:
     if not _is_admin(db_user):
         await message.answer(REFUSED)
         return
     parts = _args(command)
     if not parts:
-        await message.answer("Foydalanish: /revoke <user_id>  yoki  /unblock <user_id>")
+        await message.answer("Foydalanish: /unblock <user_id>")
         return
     try:
         tg_id = int(parts[0])
@@ -190,49 +203,32 @@ async def _block(message: Message, command: CommandObject, db_user: User, block:
         await message.answer("user_id butun son bo‘lishi kerak.")
         return
     async with async_session_factory() as session:
-        user = await _get_or_create_target(session, tg_id)
-        user.is_blocked = block
-        await _log(session, db_user.telegram_id, "revoke" if block else "unblock", tg_id)
-        await session.commit()
-    await message.answer(f"{'⛔ Bloklandi' if block else '✅ Blok olindi'}: {tg_id}")
+        await admin_users.set_blocked(session, db_user.telegram_id, tg_id, False)
+    await message.answer(f"✅ Blok olindi: {tg_id}")
 
 
-# ── /info ─────────────────────────────────────────────────────────────────────
+# ── /user (alias /info) — id OR @username ───────────────────────────────────────
 
-@router.message(Command("info"))
-async def cmd_info(message: Message, command: CommandObject, db_user: User) -> None:
+@router.message(Command("user", "info"))
+async def cmd_user(message: Message, command: CommandObject, db_user: User) -> None:
     if not _is_admin(db_user):
         await message.answer(REFUSED)
         return
     parts = _args(command)
     if not parts:
-        await message.answer("Foydalanish: /info <user_id>")
-        return
-    try:
-        tg_id = int(parts[0])
-    except ValueError:
-        await message.answer("user_id butun son bo‘lishi kerak.")
+        await message.answer("Foydalanish: /user <user_id yoki @username>")
         return
     async with async_session_factory() as session:
-        res = await session.execute(select(User).where(User.telegram_id == tg_id))
-        user = res.scalar_one_or_none()
-        if user is None:
-            await message.answer("Bunday foydalanuvchi topilmadi.")
-            return
-        # active builder session + whether its one use has been charged
-        sres = await session.execute(
-            select(BuilderSession).where(
-                BuilderSession.user_id == user.id,
-                BuilderSession.status == BuilderStatus.ACTIVE,
-            ).order_by(BuilderSession.created_at.desc()).limit(1)
-        )
-        bs = sres.scalar_one_or_none()
-        text = _fmt_user(user)
-        if bs is not None:
-            charged = "use hisoblangan" if bs.use_charged else "use hisoblanmagan"
-            text += f"\n📚 Aktiv sessiya: bor, {charged}"
-        else:
-            text += "\n📚 Aktiv sessiya: yo‘q"
+        detail = await admin_users.user_detail(session, parts[0])
+    if detail is None:
+        await message.answer("Bunday foydalanuvchi topilmadi.")
+        return
+    text = _fmt_user(detail.user)
+    if detail.has_active_session:
+        charged = "use hisoblangan" if detail.session_charged else "use hisoblanmagan"
+        text += f"\n📚 Aktiv sessiya: bor, {charged}"
+    else:
+        text += "\n📚 Aktiv sessiya: yo‘q"
     await message.answer(text, parse_mode="HTML")
 
 
@@ -245,15 +241,9 @@ async def cmd_users(message: Message, command: CommandObject, db_user: User) -> 
         return
     parts = _args(command)
     page = int(parts[0]) if parts and parts[0].isdigit() else 1
-    page = max(1, page)
     per = 20
     async with async_session_factory() as session:
-        res = await session.execute(
-            select(User).order_by(User.updated_at.desc())
-            .offset((page - 1) * per).limit(per)
-        )
-        users = res.scalars().all()
-        total = (await session.execute(select(func.count()).select_from(User))).scalar_one()
+        users, total = await admin_users.list_users(session, page=page, per=per)
     if not users:
         await message.answer("Bu sahifada foydalanuvchi yo‘q.")
         return
@@ -264,7 +254,7 @@ async def cmd_users(message: Message, command: CommandObject, db_user: User) -> 
         lines.append(f"{mark} <code>{u.telegram_id}</code> {u.full_name[:20]} · {uses_s}")
     pages = (total + per - 1) // per
     await message.answer(
-        f"👥 Foydalanuvchilar ({page}/{pages}, jami {total}):\n" + "\n".join(lines),
+        f"👥 Foydalanuvchilar ({max(1, page)}/{pages}, jami {total}):\n" + "\n".join(lines),
         parse_mode="HTML",
     )
 
@@ -369,9 +359,9 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "   uses ko‘rsatilmasa — cheksiz.\n"
         "<code>/extend &lt;id&gt; &lt;days&gt;</code> — muddatni uzaytirish\n"
         "<code>/setuses &lt;id&gt; &lt;n&gt;</code> — ishlatish sonini o‘rnatish (-1 = cheksiz)\n"
-        "<code>/revoke &lt;id&gt;</code> — bloklash\n"
+        "<code>/revoke &lt;id&gt;</code> — bloklash (tasdiq so‘raladi)\n"
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
-        "<code>/info &lt;id&gt;</code> — batafsil ma’lumot\n"
+        "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"
         "<code>/users [sahifa]</code> — ro‘yxat (20 tadan)\n"
         "<code>/stats</code> — umumiy statistika\n"
         "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)",

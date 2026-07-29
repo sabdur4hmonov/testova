@@ -44,6 +44,16 @@ def _two_button_kb(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def revoke_confirm_keyboard(tg_id: int) -> InlineKeyboardMarkup:
+    """[✅ Ha] [❌ Yo'q] gate for a destructive /revoke. The target telegram_id
+    rides in the callback data so the confirm handler stays stateless."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Ha", callback_data=f"adm:rev:ok:{tg_id}")
+    builder.button(text="❌ Yo'q", callback_data=f"adm:rev:no:{tg_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def delete_confirm_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
     """Confirm deleting the question(s) the teacher marked with a bare dash."""
     labels = {
