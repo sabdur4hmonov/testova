@@ -525,3 +525,22 @@ cheap — projected ~$427/mo at 2000 teachers vs ~$907/mo for today's single
 thinking-enabled read. Affordable, but it needs a genuinely independent signal
 (different prompt phrasing, different image preprocessing, or a different model)
 for agreement to mean anything. Repeating the same call is not that.
+
+## P6 JPEG upload instead of PNG — TRIED, REJECTED (v0.38)
+
+**Idea:** the preprocessed page re-encoded as PNG is ~2x larger than the source
+JPEG the phone sent (689KB from a 176KB original), because PNG compresses the
+CLAHE-flattened greyscale poorly. Sending JPEG would shrink the upload.
+
+**Measured, and rejected on accuracy.** Gemini bills images by DIMENSIONS, not
+bytes, so the only benefit was upload latency — but JPEG q92 changed the read:
+
+* Cyrillic sheet: Q8 misread `Г` -> `С` in 2 of 3 runs (PNG: `Г` in 3 of 3).
+* Latin sheet: the lowercase `e` on Q3 was no longer detected, 2 of 2 runs
+  (PNG: all 6 E's found).
+
+Faint pencil and small handwriting are exactly what JPEG's chroma/DCT
+quantisation smooths away. A ~2x smaller upload on a ~7s call is not worth any
+accuracy risk on a grading path. If revisited, try lossless WebP (smaller than
+PNG, no quantisation) and re-run the same accuracy proof — quality knobs above
+q92 were not explored because the upside is only latency.
