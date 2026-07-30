@@ -104,6 +104,35 @@ async def set_uses(session, admin_id: int, tg_id: int, n: int) -> User:
     return user
 
 
+async def set_plan(session, admin_id: int, tg_id: int, plan_key: str) -> User:
+    """Assign a paid plan (the ONE command for a manual sale). Sets BOTH monthly
+    limits to the plan's bundle, neutralises the old trial meter (uses_left =
+    NULL/unlimited), starts a fresh 30-day access window + quota cycle (zeroes
+    both counters, period_start = now). Raises ValueError on an unknown plan
+    BEFORE touching the DB (no row created / changed)."""
+    from datetime import timedelta
+    from app.services.plans import get_plan, PLAN_DAYS
+
+    plan = get_plan(plan_key)
+    if plan is None:
+        raise ValueError(plan_key)
+
+    now = _now()
+    user = await get_or_create(session, tg_id)
+    user.monthly_variant_limit = plan.variant_limit
+    user.monthly_check_limit = plan.check_limit
+    user.uses_left = None                 # paid users aren't gated by the trial counter
+    user.variant_count_this_period = 0    # fresh full cycle from today
+    user.check_count_this_period = 0
+    user.period_start = now
+    user.access_until = now + timedelta(days=PLAN_DAYS)
+    user.is_blocked = False
+    await _write_log(session, admin_id, "plan", tg_id, plan=plan.key)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def set_variant_limit(session, admin_id: int, tg_id: int, n: int) -> User:
     """Set the monthly variant-generation limit. n < 0 → unlimited (NULL)."""
     user = await get_or_create(session, tg_id)

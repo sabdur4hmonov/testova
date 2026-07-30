@@ -48,6 +48,7 @@ def _fmt_user(u: User) -> str:
         date_s = f"{(u.access_until - now).days} kun ({u.access_until:%Y-%m-%d})"
     else:
         date_s = f"tugagan ({u.access_until:%Y-%m-%d})"
+    from app.services.plans import plan_name
     uses_s = "cheksiz" if u.uses_left is None else str(u.uses_left)
     handle = f"@{u.username}" if u.username else "yo‘q"
     vlim = "∞" if u.monthly_variant_limit is None else str(u.monthly_variant_limit)
@@ -55,6 +56,7 @@ def _fmt_user(u: User) -> str:
     return (
         f"👤 <code>{u.telegram_id}</code> {u.full_name}\n"
         f"🔗 Username: {handle}\n"
+        f"💳 Tarif: {plan_name(u)}\n"
         f"📝 Izoh: {u.note or '—'}\n"
         f"📅 Muddat: {date_s}\n"
         f"🔢 Ishlatish: {uses_s}\n"
@@ -151,6 +153,35 @@ async def cmd_setuses(message: Message, command: CommandObject, db_user: User) -
         user = await admin_users.set_uses(session, db_user.telegram_id, tg_id, n)
         text = _fmt_user(user)
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
+
+
+# ── /plan <id> <standart|pro> — assign a paid plan (the manual-sale command) ──
+
+@router.message(Command("plan"))
+async def cmd_plan(message: Message, command: CommandObject, db_user: User) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    from app.services.plans import get_plan, PLANS
+    parts = _args(command)
+    if len(parts) < 2:
+        names = " | ".join(PLANS)
+        await message.answer(f"Foydalanish: /plan <user_id> <{names}>")
+        return
+    try:
+        tg_id = int(parts[0])
+    except ValueError:
+        await message.answer("user_id butun son bo‘lishi kerak.")
+        return
+    if get_plan(parts[1]) is None:            # validate BEFORE any DB change
+        await message.answer(
+            f"❌ Noma’lum tarif: «{parts[1]}». Mavjud: {' | '.join(PLANS)}."
+        )
+        return
+    async with async_session_factory() as session:
+        user = await admin_users.set_plan(session, db_user.telegram_id, tg_id, parts[1])
+        text = _fmt_user(user)
+    await message.answer(f"✅ Tarif berildi:\n{text}", parse_mode="HTML")
 
 
 # ── /setvariantlimit, /setchecklimit ──────────────────────────────────────────
@@ -539,6 +570,7 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         return
     await message.answer(
         "🛠 <b>Admin buyruqlar</b>\n\n"
+        "<code>/plan &lt;id&gt; &lt;standart|pro&gt;</code> — tarif berish (to‘lovdan keyin)\n"
         "<code>/grant &lt;id&gt; &lt;days&gt; [uses] [izoh]</code> — kirish berish\n"
         "   masalan: <code>/grant 12345 30 5 Ali maktab 1</code>\n"
         "   uses ko‘rsatilmasa — cheksiz.\n"

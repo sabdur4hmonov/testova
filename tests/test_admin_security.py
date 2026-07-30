@@ -99,6 +99,7 @@ async def test_all_message_commands_reject_non_admin(monkeypatch):
 
     checks = {
         "/grant": await run_with_command(admin.cmd_grant),
+        "/plan": await run_with_command(admin.cmd_plan),
         "/extend": await run_with_command(admin.cmd_extend),
         "/setuses": await run_with_command(admin.cmd_setuses),
         "/setvariantlimit": await run_with_command(admin.cmd_setvariantlimit),
