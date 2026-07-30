@@ -45,11 +45,26 @@ async def get_or_create_user(
             "user_created", telegram_id=telegram_id,
             is_admin=user.is_admin, uses_left=user.uses_left,
         )
-    elif telegram_id in settings.ADMIN_IDS and not user.is_admin:
-        # Promote pre-existing admins (created before the ADMIN_IDS entry).
-        user.is_admin = True
-        await session.flush()
-        logger.info("user_promoted_admin", telegram_id=telegram_id)
+    else:
+        # Refresh identity on every interaction. Telegram sends the CURRENT
+        # username + display name with each update, so mirroring them keeps the
+        # admin panel searchable by the user's current @username, reflects handle
+        # changes, and backfills usernames that were NULL (captured before this
+        # refresh existed). Flush only when something actually changed.
+        changed = False
+        if user.username != username:
+            user.username = username
+            changed = True
+        if full_name and user.full_name != full_name:
+            user.full_name = full_name
+            changed = True
+        if telegram_id in settings.ADMIN_IDS and not user.is_admin:
+            # Promote pre-existing admins (created before the ADMIN_IDS entry).
+            user.is_admin = True
+            changed = True
+            logger.info("user_promoted_admin", telegram_id=telegram_id)
+        if changed:
+            await session.flush()
 
     return user
 
