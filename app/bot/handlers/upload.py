@@ -33,7 +33,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import access, admin_notify, storage
+from app.services import access, admin_notify, quota, storage
 from app.services.answer_key_parser import parse_answer_key, _to_colon_written
 from app.services.option_letters import (
     OPTION_LETTER_CLASS, canonical_letter,
@@ -1256,6 +1256,12 @@ async def _generate_and_send(
 ) -> None:
     lang   = db_user.language.value
     status = await message.answer(t("generating", lang, n=count))
+
+    # ── Monthly variant quota (independent of uses_left) ─────────────────────
+    if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.VARIANT):
+        await status.edit_text(access.limit_reached_text())
+        await state.clear()
+        return
 
     # FIX 3: skip semantics — explicitly skipped numbers are excluded from
     # grading (correct_answer stays NULL) and listed once, here.

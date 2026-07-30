@@ -62,6 +62,21 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── Independent monthly quotas (rolling 30 days) ─────────────────────────
+    # Separate from uses_left. NULL limit = unlimited on that dimension. Both
+    # counters share one rolling window anchored at period_start.
+    monthly_variant_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    variant_count_this_period: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    monthly_check_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    check_count_this_period: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

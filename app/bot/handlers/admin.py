@@ -50,12 +50,16 @@ def _fmt_user(u: User) -> str:
         date_s = f"tugagan ({u.access_until:%Y-%m-%d})"
     uses_s = "cheksiz" if u.uses_left is None else str(u.uses_left)
     handle = f"@{u.username}" if u.username else "yo‘q"
+    vlim = "∞" if u.monthly_variant_limit is None else str(u.monthly_variant_limit)
+    clim = "∞" if u.monthly_check_limit is None else str(u.monthly_check_limit)
     return (
         f"👤 <code>{u.telegram_id}</code> {u.full_name}\n"
         f"🔗 Username: {handle}\n"
         f"📝 Izoh: {u.note or '—'}\n"
         f"📅 Muddat: {date_s}\n"
         f"🔢 Ishlatish: {uses_s}\n"
+        f"📦 Variant limiti: {u.variant_count_this_period}/{vlim} (oyiga)\n"
+        f"📝 Tekshirish limiti: {u.check_count_this_period}/{clim} (oyiga)\n"
         f"⛔ Bloklangan: {'ha' if u.is_blocked else 'yo‘q'}\n"
         f"📤 Yuklamalar: {u.total_projects}\n"
         f"🕐 Oxirgi faollik: {u.updated_at:%Y-%m-%d %H:%M}"
@@ -137,6 +141,41 @@ async def cmd_setuses(message: Message, command: CommandObject, db_user: User) -
         return
     async with async_session_factory() as session:
         user = await admin_users.set_uses(session, db_user.telegram_id, tg_id, n)
+        text = _fmt_user(user)
+    await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
+
+
+# ── /setvariantlimit, /setchecklimit ──────────────────────────────────────────
+
+@router.message(Command("setvariantlimit"))
+async def cmd_setvariantlimit(message: Message, command: CommandObject, db_user: User) -> None:
+    await _set_limit(message, command, db_user, kind="variant")
+
+
+@router.message(Command("setchecklimit"))
+async def cmd_setchecklimit(message: Message, command: CommandObject, db_user: User) -> None:
+    await _set_limit(message, command, db_user, kind="check")
+
+
+async def _set_limit(message: Message, command: CommandObject, db_user: User, kind: str) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    cmd = "/setvariantlimit" if kind == "variant" else "/setchecklimit"
+    parts = _args(command)
+    if len(parts) < 2:
+        await message.answer(f"Foydalanish: {cmd} <user_id> <n>  (n=-1 → cheksiz)")
+        return
+    try:
+        tg_id, n = int(parts[0]), int(parts[1])
+    except ValueError:
+        await message.answer("Sonlar noto‘g‘ri.")
+        return
+    async with async_session_factory() as session:
+        if kind == "variant":
+            user = await admin_users.set_variant_limit(session, db_user.telegram_id, tg_id, n)
+        else:
+            user = await admin_users.set_check_limit(session, db_user.telegram_id, tg_id, n)
         text = _fmt_user(user)
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
 
@@ -439,6 +478,8 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "   uses ko‘rsatilmasa — cheksiz.\n"
         "<code>/extend &lt;id&gt; &lt;days&gt;</code> — muddatni uzaytirish\n"
         "<code>/setuses &lt;id&gt; &lt;n&gt;</code> — ishlatish sonini o‘rnatish (-1 = cheksiz)\n"
+        "<code>/setvariantlimit &lt;id&gt; &lt;n&gt;</code> — oylik variant limiti (-1 = cheksiz)\n"
+        "<code>/setchecklimit &lt;id&gt; &lt;n&gt;</code> — oylik tekshirish limiti (-1 = cheksiz)\n"
         "<code>/revoke &lt;id&gt;</code> — bloklash (tasdiq so‘raladi)\n"
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
         "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"

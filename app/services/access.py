@@ -67,6 +67,15 @@ def apply_trial(user: User) -> None:
     user.uses_left = settings.TRIAL_USES
 
 
+def limit_reached_text() -> str:
+    """ONE consistent 'you hit a limit, contact the admin' message, used for
+    EVERY limit type (trial uses, monthly variant limit, monthly check limit)."""
+    return (
+        "⛔ Sizning limitingiz tugadi.\n"
+        f"Davom etish uchun admin bilan bog'laning: @{settings.ADMIN_USERNAME}"
+    )
+
+
 def blocked_text() -> str:
     """Exact Uzbek blocked/expired message with the admin username."""
     return (

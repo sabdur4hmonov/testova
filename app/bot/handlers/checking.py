@@ -32,7 +32,7 @@ from app.bot.states.forms import CheckingStates
 from app.config import settings
 from app.database import async_session_factory
 from app.models.user import User
-from app.services import storage
+from app.services import access, quota, storage
 from app.services.ai_analyzer import AIAnalyzer
 from app.services.answer_checker import check_answers
 from app.services.answer_key_parser import parse_answer_key
@@ -418,6 +418,11 @@ async def handle_answer_sheet_upload(
     message: Message, state: FSMContext, db_user: User, bot: Bot
 ) -> None:
     lang = db_user.language.value
+
+    # ── Monthly check quota (independent of the variant quota / uses_left) ────
+    if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.CHECK):
+        await message.answer(access.limit_reached_text())
+        return
 
     # Download image
     if message.photo:
@@ -1061,6 +1066,11 @@ async def handle_manual_sheet(
     to the optional name prompt only when NEITHER caption nor sheet gave a name.
     Re-runs for EVERY photo in the [➕ Yana] loop."""
     lang = db_user.language.value
+
+    # ── Monthly check quota (independent of the variant quota / uses_left) ────
+    if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.CHECK):
+        await message.answer(access.limit_reached_text())
+        return
 
     if message.photo:
         file_id = message.photo[-1].file_id

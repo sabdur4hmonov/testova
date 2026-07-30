@@ -53,7 +53,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import access, admin_notify, storage
+from app.services import access, admin_notify, quota, storage
 from app.services.file_processor import detect_file_type
 from app.services.pdf_generator import (
     build_answer_key_pdf, build_variants_pdf, build_variants_pdf_compact,
@@ -1035,6 +1035,12 @@ async def _do_generate(
     message: Message, state: FSMContext, db_user: User,
     session_id: str, n: int, m: int, status, lang: str,
 ) -> None:
+    # ── Monthly variant quota (independent of uses_left) ─────────────────────
+    if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.VARIANT):
+        await status.edit_text(access.limit_reached_text())
+        await state.clear()
+        return
+
     data = await state.get_data()
     pool, _collapsed, _siblings, _sources = await _load_pool(session_id)
 

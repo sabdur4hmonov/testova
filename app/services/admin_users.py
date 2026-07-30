@@ -104,6 +104,26 @@ async def set_uses(session, admin_id: int, tg_id: int, n: int) -> User:
     return user
 
 
+async def set_variant_limit(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Set the monthly variant-generation limit. n < 0 → unlimited (NULL)."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_variant_limit = None if n < 0 else n
+    await _write_log(session, admin_id, "setvariantlimit", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_check_limit(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Set the monthly answer-checking limit. n < 0 → unlimited (NULL)."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_check_limit = None if n < 0 else n
+    await _write_log(session, admin_id, "setchecklimit", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def set_blocked(session, admin_id: int, tg_id: int, blocked: bool) -> User:
     """Block (revoke) or unblock a user. Logged as 'revoke' / 'unblock'."""
     user = await get_or_create(session, tg_id)
