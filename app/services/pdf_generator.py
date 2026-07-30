@@ -22,6 +22,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 from app.services import storage
+from app.services.ai_analyzer import desc_reveals_answer
 from app.services.math_render import render_to_markup
 from app.utils.logging import get_logger
 
@@ -590,6 +591,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
             if q.get("has_image"):
                 img_path = q.get("image_path")
                 img_desc = q.get("image_description")
+                # Correct option TEXT for THIS variant (options are shuffled, but
+                # the text is variant-independent) — lets the fallback box refuse
+                # to reveal the answer (Defect 5 / Option D).
+                correct_text = (q.get("options") or {}).get(q.get("correct_answer"))
 
                 if img_path:
                     img_flow = _load_image_rl(img_path, max_width=available_w * 0.80)
@@ -610,10 +615,10 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
                         block.append(Spacer(1, 2 * mm))
                     else:
                         # Image path exists but failed to load — show description
-                        _append_img_desc(block, img_desc, available_w)
+                        _append_img_desc(block, img_desc, available_w, correct_text)
                 elif img_desc:
                     # No path at all — show description as styled box
-                    _append_img_desc(block, img_desc, available_w)
+                    _append_img_desc(block, img_desc, available_w, correct_text)
 
             # ── BUG FIX: open-ended questions ────────────────────────────────
             # Previously: silently rendered nothing → looked broken to students.
@@ -670,16 +675,24 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
 _USELESS_DESC = _re.compile(r'cut ?off|is cut|kesilgan|not (?:visible|readable)', _re.I)
 
 
-def _append_img_desc(story: list, img_desc: str | None, available_w: float) -> None:
+def _append_img_desc(story: list, img_desc: str | None, available_w: float,
+                     correct_text: str | None = None) -> None:
     """Append a styled description box when the actual image can't be shown.
-    Contentless descriptions are dropped entirely."""
+    Contentless descriptions are dropped entirely. A description that would
+    HAND OVER the correct option (Defect 5 / Option D) is replaced by a neutral
+    "[Rasm]" marker — never printed — so the fallback can't reveal the answer.
+    The teacher is warned separately via export_lint."""
     if not img_desc:
         return
     if len(img_desc.strip()) < 8 or _USELESS_DESC.search(img_desc):
         logger.info("img_desc_suppressed", preview=img_desc[:60])
         return
-    desc_text = _esc(img_desc).replace("\n", "<br/>")
-    desc_para = Paragraph(f"<i>[Rasm]: {desc_text}</i>", STYLES["img_desc"])
+    if desc_reveals_answer(img_desc, correct_text):
+        logger.info("answer_revealing_desc_suppressed", preview=img_desc[:60])
+        inner = "[Rasm]"  # neutral placeholder — no content, no answer leak
+    else:
+        inner = "[Rasm]: " + _esc(img_desc).replace("\n", "<br/>")
+    desc_para = Paragraph(f"<i>{inner}</i>", STYLES["img_desc"])
     desc_tbl = Table([[desc_para]], colWidths=[available_w])
     desc_tbl.setStyle(TableStyle([
         ("BOX",           (0, 0), (-1, -1), 0.5,  colors.HexColor("#888888")),
@@ -1053,6 +1066,7 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
             if q.get("has_image"):
                 img_path = q.get("image_path")
                 img_desc = q.get("image_description")
+                correct_text = (q.get("options") or {}).get(q.get("correct_answer"))
                 if img_path:
                     img_flow = _load_image_rl(img_path, max_width=usable)
                     if img_flow:
@@ -1067,9 +1081,9 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
                         block.append(tbl)
                         block.append(Spacer(1, 1.5 * mm))
                     else:
-                        _append_img_desc(block, img_desc, colw)
+                        _append_img_desc(block, img_desc, colw, correct_text)
                 elif img_desc:
-                    _append_img_desc(block, img_desc, colw)
+                    _append_img_desc(block, img_desc, colw, correct_text)
 
             if is_open:
                 block.append(Paragraph("<i>(Javobni yozing)</i>", open_st))

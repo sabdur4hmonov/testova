@@ -538,6 +538,44 @@ def _desc_redundant(stem: str | None, desc: str | None) -> bool:
     return False
 
 
+# Token = a maximal run of alphanumerics (Unicode-aware), lowercased. Used to
+# decide whether a fallback [Rasm] description LEAKS the correct answer.
+_ANS_TOKEN_RE = re.compile(r'[^\W_]+', re.UNICODE)
+
+
+def _answer_tokens(text: str | None) -> set[str]:
+    return {t for t in _ANS_TOKEN_RE.findall((text or "").lower())}
+
+
+def desc_reveals_answer(desc: str | None, correct_text: str | None) -> bool:
+    """DEFECT 5 / Option D: True when an un-renderable figure's fallback
+    description would hand the student the correct option — every token of the
+    correct option appears as a WHOLE token in the description.
+
+    - Token boundaries, NOT substring: "points A, B, C" must not count as
+      containing option "AB"/"BC". The segment option "AB, AC, BC" reveals only
+      when the description literally names AB, AC and BC as tokens.
+    - Gated on >=2 ALPHABETIC answer tokens. Bare numbers are the false-positive
+      class: a single number ("280") AND a multi-number answer ("2, 4, 6", the
+      "which reactions are correct?" answer) both collide with digits that a
+      transcribed chemistry-table / number-line description legitimately carries
+      — measured as 3 FPs on essential tables in the current corpus when numbers
+      counted. So only letter-bearing tokens (AB, AC, BC …) make an answer
+      eligible, which keeps the ~20 ESSENTIAL descriptions printable. This is
+      strictly NARROWER than the originally-recorded token rule (whose "0 FP"
+      was measured on a smaller corpus, since grown), so it can only drop FPs.
+    - Correct option must be resolved PER VARIANT (variants shuffle options),
+      but its TEXT is variant-independent, so the render sites and export_lint
+      agree.
+    """
+    if not desc:
+        return False
+    alpha = {t for t in _answer_tokens(correct_text) if any(c.isalpha() for c in t)}
+    if len(alpha) < 2:
+        return False
+    return alpha <= _answer_tokens(desc)
+
+
 def _has_scheme_content(q: dict) -> bool:
     """Attached image, a text chain with arrows, or a formula-bearing description."""
     if q.get("image_path"):
@@ -1009,6 +1047,13 @@ def export_lint(questions: list[dict]) -> list[tuple[int, str]]:
             st = set(re.findall(r'[^\W_]{3,}', stem.lower()))
             if dt and len(dt & st) / len(dt) >= 0.7:
                 violations.append((n, "desc_echoes_stem"))
+            # DEFECT 5 / Option D: an un-renderable figure whose fallback
+            # description names the correct option. Render-time suppression is
+            # the guarantee (a neutral [Rasm] prints instead); this warns the
+            # teacher so they can supply the real figure.
+            correct_text = (q.get("options") or {}).get(q.get("correct_answer"))
+            if desc_reveals_answer(desc, correct_text):
+                violations.append((n, "desc_reveals_answer"))
 
         opts = {k: v for k, v in (q.get("options") or {}).items() if v}
         if len(opts) >= 4 and re.search(r'\bA\)', stem) and re.search(r'\bB\)', stem):
