@@ -70,6 +70,14 @@ def _args(command: CommandObject) -> list[str]:
     return (command.args or "").split()
 
 
+def _user_line(u: User) -> str:
+    """One compact list row, shared by /users and /find."""
+    mark = "⛔" if u.is_blocked else "✅"
+    uses_s = "∞" if u.uses_left is None else str(u.uses_left)
+    handle = f"@{u.username}" if u.username else "—"
+    return f"{mark} <code>{u.telegram_id}</code> {handle} {u.full_name[:18]} · {uses_s}"
+
+
 # ── /grant ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("grant"))
@@ -295,17 +303,38 @@ async def cmd_users(message: Message, command: CommandObject, db_user: User) -> 
     if not users:
         await message.answer("Bu sahifada foydalanuvchi yo‘q.")
         return
-    lines = []
-    for u in users:
-        mark = "⛔" if u.is_blocked else "✅"
-        uses_s = "∞" if u.uses_left is None else str(u.uses_left)
-        handle = f"@{u.username}" if u.username else "—"
-        lines.append(
-            f"{mark} <code>{u.telegram_id}</code> {handle} {u.full_name[:18]} · {uses_s}"
-        )
+    lines = [_user_line(u) for u in users]
     pages = (total + per - 1) // per
     await message.answer(
         f"👥 Foydalanuvchilar ({max(1, page)}/{pages}, jami {total}):\n" + "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ── /find <query> — partial username/name search ──────────────────────────────
+
+@router.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject, db_user: User) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer("Foydalanish: /find <username yoki ism qismi>")
+        return
+    per = 10
+    async with async_session_factory() as session:
+        users, total = await admin_users.search_users(session, query, per=per)
+    if not users:
+        await message.answer(f"«{query}» bo‘yicha hech narsa topilmadi.")
+        return
+    more = (
+        f"\n… va yana {total - len(users)} ta. Aniqroq qidiring."
+        if total > len(users) else ""
+    )
+    await message.answer(
+        f"🔍 «{query}» ({len(users)}/{total}):\n"
+        + "\n".join(_user_line(u) for u in users) + more,
         parse_mode="HTML",
     )
 
@@ -484,6 +513,7 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
         "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"
         "<code>/users [sahifa]</code> — ro‘yxat (20 tadan)\n"
+        "<code>/find &lt;so‘rov&gt;</code> — username yoki ism bo‘yicha qidirish\n"
         "<code>/stats</code> — umumiy statistika\n"
         "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)\n"
         "<code>/broadcast &lt;matn&gt;</code> — hammaga e’lon (tasdiq so‘raladi)\n"

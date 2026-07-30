@@ -107,6 +107,7 @@ async def test_all_message_commands_reject_non_admin(monkeypatch):
         "/unblock": await run_with_command(admin.cmd_unblock),
         "/user": await run_with_command(admin.cmd_user),
         "/users": await run_with_command(admin.cmd_users),
+        "/find": await run_with_command(admin.cmd_find),
         "/stats": await run_plain(admin.cmd_stats),
         "/usage": await run_plain(admin.cmd_usage),
         "/help_admin": await run_plain(admin.cmd_help_admin),

@@ -164,6 +164,24 @@ async def user_detail(session, ident) -> UserDetail | None:
     )
 
 
+async def search_users(
+    session, query: str, page: int = 1, per: int = 10
+) -> tuple[list[User], int]:
+    """Case-insensitive PARTIAL search over username OR full_name. Returns one
+    page of matches (most-recently-active first) plus the total match count."""
+    page = max(1, page)
+    pattern = f"%{(query or '').strip()}%"
+    cond = User.username.ilike(pattern) | User.full_name.ilike(pattern)
+    total = (await session.execute(
+        select(func.count()).select_from(User).where(cond)
+    )).scalar_one()
+    res = await session.execute(
+        select(User).where(cond).order_by(User.updated_at.desc())
+        .offset((page - 1) * per).limit(per)
+    )
+    return list(res.scalars().all()), int(total)
+
+
 async def list_users(session, page: int = 1, per: int = 20) -> tuple[list[User], int]:
     """One page of users (most-recently-active first) plus the total count."""
     page = max(1, page)
