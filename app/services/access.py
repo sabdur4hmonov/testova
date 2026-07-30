@@ -77,13 +77,10 @@ def limit_reached_text() -> str:
 
 
 def blocked_text() -> str:
-    """Exact Uzbek blocked/expired message with the admin username."""
-    return (
-        "⛔ Sizning bepul limitingiz tugadi.\n"
-        f"Botdan foydalanishni davom ettirish uchun admin bilan bog'laning: "
-        f"@{settings.ADMIN_USERNAME}\n"
-        "❓ Biror muammo yoki savol bo'lsa ham bemalol yozing — yordam beramiz."
-    )
+    """Access-denied message shown by the middleware (blocked / expired / out of
+    uses). Routed through the single limit-reached text so EVERY limit type —
+    trial uses, monthly variant limit, monthly check limit — reads identically."""
+    return limit_reached_text()
 
 
 # ── Atomic use accounting ────────────────────────────────────────────────────
