@@ -53,7 +53,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import access, storage
+from app.services import access, admin_notify, storage
 from app.services.file_processor import detect_file_type
 from app.services.pdf_generator import (
     build_answer_key_pdf, build_variants_pdf, build_variants_pdf_compact,
@@ -567,11 +567,18 @@ async def _process_builder_file(
     # ── Access: ONE use for the WHOLE session, charged on the first source's
     #    successful extraction. Idempotent — later sources are free. ───────────
     remaining = None
+    first_charge = False
     if not access.is_unlimited(db_user):
         async with async_session_factory() as session:
             remaining = await access.charge_session_use(
                 session, uuid.UUID(session_id), db_user.id
             )
+            # First-ever charged use → alert admins once (only if a use was
+            # actually consumed on this session). Never breaks the flow.
+            if remaining is not None:
+                first_charge = await access.register_first_charge(session, db_user.id)
+    if first_charge:
+        await admin_notify.notify_first_charge(message.bot, db_user)
 
     await state.update_data(
         project_id=project_id,

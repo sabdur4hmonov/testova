@@ -140,6 +140,31 @@ async def charge_session_use(session, builder_session_id: uuid.UUID, user_id: uu
     return remaining
 
 
+async def register_first_charge(session, user_id: uuid.UUID) -> bool:
+    """
+    Atomically stamp first_charged_at on the user's FIRST-EVER charged use.
+    Returns True ONLY for the single call that flips NULL → now(); every later
+    call returns False. Concurrency-safe (the WHERE ... IS NULL guard means only
+    one racer can win), so the admin trial-conversion alert fires exactly once.
+
+    Call ONLY when an actual use was consumed (remaining is not None).
+    """
+    result = await session.execute(
+        text(
+            "UPDATE users SET first_charged_at = now() "
+            "WHERE id = :id AND first_charged_at IS NULL "
+            "RETURNING id"
+        ),
+        {"id": user_id},
+    )
+    row = result.first()
+    await session.commit()
+    if row is None:
+        return False
+    logger.info("first_charge_registered", user_id=str(user_id))
+    return True
+
+
 def remaining_note(remaining: int | None, unlimited: bool) -> str:
     """'📊 Qolgan: N marta' line, or empty when unlimited."""
     if unlimited or remaining is None:
