@@ -508,6 +508,11 @@ async def _process_builder_file(
 ) -> None:
     """One file through the SHARED pipeline; on success ask this file's key."""
     lang = db_user.language.value
+    # Block BEFORE the (paid) Gemini extraction when the shared generation quota
+    # is exhausted. Same shared counter as single-upload; Bepul users pass.
+    if not await quota.check_available(async_session_factory, db_user.telegram_id, quota.VARIANT):
+        await message.answer(access.limit_reached_text())
+        return
     status_msg = await message.answer(bt("processing_n", lang, i=file_index))
 
     project_id = str(uuid.uuid4())

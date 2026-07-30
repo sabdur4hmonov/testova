@@ -85,6 +85,38 @@ async def try_consume(
     return True, remaining
 
 
+async def has_quota(session, telegram_id: int, kind: str, now: datetime | None = None) -> bool:
+    """READ-ONLY: is there at least one unit of `kind` available? Does NOT
+    consume and does NOT write (an expired window reads as full, but the actual
+    reset is written only when try_consume runs). Unknown user / NULL limit =
+    unlimited. Used to block BEFORE a paid Gemini extraction."""
+    now = now or _now()
+    limit_attr, count_attr = _fields(kind)
+    res = await session.execute(select(User).where(User.telegram_id == telegram_id))
+    user = res.scalar_one_or_none()
+    if user is None:
+        return True
+    limit = getattr(user, limit_attr)
+    if limit is None:
+        return True
+    if user.period_start is None or (now - user.period_start) >= PERIOD:
+        return True  # window rolled over → effectively a fresh full allowance
+    return getattr(user, count_attr) < limit
+
+
+async def check_available(session_factory, telegram_id: int, kind: str) -> bool:
+    """Handler-facing peek used before extraction: True if a unit is available.
+    A genuine 'exhausted' returns False; an infra error FAILS OPEN (True) so a
+    hiccup never blocks a teacher. No consumption — the decrement still happens
+    later at generation via check_and_consume."""
+    try:
+        async with session_factory() as session:
+            return await has_quota(session, telegram_id, kind)
+    except Exception as e:
+        logger.warning("quota_peek_failopen", kind=kind, error=str(e))
+        return True
+
+
 async def check_and_consume(session_factory, telegram_id: int, kind: str) -> bool:
     """Handler-facing gate: open a session and consume one unit. Returns whether
     the action is ALLOWED. A genuine 'over limit' returns False (blocks); but an

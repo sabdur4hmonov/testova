@@ -787,6 +787,13 @@ async def _run_extraction(
 ) -> None:
     """Run the pipeline and drive the post-extraction prompts. Shared entry
     used after the format choice."""
+    # Generation quota is checked BEFORE the (paid) Gemini extraction — an
+    # out-of-quota teacher never triggers an extraction. The actual decrement
+    # still happens at generation. Bepul users (NULL limit) always pass here.
+    if not await quota.check_available(async_session_factory, db_user.telegram_id, quota.VARIANT):
+        await message.answer(access.limit_reached_text())
+        await state.clear()
+        return
     status_msg = await message.answer(t("analyzing", lang))
     result = await run_pipeline_with_heartbeat(
         status_msg, content, file_type, project_id, user_id=db_user.telegram_id
