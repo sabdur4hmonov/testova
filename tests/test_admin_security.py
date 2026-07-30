@@ -125,6 +125,11 @@ async def test_broadcast_commands_reject_non_admin(monkeypatch):
         await fn(m, _cmd("hammaga xabar"), u, _State())
         assert m.answers == [REFUSED], f"{cmd} did not refuse a non-admin"
 
+    # /message takes a bot param; refuse before ever touching it
+    m = _Msg()
+    await admin.cmd_message(m, _cmd("123 salom"), u, bot=object())
+    assert m.answers == [REFUSED], "/message did not refuse a non-admin"
+
 
 async def test_admin_callbacks_reject_non_admin(monkeypatch):
     _boobytrap(monkeypatch)

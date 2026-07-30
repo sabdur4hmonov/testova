@@ -493,6 +493,43 @@ async def cmd_broadcast_send(
     )
 
 
+# ── /message <id|@username> <text> — relay a message to one user ──────────────
+
+@router.message(Command("message"))
+async def cmd_message(
+    message: Message, command: CommandObject, db_user: User, bot: Bot
+) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    parts = (command.args or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Foydalanish: /message <user_id yoki @username> <matn>")
+        return
+    ident, text = parts[0], parts[1].strip()
+    if ident.lstrip("-").isdigit():
+        target = int(ident)
+    else:
+        async with async_session_factory() as session:
+            u = await admin_users.find_user(session, ident)
+        if u is None:
+            await message.answer("Bunday foydalanuvchi topilmadi.")
+            return
+        target = u.telegram_id
+
+    delivered = await broadcast.send_direct(bot, target, text)
+    async with async_session_factory() as session:
+        await broadcast.log_direct_message(session, db_user.telegram_id, target, text, delivered)
+    if delivered:
+        await message.answer(f"✅ Yuborildi: <code>{target}</code>", parse_mode="HTML")
+    else:
+        await message.answer(
+            f"⚠️ Yetkazib bo‘lmadi (foydalanuvchi botni bloklagan yoki topilmadi): "
+            f"<code>{target}</code>",
+            parse_mode="HTML",
+        )
+
+
 # ── /help_admin ───────────────────────────────────────────────────────────────
 
 @router.message(Command("help_admin"))
@@ -517,6 +554,7 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/stats</code> — umumiy statistika\n"
         "<code>/usage</code> — Gemini token xarajati (bugun / 30 kun)\n"
         "<code>/broadcast &lt;matn&gt;</code> — hammaga e’lon (tasdiq so‘raladi)\n"
-        "<code>/broadcast_active &lt;matn&gt;</code> — faqat faol foydalanuvchilarga",
+        "<code>/broadcast_active &lt;matn&gt;</code> — faqat faol foydalanuvchilarga\n"
+        "<code>/message &lt;id&gt; &lt;matn&gt;</code> — bitta foydalanuvchiga xabar",
         parse_mode="HTML",
     )

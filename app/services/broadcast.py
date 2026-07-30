@@ -20,6 +20,8 @@ logger = get_logger(__name__)
 
 # Distinct prefix so an announcement is never mistaken for a system message.
 PREFIX = "📢 Admindan e'lon:"
+# Prefix for a one-to-one admin reply (distinct from the broadcast prefix).
+DM_PREFIX = "👤 Admindan xabar:"
 
 # Rate-limit: Telegram tolerates ~30 msg/s to distinct users; stay well under.
 DEFAULT_SLEEP_BETWEEN = 0.05
@@ -74,6 +76,34 @@ async def run_broadcast(
             await asyncio.sleep(sleep_between)
     logger.info("broadcast_done", total=n, sent=sent, failed=failed)
     return sent, failed
+
+
+async def send_direct(bot, telegram_id: int, text: str) -> bool:
+    """Relay ONE admin message to a single user's chat (by telegram_id — works
+    without a username). Returns True if delivered, False if the user blocked the
+    bot / the chat is unreachable. Never raises."""
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+    try:
+        await bot.send_message(telegram_id, f"{DM_PREFIX}\n\n{text}")
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False  # blocked / chat not found → report, don't crash
+    except Exception as e:
+        logger.warning("direct_message_failed", chat_id=telegram_id, error=str(e))
+        return False
+
+
+async def log_direct_message(
+    session, admin_id: int, target_id: int, content: str, delivered: bool
+) -> None:
+    """Audit one /message relay in admin_log."""
+    session.add(AdminLog(
+        admin_id=admin_id,
+        action="message",
+        target=target_id,
+        params={"content": content[:1000], "delivered": delivered},
+    ))
+    await session.commit()
 
 
 async def log_broadcast(
