@@ -508,19 +508,34 @@ def _needs_scheme(q: dict) -> bool:
 
 
 def _desc_redundant(stem: str | None, desc: str | None) -> bool:
-    """ISSUE 4(a): the stem carries the full chain ("→" present) and >=90%
-    of the description's formula/entity tokens already appear in the stem —
-    the [Rasm] box would only restate the chain."""
+    """ISSUE 4(a): the stem carries the full chain ("→" present) and the
+    description would only restate content the stem already shows — the [Rasm]
+    box would be pure redundancy. Two independent redundancy signals, OR'd so
+    that adding the second can never keep a description the first would drop:
+
+    (1) formula/entity redundancy (chemistry chains): >=90% of the
+        description's formula/entity tokens already appear in the stem.
+    (2) number-mapping redundancy (arrow "figures" that are really typed
+        numbers with →, e.g. "3 → 8  7 → 48  2 → 3  6 → ?"): every number in
+        the description is already one of the stem's number tokens. These
+        never carry a chemical formula, so signal (1) finds no tokens and
+        misses them, which left the [Rasm] box restating the mapping.
+    """
     stem = stem or ""
     if not desc or "→" not in stem:
         return False
     tokens = set(FORMULA_RE.findall(desc)) | set(
         re.findall(r'\b[XYZ][₀-₉0-9]?\b', desc)
     )
-    if not tokens:
-        return False
-    hit = sum(1 for t in tokens if t in stem)
-    return hit / len(tokens) >= 0.9
+    if tokens and sum(1 for t in tokens if t in stem) / len(tokens) >= 0.9:
+        return True
+    # Exact number-token membership (not substring) so a desc "3" never matches
+    # inside a stem "2003"; >=2 numbers so a lone incidental digit can't trigger.
+    stem_nums = set(re.findall(r'\d+', stem))
+    desc_nums = set(re.findall(r'\d+', desc))
+    if len(desc_nums) >= 2 and desc_nums <= stem_nums:
+        return True
+    return False
 
 
 def _has_scheme_content(q: dict) -> bool:

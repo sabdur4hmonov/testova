@@ -118,6 +118,32 @@ def test_novel_desc_kept():
     assert _desc_redundant(stem, "Scheme with CuSO4 and KOH") is False
 
 
+def test_number_mapping_desc_redundant():
+    # FIX 1: an arrow "figure" that is really typed numbers with → — the stem
+    # already carries the whole mapping inline, so its restating description
+    # ("3 maps to 8 …") is pure redundancy and must be dropped (no [Rasm] box).
+    # Real Q12 of project 64ad06c6.
+    stem = "Quyidagi “?” o'rnidagi sonni toping:\n3 → 8\n7 → 48\n2 → 3\n6 →"
+    desc = ("A sequence of number mappings: 3 maps to 8, 7 maps to 48, "
+            "2 maps to 3, and 6 maps to a question mark.")
+    assert _desc_redundant(stem, desc) is True
+
+
+def test_number_mapping_desc_with_novel_number_kept():
+    # A description that introduces a number NOT in the stem is NOT pure
+    # redundancy — it carries content the stem doesn't, so keep it.
+    stem = "Ketma-ketlik: 3 → 8  7 → 48"
+    assert _desc_redundant(stem, "3 maps to 8, 7 maps to 48, and 9 maps to 99") is False
+
+
+def test_number_mapping_requires_arrow_stem():
+    # No arrow in the stem → the number-mapping branch must not fire (a geometry
+    # figure whose description mentions "4 cm" while the stem says "4" must keep
+    # its description).
+    stem = "Bo'yalgan soha yuzini toping. Radius 4 va 8."
+    assert _desc_redundant(stem, "A circle of radius 4 and 8 cm.") is False
+
+
 # ── ISSUE 4(d): inline options stripped from stem ────────────────────────────
 
 def test_inline_options_stripped():
