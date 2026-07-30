@@ -89,7 +89,54 @@ async def test_check_limit_blocks_but_variant_still_works():
         async with sm() as s:
             assert await quota.try_consume(s, tg, quota.VARIANT) == (True, None)  # unlimited
     finally:
+        from app.models.admin_log import AdminLog
         async with sm() as s:
+            await s.execute(delete(AdminLog).where(AdminLog.target == tg))
+            await s.execute(delete(User).where(User.telegram_id == tg))
+            await s.commit()
+        await engine.dispose()
+
+
+async def test_cmd_setchecklimit_handler_persists(monkeypatch):
+    """Regression for the /setchecklimit report: the REAL handler persists the
+    check limit and shows it (proven end to end, not just the service fn)."""
+    from types import SimpleNamespace
+    from aiogram.filters import CommandObject
+    from sqlalchemy import delete, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.models.admin_log import AdminLog
+    from app.models.user import User
+    from app.bot.handlers import admin
+
+    engine = await _engine()
+    if engine is None:
+        pytest.skip("Postgres not available")
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    # Point the handler at this test's disposable engine (not the shared app
+    # pool) so no asyncpg connection outlives the function-scoped event loop.
+    monkeypatch.setattr(admin, "async_session_factory", sm)
+    tg = int(uuid.uuid4().int % 10**11)
+    admin_user = SimpleNamespace(is_admin=True, telegram_id=8206475760)
+
+    class _Msg:
+        def __init__(self):
+            self.answers = []
+        async def answer(self, text, **k):
+            self.answers.append(text)
+
+    try:
+        m = _Msg()
+        await admin.cmd_setchecklimit(
+            m, CommandObject(command="setchecklimit", args=f"{tg} 7"), admin_user
+        )
+        assert "0/7" in m.answers[0]                 # display shows check limit 7
+        async with sm() as s:
+            row = (await s.execute(select(User).where(User.telegram_id == tg))).scalar_one()
+            assert row.monthly_check_limit == 7      # persisted
+            assert row.monthly_variant_limit is None  # untouched
+    finally:
+        async with sm() as s:
+            await s.execute(delete(AdminLog).where(AdminLog.target == tg))
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
         await engine.dispose()

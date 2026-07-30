@@ -170,7 +170,12 @@ async def search_users(
     """Case-insensitive PARTIAL search over username OR full_name. Returns one
     page of matches (most-recently-active first) plus the total match count."""
     page = max(1, page)
-    pattern = f"%{(query or '').strip()}%"
+    # Strip a leading "@" so "/find @s_abdur4" matches the stored username
+    # "s_abdur4hmonov" (usernames are stored without the @).
+    q = (query or "").strip().lstrip("@").strip()
+    if not q:
+        return [], 0
+    pattern = f"%{q}%"
     cond = User.username.ilike(pattern) | User.full_name.ilike(pattern)
     total = (await session.execute(
         select(func.count()).select_from(User).where(cond)

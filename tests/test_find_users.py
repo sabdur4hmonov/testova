@@ -55,6 +55,12 @@ async def test_search_matches_partial_username_and_name():
             # no match
             users, total = await admin_users.search_users(s, f"zzz_{tag}")
             assert users == [] and total == 0
+            # LEADING "@" must be stripped: "@teacher_<tag>" still finds user a
+            users, total = await admin_users.search_users(s, f"@teacher_{tag}")
+            assert [u.telegram_id for u in users] == [a] and total == 1
+            # a bare "@" matches nobody (not everybody)
+            users, total = await admin_users.search_users(s, "@")
+            assert users == [] and total == 0
     finally:
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id.in_([a, b, c])))

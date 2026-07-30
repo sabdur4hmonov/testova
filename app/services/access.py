@@ -176,3 +176,37 @@ def remaining_note(remaining: int | None, unlimited: bool) -> str:
     if unlimited or remaining is None:
         return ""
     return f"\n📊 Qolgan: {remaining} marta"
+
+
+# ── Charge + first-charge admin notification (one place, both flows) ──────────
+# The notify happens HERE, right after the charge — NOT after a later
+# user-facing message send. Previously the notify sat after `message.answer(the
+# remaining-note)`, so if that send hiccuped the admin alert was skipped even
+# though the use was already charged. Centralising it removes that ordering trap
+# and makes the path unit-testable end to end.
+
+async def charge_single_and_notify(bot, db_user) -> int | None:
+    """Consume ONE use for a single-file upload and, if it was this user's
+    first-ever charged use, notify admins. Returns remaining uses."""
+    from app.database import async_session_factory
+    from app.services import admin_notify
+    async with async_session_factory() as s:
+        remaining = await decrement_use(s, db_user.id)
+        first = remaining is not None and await register_first_charge(s, db_user.id)
+    if first:
+        await admin_notify.notify_first_charge(bot, db_user)
+    return remaining
+
+
+async def charge_session_and_notify(bot, db_user, builder_session_id: str) -> int | None:
+    """Charge ONE use for a builder session (first source) and, if it was this
+    user's first-ever charged use, notify admins. Returns remaining uses (or None
+    if this call didn't charge)."""
+    from app.database import async_session_factory
+    from app.services import admin_notify
+    async with async_session_factory() as s:
+        remaining = await charge_session_use(s, uuid.UUID(builder_session_id), db_user.id)
+        first = remaining is not None and await register_first_charge(s, db_user.id)
+    if first:
+        await admin_notify.notify_first_charge(bot, db_user)
+    return remaining

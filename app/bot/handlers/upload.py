@@ -33,7 +33,7 @@ from app.models.project import Project, ProjectStatus
 from app.models.question import Question
 from app.models.user import User
 from app.models.variant import Variant
-from app.services import access, admin_notify, quota, storage
+from app.services import access, quota, storage
 from app.services.answer_key_parser import parse_answer_key, _to_colon_written
 from app.services.option_letters import (
     OPTION_LETTER_CLASS, canonical_letter,
@@ -838,20 +838,13 @@ async def _run_extraction(
     )
 
     # ── Access: ONE use per successful single-file upload (success only) ──────
+    # Charge + first-charge admin alert happen together in the service (the
+    # alert fires BEFORE the note below, so a note-send hiccup can't skip it).
     if not access.is_unlimited(db_user):
-        async with async_session_factory() as s:
-            remaining = await access.decrement_use(s, db_user.id)
-            # First-ever charged use → alert admins once (only if a use was
-            # actually consumed). Never breaks the teacher's flow.
-            first_charge = (
-                remaining is not None
-                and await access.register_first_charge(s, db_user.id)
-            )
+        remaining = await access.charge_single_and_notify(message.bot, db_user)
         note = access.remaining_note(remaining, unlimited=False)
         if note:
             await message.answer(note.strip())
-        if first_charge:
-            await admin_notify.notify_first_charge(message.bot, db_user)
 
 
 @router.callback_query(F.data == "reextract")

@@ -14,10 +14,12 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-async def notify_first_charge(bot, user) -> None:
+async def notify_first_charge(bot, user) -> int:
     """Tell every admin that `user` just consumed their first-ever charged use,
     with a ready-to-use /message hint. Plain text (send_text has no parse_mode).
-    Never raises."""
+    Never raises. Returns how many admins were reached — and logs at ERROR if
+    that is ZERO (a swallowed send failure must be VISIBLE, not silent)."""
+    delivered = 0
     try:
         who = f"@{user.username}" if user.username else (user.full_name or "—")
         text = (
@@ -26,7 +28,21 @@ async def notify_first_charge(bot, user) -> None:
             f"🆔 {user.telegram_id}\n"
             f"✍️ Javob berish: /message {user.telegram_id} <matn>"
         )
-        for admin_id in settings.ADMIN_IDS:
-            await send_text(bot, admin_id, text)
+        admins = list(settings.ADMIN_IDS)
+        for admin_id in admins:
+            if await send_text(bot, admin_id, text):
+                delivered += 1
+        if delivered:
+            logger.info(
+                "first_charge_notified",
+                telegram_id=user.telegram_id, delivered=delivered,
+            )
+        else:
+            # Reached NO admin — surface it loudly instead of failing silently.
+            logger.error(
+                "first_charge_notify_delivered_to_none",
+                telegram_id=user.telegram_id, admin_count=len(admins),
+            )
     except Exception as e:  # a notification must never break the main flow
-        logger.warning("first_charge_notify_failed", error=str(e))
+        logger.error("first_charge_notify_failed", error=str(e))
+    return delivered
