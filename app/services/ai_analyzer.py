@@ -975,6 +975,88 @@ def _strip_inline_options(q: dict) -> None:
         logger.info("inline_options_stripped", question=q.get("question_number"))
 
 
+# ── FIX 3: strip source author/channel credits + watermark names ─────────────
+# A teacher uploading someone else's test must not publish that author's name or
+# channel. The source carries them as (a) an author-credit line "Tuzuvchi: NAME
+# ...  Telegram kanalimiz:@handle", and (b) a diagonal watermark of the same
+# name. Gemini's prompt rule 13 omits them non-deterministically; this makes the
+# removal DETERMINISTIC. All three regexes are proven on the real credit line.
+
+# Author label followed by a COLON, to end of line — removes the name AND the
+# channel that trails it on the same line. Colon required so prose like
+# "asarning muallifi kim?" (no colon after "muallif") is never touched.
+_CREDIT_LABEL_RE = re.compile(
+    r'(?im)[ \t]*(?:tuzuvchi|muallif|mualif|author|составител\w*)\s*[:：].*?$'
+)
+# A whole line that is a Telegram-channel promo (both "telegram" and "kanal").
+_CHANNEL_LINE_RE = re.compile(r'(?im)^.*\btelegram\b[^\n]*\bkanal\w*[^\n]*$')
+# A bare @handle (>=3 chars, so an email fragment like "a@b" is never matched).
+_HANDLE_RE = re.compile(r'@[_a-zA-Z0-9]{3,}')
+# Unicode letter that is NOT a digit or underscore — used as a name-token
+# boundary so a watermark "Muxammadzoir_Biloliddinov" (underscore-joined,
+# order reversed) still strips, while a subscript "x_1" never does.
+_LETTER = r'[^\W\d_]'
+# Name after the colon: 1-4 letter-words, stopping before the channel/handle.
+_NAME_HARVEST_RE = re.compile(
+    r'(?im)(?:tuzuvchi|muallif|mualif|author)\s*[:：]\s*'
+    r'(?P<name>' + _LETTER + r'(?:' + _LETTER + r'|[ ʻ’\'`])*?)'
+    r'(?=\s*(?:telegram|kanal|@|\d)|\s{3,}|\r?\n|$)'
+)
+
+
+def harvest_credit_name_tokens(questions: list[dict]) -> set[str]:
+    """Collect distinctive personal-name tokens (>=4 letters) from every
+    "Tuzuvchi:/Muallif: NAME" credit line across the whole extraction, so the
+    SAME name can be removed where it appears as a diagonal watermark on a
+    question that carries no credit line of its own."""
+    tokens: set[str] = set()
+    for q in questions:
+        for field in (q.get("question_text"), q.get("image_description")):
+            for m in _NAME_HARVEST_RE.finditer(field or ""):
+                name = re.sub(r"\s+", " ", m.group("name")).strip()
+                if 1 <= len(name.split()) <= 4:
+                    tokens.update(w for w in name.split() if len(w) >= 4)
+    return tokens
+
+
+def strip_source_credits(text: str | None, name_tokens: set[str] = frozenset()) -> str:
+    """Remove author-credit lines, Telegram-channel promos, @handles and
+    watermark name tokens. A label→EOL strip keeps any real question text that
+    precedes the credit on the same line; name tokens are removed only on a
+    non-letter boundary so math subscripts (x_1) survive."""
+    if not text:
+        return text or ""
+    text = _CREDIT_LABEL_RE.sub("", text)
+    text = _CHANNEL_LINE_RE.sub("", text)
+    text = _HANDLE_RE.sub("", text)
+    for tok in name_tokens:
+        text = re.sub(
+            r"(?i)(?<!" + _LETTER + r")" + re.escape(tok) + r"(?!" + _LETTER + r")",
+            "", text,
+        )
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"(?m)^[ \t_]+$", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip(" _\n\t")
+
+
+def strip_credits_from_questions(questions: list[dict]) -> None:
+    """In-place: harvest author names once, then strip credits/watermark from
+    every question's text and description. A description reduced to nothing is
+    nulled so no empty [Rasm] box prints."""
+    tokens = harvest_credit_name_tokens(questions)
+    for q in questions:
+        before = q.get("question_text") or ""
+        stripped = strip_source_credits(before, tokens)
+        if stripped != before:
+            q["question_text"] = stripped
+            logger.info("source_credit_stripped", question=q.get("question_number"))
+        if q.get("image_description"):
+            q["image_description"] = strip_source_credits(
+                q["image_description"], tokens
+            ) or None
+
+
 # ── Unanswerable-question detection (ISSUE 2) ────────────────────────────────
 
 _ASK_VERBS = ("toping", "aniqlang", "hisoblang", "qaysi")
@@ -1308,6 +1390,11 @@ class AIAnalyzer:
             _strip_leading_backticks(q)
             _strip_inline_options(q)
             q["question_text"] = canonicalize_chain_text(q.get("question_text"))
+
+        # FIX 3: strip the source's author/channel credits and watermark name so
+        # the teacher never republishes another author's identity. Global pass
+        # (needs every question to harvest the name once, then strip everywhere).
+        strip_credits_from_questions(unique)
 
         unique.sort(key=lambda x: (x.get("section", 1), x.get("question_number", 0)))
         logger.info("extraction_done", total=len(unique), pages=len(images))
