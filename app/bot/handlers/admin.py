@@ -49,8 +49,10 @@ def _fmt_user(u: User) -> str:
     else:
         date_s = f"tugagan ({u.access_until:%Y-%m-%d})"
     uses_s = "cheksiz" if u.uses_left is None else str(u.uses_left)
+    handle = f"@{u.username}" if u.username else "yo‘q"
     return (
         f"👤 <code>{u.telegram_id}</code> {u.full_name}\n"
+        f"🔗 Username: {handle}\n"
         f"📝 Izoh: {u.note or '—'}\n"
         f"📅 Muddat: {date_s}\n"
         f"🔢 Ishlatish: {uses_s}\n"
@@ -258,7 +260,10 @@ async def cmd_users(message: Message, command: CommandObject, db_user: User) -> 
     for u in users:
         mark = "⛔" if u.is_blocked else "✅"
         uses_s = "∞" if u.uses_left is None else str(u.uses_left)
-        lines.append(f"{mark} <code>{u.telegram_id}</code> {u.full_name[:20]} · {uses_s}")
+        handle = f"@{u.username}" if u.username else "—"
+        lines.append(
+            f"{mark} <code>{u.telegram_id}</code> {handle} {u.full_name[:18]} · {uses_s}"
+        )
     pages = (total + per - 1) // per
     await message.answer(
         f"👥 Foydalanuvchilar ({max(1, page)}/{pages}, jami {total}):\n" + "\n".join(lines),
@@ -381,8 +386,14 @@ async def _start_broadcast(
 
 
 @router.callback_query(BroadcastStates.confirming, F.data == "adm:bc:no")
-async def cmd_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+async def cmd_broadcast_cancel(
+    callback: CallbackQuery, state: FSMContext, db_user: User
+) -> None:
     await callback.answer()
+    if not _is_admin(db_user):  # uniform boundary — callbacks aren't gated upstream
+        await state.clear()
+        await callback.message.edit_text(REFUSED)
+        return
     await state.clear()
     await callback.message.edit_text("❌ Bekor qilindi. Xabar yuborilmadi.")
 

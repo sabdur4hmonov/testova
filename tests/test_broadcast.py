@@ -167,7 +167,7 @@ async def test_broadcast_confirm_noq_cancels(monkeypatch):
 
     cb = _CB("adm:bc:no")
     state = _FakeState({"bc_text": "x", "bc_scope": "all"})
-    await admin.cmd_broadcast_cancel(cb, state)
+    await admin.cmd_broadcast_cancel(cb, state, _admin())
     assert any("Bekor" in e for e in cb.message.edits)
     assert state.state is None
 
