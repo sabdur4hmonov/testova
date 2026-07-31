@@ -208,23 +208,25 @@ def reextract_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
 
 
 def check_project_keyboard(projects, lang: str = "uz") -> InlineKeyboardMarkup:
-    """List the teacher's own projects to pick which test to grade against."""
+    """List the teacher's own projects to pick which test to grade against. Each
+    row also has a 🗑 delete button (reusing the project_delete confirm flow), so
+    project deletion lives here now that 'Mening loyihalarim' is gone."""
     builder = InlineKeyboardBuilder()
+    projects = list(projects)
     for p in projects:
         # Teacher-given display_name wins; fall back to the auto name for
         # projects created before naming existed.
         label = getattr(p, "display_name", None) or p.name
-        builder.button(
-            text=f"📄 {label}",
-            callback_data=f"check_project:{p.id}",
-        )
+        builder.button(text=f"📄 {label}", callback_data=f"check_project:{p.id}")
+        builder.button(text="🗑", callback_data=f"project_delete:{p.id}")
     cancel = {
         "uz": "❌ Bekor qilish",
         "en": "❌ Cancel",
         "ru": "❌ Отмена",
     }.get(lang, "❌ Cancel")
     builder.button(text=cancel, callback_data="cancel")
-    builder.adjust(1)
+    # each project row = [📄 grade] [🗑 delete]; the cancel button on its own row
+    builder.adjust(*([2] * len(projects)), 1)
     return builder.as_markup()
 
 
