@@ -421,7 +421,7 @@ async def handle_answer_sheet_upload(
 
     # ── Monthly check quota (independent of the variant quota / uses_left) ────
     if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.CHECK):
-        await message.answer(access.limit_reached_text())
+        await message.answer(access.limit_reached_text(db_user.language.value))
         return
 
     # Download image
@@ -1069,7 +1069,7 @@ async def handle_manual_sheet(
 
     # ── Monthly check quota (independent of the variant quota / uses_left) ────
     if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.CHECK):
-        await message.answer(access.limit_reached_text())
+        await message.answer(access.limit_reached_text(db_user.language.value))
         return
 
     if message.photo:

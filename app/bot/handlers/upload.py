@@ -791,7 +791,7 @@ async def _run_extraction(
     # out-of-quota teacher never triggers an extraction. The actual decrement
     # still happens at generation. Bepul users (NULL limit) always pass here.
     if not await quota.check_available(async_session_factory, db_user.telegram_id, quota.VARIANT):
-        await message.answer(access.limit_reached_text())
+        await message.answer(access.limit_reached_text(db_user.language.value))
         await state.clear()
         return
     status_msg = await message.answer(t("analyzing", lang))
@@ -1259,7 +1259,7 @@ async def _generate_and_send(
 
     # ── Monthly variant quota (independent of uses_left) ─────────────────────
     if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.VARIANT):
-        await status.edit_text(access.limit_reached_text())
+        await status.edit_text(access.limit_reached_text(db_user.language.value))
         await state.clear()
         return
 

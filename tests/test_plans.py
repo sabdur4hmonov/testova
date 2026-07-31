@@ -122,7 +122,8 @@ async def test_cmd_plan_reflected_and_invalid_guarded(monkeypatch):
     sm = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(admin, "async_session_factory", sm)
     tg = int(uuid.uuid4().int % 10**11)
-    admin_user = SimpleNamespace(is_admin=True, telegram_id=8206475760)
+    admin_user = SimpleNamespace(is_admin=True, telegram_id=8206475760,
+                                 language=SimpleNamespace(value="uz"))
 
     class _Msg:
         def __init__(self):

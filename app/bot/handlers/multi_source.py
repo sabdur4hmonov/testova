@@ -511,7 +511,7 @@ async def _process_builder_file(
     # Block BEFORE the (paid) Gemini extraction when the shared generation quota
     # is exhausted. Same shared counter as single-upload; Bepul users pass.
     if not await quota.check_available(async_session_factory, db_user.telegram_id, quota.VARIANT):
-        await message.answer(access.limit_reached_text())
+        await message.answer(access.limit_reached_text(db_user.language.value))
         return
     status_msg = await message.answer(bt("processing_n", lang, i=file_index))
 
@@ -1034,7 +1034,7 @@ async def _do_generate(
 ) -> None:
     # ── Monthly variant quota (independent of uses_left) ─────────────────────
     if not await quota.check_and_consume(async_session_factory, db_user.telegram_id, quota.VARIANT):
-        await status.edit_text(access.limit_reached_text())
+        await status.edit_text(access.limit_reached_text(db_user.language.value))
         await state.clear()
         return
 

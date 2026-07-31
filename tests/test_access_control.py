@@ -21,6 +21,7 @@ PAST = NOW - timedelta(days=1)
 
 
 def _user(**kw):
+    from app.models.user import Language
     u = User(
         telegram_id=kw.get("telegram_id", 1),
         username="t", full_name="Teacher",
@@ -29,6 +30,7 @@ def _user(**kw):
     u.is_blocked = kw.get("is_blocked", False)
     u.access_until = kw.get("access_until", FUTURE)
     u.uses_left = kw.get("uses_left", 1)
+    u.language = kw.get("language", Language.UZ)  # unsaved instance: set explicitly
     return u
 
 

@@ -180,8 +180,13 @@ async def cmd_plan(message: Message, command: CommandObject, db_user: User) -> N
         return
     async with async_session_factory() as session:
         user = await admin_users.set_plan(session, db_user.telegram_id, tg_id, parts[1])
-        text = _fmt_user(user)
-    await message.answer(f"✅ Tarif berildi:\n{text}", parse_mode="HTML")
+        text = _fmt_user(user)  # admin data view stays Uzbek (admin-only)
+    wrapper = {
+        "uz": "✅ Tarif berildi:",
+        "en": "✅ Plan assigned:",
+        "ru": "✅ Тариф назначен:",
+    }.get(db_user.language.value, "✅ Tarif berildi:")
+    await message.answer(f"{wrapper}\n{text}", parse_mode="HTML")
 
 
 # ── /setvariantlimit, /setchecklimit ──────────────────────────────────────────

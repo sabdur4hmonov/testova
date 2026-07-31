@@ -65,29 +65,43 @@ async def handle_language_selection(
     await state.clear()
 
 
+_TARIFLAR = {
+    "uz": {"title": "Tariflar", "admin": "♾ Admin — cheksiz.", "month": "oy",
+           "gen": "ta test yaratish", "chk": "ta rasm tekshirish",
+           "manual": "To'lov qo'lda amalga oshiriladi — admin bilan bog'laning."},
+    "en": {"title": "Pricing", "admin": "♾ Admin — unlimited.", "month": "month",
+           "gen": "test generations", "chk": "sheet checks",
+           "manual": "Payment is manual — contact the admin."},
+    "ru": {"title": "Тарифы", "admin": "♾ Админ — без ограничений.", "month": "мес",
+           "gen": "генераций тестов", "chk": "проверок листов",
+           "manual": "Оплата вручную — свяжитесь с админом."},
+}
+
+
 @router.message(F.text.in_({v["pricing"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_pricing(message: Message, db_user: User) -> None:
     from app.bot.keyboards.inline import pricing_keyboard
     from app.services import account, plans
 
     lang = db_user.language.value
+    tr = _TARIFLAR.get(lang, _TARIFLAR["uz"])
     if db_user.is_admin:
-        current = "♾ Admin — cheksiz."
+        current = tr["admin"]
     else:
-        current = "\n".join(account.summary_lines(db_user))
+        current = "\n".join(account.summary_lines(db_user, lang))
 
     s, p = plans.STANDART, plans.PRO
     text = (
-        "💎 <b>Tariflar</b>\n\n"
+        f"💎 <b>{tr['title']}</b>\n\n"
         f"{current}\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"📘 <b>{s.name} — {s.price_som:,} so'm/oy</b>\n"
-        f"   • {s.variant_limit} ta test yaratish\n"
-        f"   • {s.check_limit} ta rasm tekshirish\n\n"
-        f"💎 <b>{p.name} — {p.price_som:,} so'm/oy</b>\n"
-        f"   • {p.variant_limit} ta test yaratish\n"
-        f"   • {p.check_limit} ta rasm tekshirish\n\n"
-        "💳 To'lov qo'lda amalga oshiriladi — admin bilan bog'laning."
+        f"📘 <b>{s.name} — {s.price_som:,} so'm/{tr['month']}</b>\n"
+        f"   • {s.variant_limit} {tr['gen']}\n"
+        f"   • {s.check_limit} {tr['chk']}\n\n"
+        f"💎 <b>{p.name} — {p.price_som:,} so'm/{tr['month']}</b>\n"
+        f"   • {p.variant_limit} {tr['gen']}\n"
+        f"   • {p.check_limit} {tr['chk']}\n\n"
+        f"💳 {tr['manual']}"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=pricing_keyboard(lang))
 

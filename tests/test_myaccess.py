@@ -18,6 +18,7 @@ def _u(**over):
         monthly_variant_limit=None, variant_count_this_period=0,
         monthly_check_limit=None, check_count_this_period=0,
         period_start=None, access_until=now + timedelta(days=20), uses_left=1,
+        language=SimpleNamespace(value="uz"),
     )
     d.update(over)
     return SimpleNamespace(**d)

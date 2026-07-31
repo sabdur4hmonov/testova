@@ -98,12 +98,18 @@ def _myaccess_text(user: User) -> str:
     never gated). Shows plan + live remaining quotas + renewal date + price."""
     from app.services import account
 
+    lang = user.language.value
     if user.is_admin:
         return "♾ Sizda cheklovsiz kirish (admin)."
     now = datetime.now(timezone.utc)
     if user.is_blocked or (user.access_until is not None and user.access_until <= now):
-        return access.blocked_text()
-    return "📊 <b>Mening hisobim</b>\n\n" + "\n".join(account.summary_lines(user, now))
+        return access.blocked_text(lang)
+    header = {
+        "uz": "📊 <b>Mening hisobim</b>",
+        "en": "📊 <b>My account</b>",
+        "ru": "📊 <b>Мой аккаунт</b>",
+    }.get(lang, "📊 <b>Mening hisobim</b>")
+    return header + "\n\n" + "\n".join(account.summary_lines(user, lang, now))
 
 
 @router.message(Command("myaccess"))

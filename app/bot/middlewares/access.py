@@ -93,7 +93,7 @@ class AccessMiddleware(BaseMiddleware):
             logger.info(
                 "access_denied", telegram_id=user.telegram_id, action=text[:24],
             )
-            await event.answer(access.blocked_text())
+            await event.answer(access.blocked_text(user.language.value))
             return  # stop — handler not called
 
         return await handler(event, data)

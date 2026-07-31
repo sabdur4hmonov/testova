@@ -67,20 +67,24 @@ def apply_trial(user: User) -> None:
     user.uses_left = settings.TRIAL_USES
 
 
-def limit_reached_text() -> str:
+_LIMIT_TEXT = {
+    "uz": "⛔ Sizning limitingiz tugadi.\nDavom etish uchun admin bilan bog'laning: @{h}",
+    "en": "⛔ You've reached your limit.\nContact the admin to continue: @{h}",
+    "ru": "⛔ Вы достигли лимита.\nСвяжитесь с админом, чтобы продолжить: @{h}",
+}
+
+
+def limit_reached_text(lang: str = "uz") -> str:
     """ONE consistent 'you hit a limit, contact the admin' message, used for
     EVERY limit type (trial uses, monthly variant limit, monthly check limit)."""
-    return (
-        "⛔ Sizning limitingiz tugadi.\n"
-        f"Davom etish uchun admin bilan bog'laning: @{settings.ADMIN_USERNAME}"
-    )
+    return _LIMIT_TEXT.get(lang, _LIMIT_TEXT["uz"]).format(h=settings.ADMIN_USERNAME)
 
 
-def blocked_text() -> str:
+def blocked_text(lang: str = "uz") -> str:
     """Access-denied message shown by the middleware (blocked / expired / out of
-    uses). Routed through the single limit-reached text so EVERY limit type —
-    trial uses, monthly variant limit, monthly check limit — reads identically."""
-    return limit_reached_text()
+    uses). Routed through the single limit-reached text so EVERY limit type reads
+    identically, in the user's language."""
+    return limit_reached_text(lang)
 
 
 # ── Atomic use accounting ────────────────────────────────────────────────────

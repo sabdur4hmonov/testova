@@ -38,6 +38,7 @@ async def test_myaccess_button_renders_summary():
         monthly_variant_limit=25, variant_count_this_period=5,
         monthly_check_limit=500, check_count_this_period=0,
         period_start=now, access_until=now + timedelta(days=30), uses_left=None,
+        language=SimpleNamespace(value="uz"),
     )
 
     class _Msg:
