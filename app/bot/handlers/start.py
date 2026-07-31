@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
-from app.bot.keyboards.main_menu import main_menu
+from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, main_menu
 from app.config import settings
 from app.models.user import User
 from app.services import access
@@ -108,4 +108,11 @@ def _myaccess_text(user: User) -> str:
 
 @router.message(Command("myaccess"))
 async def cmd_myaccess(message: Message, db_user: User) -> None:
+    await message.answer(_myaccess_text(db_user), parse_mode="HTML")
+
+
+@router.message(F.text.in_({v["myaccess"] for v in MAIN_MENU_TEXTS.values()}))
+async def handle_myaccess_button(message: Message, db_user: User) -> None:
+    """💎 Hisobim / My access menu button — same summary as /myaccess. Never
+    gated (the access middleware only gates the upload/check/multi buttons)."""
     await message.answer(_myaccess_text(db_user), parse_mode="HTML")

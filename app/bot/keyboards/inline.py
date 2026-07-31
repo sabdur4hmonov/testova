@@ -28,14 +28,6 @@ def variant_count_keyboard(project_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def project_actions_keyboard(project_id: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Variantlar yaratish", callback_data=f"project_variants:{project_id}")
-    builder.button(text="🗑 O'chirish", callback_data=f"project_delete:{project_id}")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
 def _two_button_kb(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for text, cb in pairs:
