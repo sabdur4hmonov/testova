@@ -94,18 +94,16 @@ async def cmd_help(message: Message, db_user: User) -> None:
 
 
 def _myaccess_text(user: User) -> str:
-    """Access summary for /myaccess (always reachable, never gated)."""
+    """Access summary for /myaccess and the 'My access' button (always reachable,
+    never gated). Shows plan + live remaining quotas + renewal date + price."""
+    from app.services import account
+
     if user.is_admin:
         return "♾ Sizda cheklovsiz kirish (admin)."
     now = datetime.now(timezone.utc)
     if user.is_blocked or (user.access_until is not None and user.access_until <= now):
         return access.blocked_text()
-
-    days = "cheksiz" if user.access_until is None else f"{max(0, (user.access_until - now).days)} kun"
-    uses = "cheksiz" if user.uses_left is None else f"{user.uses_left} ta"
-    if user.access_until is None and user.uses_left is None:
-        return "♾ Sizda cheklovsiz kirish."
-    return f"📊 Sizda {days} va {uses} ishlatish qoldi."
+    return "📊 <b>Mening hisobim</b>\n\n" + "\n".join(account.summary_lines(user, now))
 
 
 @router.message(Command("myaccess"))

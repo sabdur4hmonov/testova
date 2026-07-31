@@ -531,7 +531,7 @@ def test_1_fresh_user_full_cycle_then_blocked():
 def test_myaccess_text_variants():
     from app.bot.handlers.start import _myaccess_text
     assert "cheklovsiz" in _myaccess_text(_user(is_admin=True)).lower()
-    assert "qoldi" in _myaccess_text(_user(uses_left=3, access_until=FUTURE))
+    assert "qolgan" in _myaccess_text(_user(uses_left=3, access_until=FUTURE))
     assert "⛔" in _myaccess_text(_user(access_until=PAST))
     assert "⛔" in _myaccess_text(_user(is_blocked=True))
 
