@@ -364,9 +364,13 @@ def confirm_keyboard(action: str, lang: str = "uz") -> InlineKeyboardMarkup:
 
 
 def pricing_keyboard(lang: str = "uz") -> InlineKeyboardMarkup:
+    """ONE working button that opens the admin's chat (payment is manual). No
+    per-plan purchase buttons — those callbacks never existed."""
+    from app.config import settings
     builder = InlineKeyboardBuilder()
-    builder.button(text="💎 Pro — 29,000 so'm/oy", callback_data="buy:pro")
-    builder.button(text="🏫 Center — 99,000 so'm/oy", callback_data="buy:center")
-    builder.button(text="💬 Admin bilan bog'lanish", callback_data="contact_admin")
+    builder.button(
+        text="💬 Admin bilan bog'lanish",
+        url=f"https://t.me/{settings.ADMIN_USERNAME}",
+    )
     builder.adjust(1)
     return builder.as_markup()

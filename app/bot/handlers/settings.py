@@ -68,64 +68,28 @@ async def handle_language_selection(
 @router.message(F.text.in_({v["pricing"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_pricing(message: Message, db_user: User) -> None:
     from app.bot.keyboards.inline import pricing_keyboard
-    from app.services.subscription import remaining_quota
+    from app.services import account, plans
 
     lang = db_user.language.value
-    remaining = remaining_quota(db_user)
+    if db_user.is_admin:
+        current = "♾ Admin — cheksiz."
+    else:
+        current = "\n".join(account.summary_lines(db_user))
 
-    pricing_texts = {
-        "uz": (
-            "💎 <b>Tariflar</b>\n\n"
-            f"Sizning tarifingiz: <b>{db_user.subscription_plan.value.upper()}</b>\n"
-            f"Bugungi qolgan: <b>{remaining}</b> ta\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "🆓 <b>Bepul</b>\n"
-            "   • Kuniga 3 ta loyiha\n\n"
-            "💎 <b>Pro — 29,000 so'm/oy</b>\n"
-            "   • Kuniga 50 ta loyiha\n"
-            "   • Ustuvor ishlov berish\n\n"
-            "🏫 <b>Center — 99,000 so'm/oy</b>\n"
-            "   • Kuniga 500 ta loyiha\n"
-            "   • Jamoaviy kirish\n"
-            "   • Statistika paneli\n"
-        ),
-        "en": (
-            "💎 <b>Pricing Plans</b>\n\n"
-            f"Your plan: <b>{db_user.subscription_plan.value.upper()}</b>\n"
-            f"Remaining today: <b>{remaining}</b>\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "🆓 <b>Free</b>\n"
-            "   • 3 projects/day\n\n"
-            "💎 <b>Pro — $3/month</b>\n"
-            "   • 50 projects/day\n"
-            "   • Priority processing\n\n"
-            "🏫 <b>Center — $10/month</b>\n"
-            "   • 500 projects/day\n"
-            "   • Team access\n"
-            "   • Analytics dashboard\n"
-        ),
-        "ru": (
-            "💎 <b>Тарифы</b>\n\n"
-            f"Ваш тариф: <b>{db_user.subscription_plan.value.upper()}</b>\n"
-            f"Осталось сегодня: <b>{remaining}</b>\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "🆓 <b>Бесплатно</b>\n"
-            "   • 3 проекта/день\n\n"
-            "💎 <b>Pro — 290 руб/мес</b>\n"
-            "   • 50 проектов/день\n"
-            "   • Приоритетная обработка\n\n"
-            "🏫 <b>Center — 990 руб/мес</b>\n"
-            "   • 500 проектов/день\n"
-            "   • Командный доступ\n"
-            "   • Аналитика\n"
-        ),
-    }
-
-    await message.answer(
-        pricing_texts.get(lang, pricing_texts["en"]),
-        parse_mode="HTML",
-        reply_markup=pricing_keyboard(lang),
+    s, p = plans.STANDART, plans.PRO
+    text = (
+        "💎 <b>Tariflar</b>\n\n"
+        f"{current}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📘 <b>{s.name} — {s.price_som:,} so'm/oy</b>\n"
+        f"   • {s.variant_limit} ta test yaratish\n"
+        f"   • {s.check_limit} ta rasm tekshirish\n\n"
+        f"💎 <b>{p.name} — {p.price_som:,} so'm/oy</b>\n"
+        f"   • {p.variant_limit} ta test yaratish\n"
+        f"   • {p.check_limit} ta rasm tekshirish\n\n"
+        "💳 To'lov qo'lda amalga oshiriladi — admin bilan bog'laning."
     )
+    await message.answer(text, parse_mode="HTML", reply_markup=pricing_keyboard(lang))
 
 
 @router.message(F.text.in_({v["support"] for v in MAIN_MENU_TEXTS.values()}))

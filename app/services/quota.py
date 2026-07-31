@@ -85,6 +85,19 @@ async def try_consume(
     return True, remaining
 
 
+def remaining(user, kind: str, now: datetime | None = None) -> int | None:
+    """Units of `kind` left this window for a user OBJECT (pure, no DB). None =
+    unlimited (NULL limit). An expired window reads as the full limit again."""
+    now = now or _now()
+    limit_attr, count_attr = _fields(kind)
+    limit = getattr(user, limit_attr)
+    if limit is None:
+        return None
+    if user.period_start is None or (now - user.period_start) >= PERIOD:
+        return limit
+    return max(0, limit - getattr(user, count_attr))
+
+
 async def has_quota(session, telegram_id: int, kind: str, now: datetime | None = None) -> bool:
     """READ-ONLY: is there at least one unit of `kind` available? Does NOT
     consume and does NOT write (an expired window reads as full, but the actual
