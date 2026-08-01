@@ -63,18 +63,23 @@ def _now() -> datetime:
 def summary_lines(user, lang: str = "uz", now: datetime | None = None) -> list[str]:
     now = now or _now()
     t = _L.get(lang, _L["uz"])
-    plan = plans.plan_for(user)
-    name = plan.name if plan is not None else t["free"]     # Standart/Pro brand kept
-    lines = [f"💳 {t['plan']}: <b>{name}</b>"]
+    lines = [f"💳 {t['plan']}: <b>{plans.plan_name(user)}</b>"]
 
-    if plan is not None:
+    # Per-dimension display keyed off whether the monthly limit is SET — so a
+    # topped-up paid user (uses_left=NULL but a real limit) shows their actual
+    # numbers, never a misleading "cheksiz".
+    if user.monthly_variant_limit is not None:
         vrem = quota.remaining(user, quota.VARIANT, now)
-        crem = quota.remaining(user, quota.CHECK, now)
-        lines.append(f"📦 {t['gen']}: <b>{vrem}/{plan.variant_limit}</b>")
-        lines.append(f"📝 {t['chk']}: <b>{crem}/{plan.check_limit}</b>")
+        lines.append(f"📦 {t['gen']}: <b>{vrem}/{user.monthly_variant_limit}</b>")
+    elif user.uses_left is not None:                      # Bepul trial meter
+        lines.append(f"📦 {t['gen']}: <b>{t['count'].format(n=user.uses_left)}</b>")
     else:
-        uses = t["unlim"] if user.uses_left is None else t["count"].format(n=user.uses_left)
-        lines.append(f"📦 {t['gen']}: <b>{uses}</b>")
+        lines.append(f"📦 {t['gen']}: <b>{t['unlim']}</b>")
+
+    if user.monthly_check_limit is not None:
+        crem = quota.remaining(user, quota.CHECK, now)
+        lines.append(f"📝 {t['chk']}: <b>{crem}/{user.monthly_check_limit}</b>")
+    else:
         lines.append(f"📝 {t['chk_free']}: <b>{t['unlim']}</b>")
 
     if user.access_until is not None:
@@ -83,6 +88,7 @@ def summary_lines(user, lang: str = "uz", now: datetime | None = None) -> list[s
     else:
         lines.append(f"📅 {t['valid_unlim']}")
 
+    plan = plans.plan_for(user)          # base tier → base price (bonus is same-period)
     if plan is not None:
         lines.append(f"💰 {t['price'].format(p=plan.price_som)}")
     return lines

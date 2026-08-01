@@ -224,6 +224,41 @@ async def _set_limit(message: Message, command: CommandObject, db_user: User, ki
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
 
 
+# ── /addvariant, /addcheck — top up CURRENT limit (bonus, keeps the plan) ──────
+
+@router.message(Command("addvariant"))
+async def cmd_addvariant(message: Message, command: CommandObject, db_user: User) -> None:
+    await _add_quota(message, command, db_user, kind="variant")
+
+
+@router.message(Command("addcheck"))
+async def cmd_addcheck(message: Message, command: CommandObject, db_user: User) -> None:
+    await _add_quota(message, command, db_user, kind="check")
+
+
+async def _add_quota(message: Message, command: CommandObject, db_user: User, kind: str) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    cmd = "/addvariant" if kind == "variant" else "/addcheck"
+    parts = _args(command)
+    if len(parts) < 2:
+        await message.answer(f"Foydalanish: {cmd} <user_id> <n>  (joriy limitga qo‘shadi)")
+        return
+    try:
+        tg_id, n = int(parts[0]), int(parts[1])
+    except ValueError:
+        await message.answer("Sonlar noto‘g‘ri.")
+        return
+    async with async_session_factory() as session:
+        if kind == "variant":
+            user = await admin_users.add_variant_quota(session, db_user.telegram_id, tg_id, n)
+        else:
+            user = await admin_users.add_check_quota(session, db_user.telegram_id, tg_id, n)
+        text = _fmt_user(user)
+    await message.answer(f"✅ Qo‘shildi:\n{text}", parse_mode="HTML")
+
+
 # ── /revoke (confirmation-gated) ────────────────────────────────────────────────
 
 @router.message(Command("revoke"))
@@ -583,6 +618,8 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/setuses &lt;id&gt; &lt;n&gt;</code> — ishlatish sonini o‘rnatish (-1 = cheksiz)\n"
         "<code>/setvariantlimit &lt;id&gt; &lt;n&gt;</code> — oylik variant limiti (-1 = cheksiz)\n"
         "<code>/setchecklimit &lt;id&gt; &lt;n&gt;</code> — oylik tekshirish limiti (-1 = cheksiz)\n"
+        "<code>/addvariant &lt;id&gt; &lt;n&gt;</code> — variant limitiga qo‘shish (bonus)\n"
+        "<code>/addcheck &lt;id&gt; &lt;n&gt;</code> — tekshirish limitiga qo‘shish (bonus)\n"
         "<code>/revoke &lt;id&gt;</code> — bloklash (tasdiq so‘raladi)\n"
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
         "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"

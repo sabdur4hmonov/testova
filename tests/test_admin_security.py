@@ -104,6 +104,8 @@ async def test_all_message_commands_reject_non_admin(monkeypatch):
         "/setuses": await run_with_command(admin.cmd_setuses),
         "/setvariantlimit": await run_with_command(admin.cmd_setvariantlimit),
         "/setchecklimit": await run_with_command(admin.cmd_setchecklimit),
+        "/addvariant": await run_with_command(admin.cmd_addvariant),
+        "/addcheck": await run_with_command(admin.cmd_addcheck),
         "/revoke": await run_with_command(admin.cmd_revoke),
         "/unblock": await run_with_command(admin.cmd_unblock),
         "/user": await run_with_command(admin.cmd_user),

@@ -153,6 +153,30 @@ async def set_check_limit(session, admin_id: int, tg_id: int, n: int) -> User:
     return user
 
 
+async def add_variant_quota(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Top up the CURRENT monthly variant limit by n (same-period bonus, does NOT
+    change the plan tier). NULL base = 0. Clamped at 0."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_variant_limit = max(0, (user.monthly_variant_limit or 0) + n)
+    await _write_log(session, admin_id, "addvariant", tg_id,
+                     n=n, new=user.monthly_variant_limit)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def add_check_quota(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Top up the CURRENT monthly check limit by n (same-period bonus). NULL base
+    = 0. Clamped at 0."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_check_limit = max(0, (user.monthly_check_limit or 0) + n)
+    await _write_log(session, admin_id, "addcheck", tg_id,
+                     n=n, new=user.monthly_check_limit)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def set_blocked(session, admin_id: int, tg_id: int, blocked: bool) -> User:
     """Block (revoke) or unblock a user. Logged as 'revoke' / 'unblock'."""
     user = await get_or_create(session, tg_id)

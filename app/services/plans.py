@@ -34,16 +34,44 @@ def get_plan(key: str) -> Plan | None:
     return PLANS.get((key or "").strip().lower())
 
 
+_TIERS = [STANDART, PRO]  # ascending by allowance
+
+
+def _tier_by(value: int | None, attr: str) -> Plan | None:
+    """Highest tier whose base `attr` is <= value. None if value is below every
+    tier (or None). Threshold-based so a topped-up limit still maps to its tier."""
+    if value is None:
+        return None
+    best: Plan | None = None
+    for plan in _TIERS:
+        if value >= getattr(plan, attr):
+            best = plan
+    return best
+
+
 def plan_for(user) -> Plan | None:
-    """The paid Plan a user is on, DERIVED from monthly_variant_limit. None = Bepul."""
-    vlim = getattr(user, "monthly_variant_limit", None)
-    for plan in PLANS.values():
-        if vlim == plan.variant_limit:
-            return plan
-    return None
+    """The paid tier a user is on, DERIVED from their limits. A tier requires BOTH
+    limits to reach it, so the tier is the LOWER of the variant-implied and
+    check-implied tiers — a single-limit BUMP can never cross to a higher tier
+    (only an explicit /plan does). A missing/NULL check limit falls back to the
+    variant tier (keeps the variant-only derivation cases intact). None = Bepul."""
+    vt = _tier_by(getattr(user, "monthly_variant_limit", None), "variant_limit")
+    if vt is None:
+        return None
+    ct = _tier_by(getattr(user, "monthly_check_limit", None), "check_limit")
+    if ct is None:
+        return vt
+    return vt if _TIERS.index(vt) <= _TIERS.index(ct) else ct
 
 
 def plan_name(user) -> str:
-    """Display plan name for a user: 'Standart' / 'Pro' / 'Bepul'."""
+    """Display label: 'Bepul' / 'Standart' / 'Pro', with a '+N' bonus suffix when
+    the variant limit exceeds the tier base (a same-period top-up). The bump never
+    flips the tier name; exact numbers for both limits are shown in the quota
+    lines. E.g. Standart bumped to 35 → 'Standart +10'."""
     plan = plan_for(user)
-    return plan.name if plan is not None else FREE_NAME
+    if plan is None:
+        return FREE_NAME
+    vlim = getattr(user, "monthly_variant_limit", None) or 0
+    bonus = vlim - plan.variant_limit
+    return f"{plan.name} +{bonus}" if bonus > 0 else plan.name
