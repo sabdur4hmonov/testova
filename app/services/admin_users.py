@@ -133,6 +133,26 @@ async def set_plan(session, admin_id: int, tg_id: int, plan_key: str) -> User:
     return user
 
 
+async def reset_quota(session, admin_id: int, tg_id: int) -> User:
+    """Early renewal (paid-again mid-period): zero BOTH period counters, start a
+    fresh quota cycle (period_start = now) AND extend access_until 30 days from
+    now — the SAME window /plan uses, so quota and access stay consistent. The
+    plan tier and both limits are UNCHANGED."""
+    from datetime import timedelta
+    from app.services.plans import PLAN_DAYS
+
+    now = _now()
+    user = await get_or_create(session, tg_id)
+    user.variant_count_this_period = 0
+    user.check_count_this_period = 0
+    user.period_start = now
+    user.access_until = now + timedelta(days=PLAN_DAYS)
+    await _write_log(session, admin_id, "resetquota", tg_id)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def set_variant_limit(session, admin_id: int, tg_id: int, n: int) -> User:
     """Set the monthly variant-generation limit. n < 0 → unlimited (NULL)."""
     user = await get_or_create(session, tg_id)

@@ -224,6 +224,28 @@ async def _set_limit(message: Message, command: CommandObject, db_user: User, ki
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
 
 
+# ── /resetquota — early renewal: fresh quota cycle + access, limits unchanged ──
+
+@router.message(Command("resetquota"))
+async def cmd_resetquota(message: Message, command: CommandObject, db_user: User) -> None:
+    if not _is_admin(db_user):
+        await message.answer(REFUSED)
+        return
+    parts = _args(command)
+    if not parts:
+        await message.answer("Foydalanish: /resetquota <user_id>")
+        return
+    try:
+        tg_id = int(parts[0])
+    except ValueError:
+        await message.answer("user_id butun son bo‘lishi kerak.")
+        return
+    async with async_session_factory() as session:
+        user = await admin_users.reset_quota(session, db_user.telegram_id, tg_id)
+        text = _fmt_user(user)
+    await message.answer(f"✅ Kvota yangilandi (yangi 30 kunlik davr):\n{text}", parse_mode="HTML")
+
+
 # ── /addvariant, /addcheck — top up CURRENT limit (bonus, keeps the plan) ──────
 
 @router.message(Command("addvariant"))
@@ -620,6 +642,7 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/setchecklimit &lt;id&gt; &lt;n&gt;</code> — oylik tekshirish limiti (-1 = cheksiz)\n"
         "<code>/addvariant &lt;id&gt; &lt;n&gt;</code> — variant limitiga qo‘shish (bonus)\n"
         "<code>/addcheck &lt;id&gt; &lt;n&gt;</code> — tekshirish limitiga qo‘shish (bonus)\n"
+        "<code>/resetquota &lt;id&gt;</code> — kvotani yangilash (yangi 30 kun)\n"
         "<code>/revoke &lt;id&gt;</code> — bloklash (tasdiq so‘raladi)\n"
         "<code>/unblock &lt;id&gt;</code> — blokdan chiqarish\n"
         "<code>/user &lt;id yoki @username&gt;</code> — batafsil ma’lumot\n"
