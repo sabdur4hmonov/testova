@@ -19,11 +19,17 @@ logger = get_logger(__name__)
 
 async def send_text(bot: Bot, chat_id: int, text: str) -> bool:
     """
-    Send a plain proactive message. Returns True on success, False if the send
+    Send a PLAIN proactive message. Returns True on success, False if the send
     failed (never raises).
+
+    parse_mode is forced to None: the Bot is configured with a default
+    parse_mode=HTML, so an unset parse_mode here would parse the text as HTML and
+    reject any literal angle-bracket text (e.g. the "/message <id> <matn>" hint →
+    "can't parse entities: Unsupported start tag"). These are plain notifications
+    with no rich formatting, so we opt out explicitly.
     """
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=None)
         return True
     except Exception as exc:  # noqa: BLE001 — a notification must not crash the job
         logger.warning("proactive_send_failed", chat_id=chat_id, error=str(exc))
