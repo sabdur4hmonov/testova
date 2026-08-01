@@ -61,10 +61,13 @@ def is_unlimited(user: User) -> bool:
 
 
 def apply_trial(user: User) -> None:
-    """Apply the fresh-user trial. Call ONCE, on user creation only."""
+    """Apply the fresh-user trial. Call ONCE, on user creation only. Also caps
+    free answer-sheet checks (monthly_check_limit) — was NULL/unlimited, a real
+    cost gap. Variant stays gated by uses_left (monthly_variant_limit left NULL)."""
     now = _now()
     user.access_until = now + timedelta(days=settings.TRIAL_DAYS)
     user.uses_left = settings.TRIAL_USES
+    user.monthly_check_limit = settings.TRIAL_CHECK_LIMIT
 
 
 _LIMIT_TEXT = {

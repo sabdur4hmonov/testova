@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     # ── Access control ────────────────────────────────────────────────────────
     TRIAL_DAYS: int = 30          # free trial window applied on first /start
     TRIAL_USES: int = 1           # free full cycles for a fresh user
+    TRIAL_CHECK_LIMIT: int = 2    # free answer-sheet checks for a fresh user (0 gap fix)
     ADMIN_USERNAME: str = "admin"  # shown in the blocked message (no leading @)
 
     # ── Subscription limits ───────────────────────────────────────────────────

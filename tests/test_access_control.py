@@ -59,6 +59,7 @@ def test_apply_trial_sets_window_and_uses():
     u = _user(access_until=None, uses_left=None)
     access.apply_trial(u)
     assert u.uses_left == settings.TRIAL_USES
+    assert u.monthly_check_limit == settings.TRIAL_CHECK_LIMIT   # cost-control gap fix
     assert u.access_until is not None
     delta = u.access_until - datetime.now(timezone.utc)
     assert timedelta(days=settings.TRIAL_DAYS - 1) < delta <= timedelta(days=settings.TRIAL_DAYS)
