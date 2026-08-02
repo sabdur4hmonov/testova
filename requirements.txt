@@ -49,6 +49,10 @@ structlog==25.3.0
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 httpx==0.28.1
+# Used directly by the grading REST call (sheet_reader._call_sync). Previously
+# only present transitively (via google-generativeai) — pin it so the grading
+# path never breaks if a transitive dep drops it.
+requests==2.34.2
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest==8.4.0
