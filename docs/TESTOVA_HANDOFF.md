@@ -400,20 +400,29 @@ The **Saqlangan** (saved-test) flow can't grade written answers yet — its key 
 
 ---
 
-## ⏭️ NEXT — VPS DEPLOYMENT (now the biggest unbuilt piece)
+## ⏭️ NEXT — VPS DEPLOYMENT (blockers CLEARED — ready to deploy)
 
 The original "NEXT" (the full generate-and-grade UX) is **substantially SHIPPED**: grading lives behind **✅ Test tekshirish** with two modes — **Saqlangan** (grade against a saved project) and **Javob orqali** (grade against a typed answer key) — plus student names, the class group-result table, copy-to-Excel, test naming, an **exam timer** (v0.10), **auto-detect of variant + student name off the photo** (v0.11–v0.12), **short-answer grading** (v0.13, manual only), and **teacher-confirm of wrong written answers** (v0.16 Design B). Grading is free and ignores `uses_left` by design.
 
-The remaining gate before any real teacher touches this is deployment:
+**A full pre-deployment audit ran (Aug 2026) and all deploy BLOCKERS are now fixed** (commits `5d399f1`→`766a45d` on `origin/master`):
+- 🔴 **`temp_images/` now mounted** as a volume in `docker-compose.yml` — redeploys no longer destroy figure crops.
+- 🔴 **`docker-compose.yml` trimmed to postgres + redis + bot** — the dead Celery worker/beat/flower, the insecure FastAPI admin API (:8000, default secret), and nginx (missing certs) were removed.
+- 🔴 **`.env.example` `ADMIN_IDS` fixed to JSON-array form** (`ADMIN_IDS=[123456789]`); the old comma form crashed the bot at startup. Dead vars (CELERY_*, daily-project limits, ADMIN_API_SECRET, S3, webhook) removed.
+- 🔴 **`create_all_tables()` no longer runs at startup** — **Alembic is the single source of truth**. Run `alembic upgrade head` BEFORE starting the bot, every deploy.
+- 🟠 Also fixed: `requests` pinned (grading dep), PDF page-count capped before rendering (OOM guard), rotating file-log handler (`logs/testova.log`, ~60 MB cap).
 
-**VPS deployment** — kills the Telegram block permanently, bot online 24/7. ~$5/mo (Hetzner/Contabo/DigitalOcean). On deploy:
-- `.env` with `ADMIN_IDS=[8206475760]` (JSON list), `ADMIN_USERNAME=testova_admin`, `GEMINI_MODEL=gemini-2.5-flash`, Gemini price vars if non-default (`GEMINI_PRICE_IN_PER_M`, `GEMINI_PRICE_OUT_PER_M`, `UZS_PER_USD`), Postgres connection string.
-- `pip install -r requirements.txt` (incl. matplotlib==3.11.0 **and APScheduler==3.10.4** for the exam timer).
-- `alembic upgrade head` — schema is **still at migration 006** (001 initial → 002 builder_sessions → 003 access_control → 004 gemini_usage → 005 manual_checking → 006 project_naming). v0.10–v0.17 added NO migration (timer reused 006's reserved columns; short-answer keys ride the existing `manual_check_sessions.correct_answers` JSONB). **Migration 007 is still owed** for the E/C letters + saved-flow short answers — see KNOWN-OPEN #2/#3.
+**➡️ The full step-by-step deploy checklist now lives in [`docs/DEPLOY.md`](DEPLOY.md)** (fresh Ubuntu / Oracle ARM64 free tier → running bot, with the migrate-before-bot ordering, `.env` keys, volumes, `pg_dump` backup cron, and the ARM64 build note). **The complete audit — all findings by part, ranked, with fix status — is in [`docs/PRE_DEPLOYMENT_AUDIT.md`](PRE_DEPLOYMENT_AUDIT.md).**
+
+Quick deploy essentials (see DEPLOY.md for the rest):
+- `.env` with `ADMIN_IDS=[8206475760]` (**JSON brackets required**), `ADMIN_USERNAME=testova_admin`, `GEMINI_MODEL=gemini-2.5-flash`, `GEMINI_API_KEY`, `POSTGRES_PASSWORD`, Gemini price vars if non-default.
+- `pip install -r requirements.txt` (incl. matplotlib==3.11.0, APScheduler==3.10.4, and now `requests==2.34.2`).
+- **Schema head is migration `012`** (001→012: builder_sessions, access_control, gemini_usage, manual_checking, project_naming, question_options_json, question_correct_answers_list, question_is_deleted, confirm_decisions, user_first_charged_at, monthly_quotas). `alembic upgrade head` on a fresh DB produces the current schema — proven via offline SQL gen. **Migration 007+008 already shipped** the E/C letters + saved-flow short answers (KNOWN-OPEN #2/#3 are CLOSED).
 - Set Gemini Prepay auto-reload so nobody hits a $0 balance mid-exam.
 
+**Still-open, tracked-not-fixed** (none block deploy; full detail in `PRE_DEPLOYMENT_AUDIT.md`): #9 `GEMINI_API_KEY` empty-string default fails per-call not at startup; #10 generation quota *peek* is racy/fail-open (self-inflicted double-extraction cost, not a bypass); #11 Redis→memory fallback is silent. Also: the `pg_dump` backup cron is documented in DEPLOY.md but must be installed on the server.
+
 Suggested opening prompt for the deployment session:
-> "Walk me through deploying Testova to a VPS step by step — I'm a beginner. We're at migration 006, model gemini-2.5-flash. Cover the .env, Postgres, alembic upgrade head, keeping the bot running 24/7, and Gemini auto-reload."
+> "Walk me through deploying Testova to the Oracle Cloud ARM64 free tier following docs/DEPLOY.md — I'm a beginner. We're at migration 012, model gemini-2.5-flash, compose is postgres+redis+bot. Cover the .env, running alembic upgrade head before the bot, the temp_images volume, and Gemini auto-reload."
 
 ---
 
