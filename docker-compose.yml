@@ -1,5 +1,21 @@
 version: "3.9"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Production stack: postgres + redis + bot ONLY.
+#
+# The Celery worker/beat/flower, the FastAPI admin API, and nginx were REMOVED
+# on purpose:
+#   - Celery is dead code (app.tasks.file_tasks ImportErrors) — the worker/beat
+#     would crash-loop. Background work runs in-process (the exam timer is an
+#     in-process APScheduler; extraction runs on the event loop's thread pool).
+#   - The FastAPI admin (app.admin.main) is built on the dead subscription model
+#     and was guarded only by a default secret — administration is done via the
+#     in-bot admin commands (/grant, /stats, …) instead.
+#   - nginx required TLS certs that are not shipped, and the bot runs in polling
+#     mode, so no reverse proxy is needed.
+# Reintroduce them only with their own review.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   # ── PostgreSQL ─────────────────────────────────────────────────────────────
   postgres:
@@ -19,7 +35,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Redis ──────────────────────────────────────────────────────────────────
+  # ── Redis (FSM storage) ────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     restart: always
@@ -35,6 +51,8 @@ services:
       retries: 5
 
   # ── Bot ────────────────────────────────────────────────────────────────────
+  # NOTE: run `alembic upgrade head` BEFORE the first `up` of this service —
+  # alembic is the single source of truth for the schema (see README/handoff).
   bot:
     build:
       context: .
@@ -45,6 +63,10 @@ services:
     volumes:
       - ./storage:/app/storage
       - ./logs:/app/logs
+      # temp_images/ is a PERMANENT store: figure crops written at upload time
+      # are read back by pdf_generator at every variant build. WITHOUT this
+      # mount, a redeploy destroys teachers' figures (they print blank).
+      - ./temp_images:/app/temp_images
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,89 +75,6 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:-strongpassword}@postgres:5432/testova_db
       - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-
-  # ── Celery Worker ──────────────────────────────────────────────────────────
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
-    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4 -Q file_processing,notifications
-    env_file: .env
-    volumes:
-      - ./storage:/app/storage
-      - ./logs:/app/logs
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:-strongpassword}@postgres:5432/testova_db
-      - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-
-  # ── Celery Beat (scheduled tasks) ─────────────────────────────────────────
-  beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
-    command: celery -A app.tasks.celery_app beat --loglevel=info
-    env_file: .env
-    depends_on:
-      - redis
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/1
-
-  # ── Flower (Celery monitoring) ─────────────────────────────────────────────
-  flower:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
-    command: celery -A app.tasks.celery_app flower --port=5555
-    ports:
-      - "5555:5555"
-    depends_on:
-      - redis
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/1
-
-  # ── Admin API ──────────────────────────────────────────────────────────────
-  admin:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
-    command: uvicorn app.admin.main:app --host 0.0.0.0 --port 8000
-    env_file: .env
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./storage:/app/storage
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:-strongpassword}@postgres:5432/testova_db
-
-  # ── Nginx ──────────────────────────────────────────────────────────────────
-  nginx:
-    image: nginx:alpine
-    restart: always
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/certs:/etc/nginx/certs:ro
-    depends_on:
-      - bot
-      - admin
 
 volumes:
   postgres_data:
