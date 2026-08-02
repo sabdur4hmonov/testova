@@ -156,7 +156,9 @@ async def process_file(
 
     # ── Convert to page images ────────────────────────────────────────────────
     if effective_type == "pdf":
-        raw_pages = await asyncio.to_thread(pdf_to_images, effective_bytes)
+        # Cap at render time (not just the slice below) so a many-page PDF
+        # never rasterises hundreds of pages into memory.
+        raw_pages = await asyncio.to_thread(pdf_to_images, effective_bytes, max_pages=MAX_PAGES)
     elif effective_type == "docx":
         raw_pages, _ = await asyncio.to_thread(docx_to_images, effective_bytes)
     else:

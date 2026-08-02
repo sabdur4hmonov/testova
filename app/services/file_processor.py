@@ -126,26 +126,39 @@ def pdf_extract_pages_text(pdf_bytes: bytes) -> list[str]:
     return result
 
 
-def pdf_to_images(pdf_bytes: bytes, dpi: int = DPI) -> list[PageImage]:
-    """Convert every PDF page to a PIL Image.
+def pdf_to_images(
+    pdf_bytes: bytes, dpi: int = DPI, max_pages: int | None = None
+) -> list[PageImage]:
+    """Convert PDF pages to PIL Images.
 
     Cost optimization: a page with NO embedded raster image renders fine for
     Gemini at a lower DPI (150) — fewer image tiles, cheaper call. Pages that
     carry an embedded image keep the full DPI so figure detail survives. Figure
     CROPS are re-rendered straight from the PDF at CROP_DPI, so the page DPI
     never affects crop sharpness.
+
+    `max_pages` caps how many pages are rendered *before* any rendering happens.
+    The pipeline only ever uses the first MAX_PAGES pages, but rendering the
+    whole document first (a page is ~12-36 MB at these DPIs) means a large or
+    malicious PDF could exhaust memory and OOM-kill the process before the
+    caller ever sliced the list down. Pass the cap so extra pages are never
+    rasterised. None = render every page (dev/tests).
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = len(doc)
+    render_count = total if max_pages is None else min(total, max_pages)
     pages: list[PageImage] = []
-    for page_num in range(len(doc)):
+    for page_num in range(render_count):
         page = doc[page_num]
         page_dpi = dpi if page.get_images() else min(dpi, 150)
         zoom = page_dpi / 72
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         pages.append(PageImage(page_number=page_num + 1, image=img))
-        logger.debug("converted_page", page=page_num + 1, total=len(doc), dpi=page_dpi)
+        logger.debug("converted_page", page=page_num + 1, total=total, dpi=page_dpi)
     doc.close()
+    if render_count < total:
+        logger.info("pdf_page_cap_applied", rendered=render_count, total=total)
     return pages
 
 

@@ -896,7 +896,7 @@ async def handle_reextract(
     try:
         content = await storage.read_file(project.original_file_path)
         if project.file_type == "pdf":
-            raw_pages = await asyncio.to_thread(pdf_to_images, content)
+            raw_pages = await asyncio.to_thread(pdf_to_images, content, max_pages=MAX_PAGES)
         elif project.file_type == "docx":
             raw_pages, _ = await asyncio.to_thread(docx_to_images, content)
         else:
