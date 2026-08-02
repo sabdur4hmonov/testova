@@ -15,13 +15,17 @@ from aiohttp import web
 
 from app.bot.main import create_bot, create_dispatcher
 from app.config import settings
-from app.database import async_session_factory, create_all_tables
+from app.database import async_session_factory
 from app.services import exam_timer
 from app.utils.logging import get_logger, setup_logging
 
 
 async def on_startup(bot, dp) -> None:
-    await create_all_tables()
+    # Schema is managed by Alembic ONLY — run `alembic upgrade head` before
+    # starting the bot (see the deploy checklist in docs/). We deliberately do
+    # NOT create_all() here: it cannot ALTER existing tables (so it silently
+    # masks a missing migration) and, on a fresh DB, it would build an
+    # un-stamped schema that then collides with `alembic upgrade head`.
 
     # Start the in-process exam scheduler and re-load any running exams so a
     # restart never loses a timer. NON-FATAL: if any of this fails the bot must
