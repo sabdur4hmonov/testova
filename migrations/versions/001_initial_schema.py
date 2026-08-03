@@ -19,18 +19,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # ── Enums ─────────────────────────────────────────────────────────────────
-    language_enum = postgresql.ENUM("uz", "en", "ru", name="language_enum")
-    language_enum.create(op.get_bind())
-
-    plan_enum = postgresql.ENUM("free", "pro", "center", name="subscription_plan_enum")
-    plan_enum.create(op.get_bind())
-
-    status_enum = postgresql.ENUM(
-        "pending", "processing", "completed", "failed", name="project_status_enum"
-    )
-    status_enum.create(op.get_bind())
-
+    
     # ── users ─────────────────────────────────────────────────────────────────
     op.create_table(
         "users",
@@ -38,8 +27,8 @@ def upgrade() -> None:
         sa.Column("telegram_id", sa.BigInteger, unique=True, nullable=False),
         sa.Column("username", sa.String(64), nullable=True),
         sa.Column("full_name", sa.String(256), nullable=False),
-        sa.Column("language", sa.Enum("uz", "en", "ru", name="language_enum", create_type=False), nullable=False, server_default="uz"),
-        sa.Column("subscription_plan", sa.Enum("free", "pro", "center", name="subscription_plan_enum", create_type=False), nullable=False, server_default="free"),
+        sa.Column("language", sa.Enum("uz", "en", "ru", name="language_enum"), nullable=False, server_default="uz"),
+        sa.Column("subscription_plan", sa.Enum("free", "pro", "center", name="subscription_plan_enum"), nullable=False, server_default="free"),
         sa.Column("daily_projects_used", sa.Integer, nullable=False, server_default="0"),
         sa.Column("monthly_projects_used", sa.Integer, nullable=False, server_default="0"),
         sa.Column("total_projects", sa.Integer, nullable=False, server_default="0"),
@@ -72,7 +61,7 @@ def upgrade() -> None:
         sa.Column("original_file_path", sa.String(1024), nullable=True),
         sa.Column("original_file_name", sa.String(512), nullable=True),
         sa.Column("file_type", sa.String(16), nullable=True),
-        sa.Column("status", sa.Enum("pending", "processing", "completed", "failed", name="project_status_enum", create_type=False), nullable=False, server_default="pending"),
+        sa.Column("status", sa.Enum("pending", "processing", "completed", "failed", name="project_status_enum"), nullable=False, server_default="pending"),
         sa.Column("question_count", sa.Integer, nullable=False, server_default="0"),
         sa.Column("error_message", sa.Text, nullable=True),
         sa.Column("task_id", sa.String(256), nullable=True),
