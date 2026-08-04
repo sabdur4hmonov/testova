@@ -33,10 +33,12 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     full_name: Mapped[str] = mapped_column(String(256), nullable=False)
     language: Mapped[Language] = mapped_column(
-        Enum(Language, name="language_enum"), default=Language.UZ, nullable=False
+        Enum(Language, name="language_enum", values_callable=lambda obj: [e.value for e in obj]),
+        default=Language.UZ,
+        nullable=False,
     )
     subscription_plan: Mapped[SubscriptionPlan] = mapped_column(
-        Enum(SubscriptionPlan, name="subscription_plan_enum"),
+        Enum(SubscriptionPlan, name="subscription_plan_enum", values_callable=lambda obj: [e.value for e in obj]),
         default=SubscriptionPlan.FREE,
         nullable=False,
     )
