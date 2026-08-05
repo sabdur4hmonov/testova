@@ -40,7 +40,7 @@ class BuilderSession(Base):
         nullable=False, index=True,
     )
     status: Mapped[BuilderStatus] = mapped_column(
-        Enum(BuilderStatus, name="builder_status_enum"),
+        Enum(BuilderStatus, name="builder_status_enum", values_callable=lambda obj: [e.value for e in obj]),
         default=BuilderStatus.ACTIVE, nullable=False, index=True,
     )
     # Project owning the generated pool variants (created at finish time)
