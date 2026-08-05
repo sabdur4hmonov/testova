@@ -32,7 +32,7 @@ class Project(Base):
     original_file_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     file_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # pdf, docx, image
     status: Mapped[ProjectStatus] = mapped_column(
-        Enum(ProjectStatus, name="project_status_enum"),
+        Enum(ProjectStatus, name="project_status_enum", values_callable=lambda obj: [e.value for e in obj]),
         default=ProjectStatus.PENDING,
         nullable=False,
         index=True,
