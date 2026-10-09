@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Testova Admin{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/bootstrap.min.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<div class="d-flex">
+  <!-- Sidebar: static on lg+, off-canvas (hamburger) below lg -->
+  <div class="offcanvas-lg offcanvas-start sidebar text-bg-dark" tabindex="-1" id="sidebar">
+    <div class="offcanvas-header">
+      <span class="fs-5 fw-semibold">🧪 Testova</span>
+      <button type="button" class="btn-close btn-close-white"
+              data-bs-dismiss="offcanvas" data-bs-target="#sidebar"></button>
+    </div>
+    <div class="offcanvas-body flex-column p-0">
+      <div class="sidebar-brand d-none d-lg-block px-3 py-3 fs-5 fw-semibold">🧪 Testova</div>
+      <ul class="nav nav-pills flex-column px-2 gap-1">
+        {% set items = [
+          ('dashboard', '/',          '📊 Dashboard', True),
+          ('users',     '/users',     '👥 Users',     True),
+          ('costs',     '/costs',     '💵 Costs',     True),
+          ('revenue',   '/revenue',   '💰 Revenue',   True),
+          ('messaging', '/messaging', '✉️ Messaging', True),
+          ('books',     '/books',     '📚 Books',     True),
+          ('alerts',    '/alerts',    '🔔 Alerts',    True),
+          ('audit',     '/audit',     '📝 Audit log', True),
+        ] %}
+        {% for key, href, label, ready in items %}
+        <li class="nav-item">
+          {% if ready %}
+          <a class="nav-link text-white {% if active == key %}active{% endif %}" href="{{ href }}">{{ label }}</a>
+          {% else %}
+          <span class="nav-link text-white-50 d-flex justify-content-between align-items-center">
+            {{ label }} <span class="badge text-bg-secondary">soon</span>
+          </span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      <div class="mt-auto p-3">
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+          <button class="btn btn-outline-light btn-sm w-100" type="submit">Chiqish</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main flex-grow-1 min-vw-0">
+    <nav class="navbar bg-body-tertiary d-lg-none border-bottom">
+      <div class="container-fluid">
+        <button class="btn btn-outline-secondary" type="button"
+                data-bs-toggle="offcanvas" data-bs-target="#sidebar">☰</button>
+        <span class="navbar-brand mb-0 ms-2">{% block heading_mobile %}Admin{% endblock %}</span>
+      </div>
+    </nav>
+    <main class="p-3 p-lg-4">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+<script src="/static/js/bootstrap.bundle.min.js"></script>
+<script src="/static/js/panel.js"></script>
+</body>
+</html>

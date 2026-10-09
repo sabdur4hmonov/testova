@@ -102,7 +102,7 @@ async def decrement_use(session, user_id: uuid.UUID) -> int | None:
     """
     result = await session.execute(
         text(
-            "UPDATE users SET uses_left = uses_left - 1 "
+            "UPDATE users SET uses_left = uses_left - 1, updated_at = now() "
             "WHERE id = :id AND uses_left IS NOT NULL AND uses_left > 0 "
             "RETURNING uses_left"
         ),
@@ -137,7 +137,7 @@ async def charge_session_use(session, builder_session_id: uuid.UUID, user_id: uu
         return None  # already charged by an earlier/concurrent source
     result = await session.execute(
         text(
-            "UPDATE users SET uses_left = uses_left - 1 "
+            "UPDATE users SET uses_left = uses_left - 1, updated_at = now() "
             "WHERE id = :id AND uses_left IS NOT NULL AND uses_left > 0 "
             "RETURNING uses_left"
         ),
@@ -164,7 +164,7 @@ async def register_first_charge(session, user_id: uuid.UUID) -> bool:
     """
     result = await session.execute(
         text(
-            "UPDATE users SET first_charged_at = now() "
+            "UPDATE users SET first_charged_at = now(), updated_at = now() "
             "WHERE id = :id AND first_charged_at IS NULL "
             "RETURNING id"
         ),

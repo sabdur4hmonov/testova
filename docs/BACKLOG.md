@@ -581,3 +581,70 @@ one thinking-ON run but never with it off). None of that outweighs inventing
 **Conclusion:** grading is a transcription task and does not need reasoning;
 extraction is a *structuring* task and does. Keep thinking ON for extraction.
 Do not retry without a way to make the model reject non-question pages first.
+
+
+## Stage-4 follow-ups (recorded 2026-10-09, not implemented)
+
+Owner's priority order after the next deploy: F13 -> F07 -> F04 (minimal)
+-> F11 (daily breaker). Evidence and Step 0 notes:
+`docs/STAGE4_REVIEW_2026-10-09.md`.
+
+### ONLINE_TEST_ENABLED ni yoqishdan OLDIN SHART — question freeze for online tests
+- Re-extract refuses to rewrite questions once VARIANTS exist (CP-5,
+  `upload._variants_exist`), but an online test stores Question ids
+  (`online_tests.pool_question_ids`) and reads the rows live. A re-read
+  during or after a running online test changes what students see and how
+  they are graded.
+- Needed: `handle_reextract` refuses (no paid re-read) when the project has
+  any online test, the same way as for variants; or online tests snapshot
+  their questions at creation.
+- Guard: `tests/test_online_requires_question_freeze.py` (worktree branch).
+  It passes while the flag is off and FAILS as soon as ONLINE_TEST_ENABLED is
+  turned on, until this is built. Do not delete or weaken it to enable the
+  flag.
+
+### F06 follow-up — "Resend report" button (small)
+- Since F06 the grade commits before the report is sent and transient send
+  errors are retried twice. If all attempts fail, the teacher gets no report
+  message; the grade is safe and appears in the run's finish report.
+- Small feature: a "📨 Hisobotni qayta yuborish" action that re-renders the
+  report from the stored sheet row (`sheet_checks.result`, Submission
+  `results` / check_results). It must never re-read or re-grade.
+
+### Redis memory warning (small)
+- Redis now runs `noeviction` (F10). A full Redis refuses new writes with
+  OutOfMemoryError: leases fail closed and FSM writes error loudly, but
+  nothing warns BEFORE that point. Live on 2026-10-09: 1.12 MB of 512 MB used.
+- Add an hourly check (same scheduler as `alert_check`) of
+  `INFO memory` used_memory / maxmemory that logs and alerts the admin above
+  ~70%.
+
+### C10 — `_get_or_capture_theme_images` holds a transaction across PDF work
+- `app/bot/handlers/book.py` (`_get_or_capture_theme_images`) opens one
+  session, reads/deletes stale rows, then loads book PDFs and crops figures
+  inside the same transaction. One pooled connection is held for the whole
+  crop. The F09 budget absorbs it today (bot pool 20 + 20); fix by
+  reading/deleting in one short transaction, cropping outside, and
+  persisting in a second short transaction.
+
+### Detector adapter: 80 vs 150+ words (worktree, DETECTOR_ENABLED off)
+- `app/bot/handlers/detector.py` uses `MIN_WORDS = 80` and says "Ishonchli
+  baho uchun kamida 80 so'z kerak". The four-language adapter
+  (`detector/BOT_INTEGRATION.md`) needs 150+ words per scored part.
+- Before enabling: raise the handler minimum to 150; avoid "ishonch"
+  (confidence) wording; say "SI uslubiga o'xshashlik", not "AI ehtimoli";
+  keep "bu taxmin, hukm emas" and "mualliflik isboti emas" in every result.
+  Independent school-essay accuracy (FP rate) is still unproven.
+
+### Audit priorities F02–F14 (from the 2026-10-01 external audit; analysis only)
+| Item | Before mass launch? | Size | Status |
+|---|---|---|---|
+| F09 DB connection budget | yes | S | DONE 2026-10-09 (2ed53ce) |
+| F10 Redis eviction | yes | S | DONE 2026-10-09 (96d2998) |
+| F13 scanned-page prep spends before quota | yes (money leak) | M | next after deploy |
+| F07 render memory (2 GiB, concurrent PDFs) | yes | M | Step 0 can measure RSS |
+| F04 recovery of interrupted jobs | minimal version yes (startup reconcile + clear message); full job table later | S / L (migration) | |
+| F11 Gemini project quota | daily circuit breaker yes; full limiter needs real AI Studio quotas | M–L | |
+| F02 executor starvation (slot waits inside worker threads; pool 32) | partly (async admission, grading priority) | M–L | |
+| F12 Telegram paced outbox | after launch (hundreds of concurrent jobs) | L | F06 already keeps grades on send failure |
+| F14 page-range cache race (P2) | after launch; needs a unique index = new migration | S–M | |

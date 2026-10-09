@@ -73,6 +73,9 @@ class Project(Base):
     variants: Mapped[list["Variant"]] = relationship(  # type: ignore[name-defined]
         back_populates="project", cascade="all, delete-orphan", lazy="select"
     )
+    editions: Mapped[list["ExamEdition"]] = relationship(  # type: ignore[name-defined]
+        back_populates="project", cascade="all, delete-orphan", lazy="select"
+    )
 
     def __repr__(self) -> str:
         return f"<Project id={self.id} name={self.name!r} status={self.status}>"

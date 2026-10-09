@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Audit log — Testova Admin{% endblock %}
+{% block heading_mobile %}Audit{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Audit log <span class="text-muted fs-6">({{ total }})</span></h1>
+  <div class="d-flex gap-2">
+    <form method="get" action="/audit" class="d-flex gap-2">
+      <select name="action" class="form-select form-select-sm" data-autosubmit>
+        <option value="">— barcha amallar —</option>
+        {% for a in actions %}
+        <option value="{{ a }}" {% if a == action %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <a class="btn btn-sm btn-outline-secondary" href="/export/audit.csv">CSV</a>
+  </div>
+</div>
+
+<div class="table-responsive">
+  <table class="table table-sm table-striped align-middle">
+    <thead><tr><th>Vaqt</th><th>Admin</th><th>Amal</th><th>Nishon</th><th>Tafsilot</th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="text-nowrap">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td><code>{{ r.admin_id }}</code></td>
+        <td><span class="badge text-bg-secondary">{{ r.action }}</span></td>
+        <td>{% if r.target %}<a href="/users/{{ r.target }}"><code>{{ r.target }}</code></a>{% else %}—{% endif %}</td>
+        <td class="small text-break">{{ r.params }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-center text-muted py-4">Yozuv yo‘q.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if pages > 1 %}
+<nav class="d-flex justify-content-center">
+  <ul class="pagination pagination-sm">
+    {% set qs = ('&action=' ~ action) if action else '' %}
+    <li class="page-item {% if page <= 1 %}disabled{% endif %}"><a class="page-link" href="/audit?page={{ page-1 }}{{ qs }}">‹</a></li>
+    <li class="page-item disabled"><span class="page-link">{{ page }} / {{ pages }}</span></li>
+    <li class="page-item {% if page >= pages %}disabled{% endif %}"><a class="page-link" href="/audit?page={{ page+1 }}{{ qs }}">›</a></li>
+  </ul>
+</nav>
+{% endif %}
+{% endblock %}

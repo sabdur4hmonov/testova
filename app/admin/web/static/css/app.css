@@ -1,0 +1,39 @@
+/* Testova admin panel — small overrides on top of vendored Bootstrap 5. */
+
+.sidebar {
+  width: 240px;
+  min-height: 100vh;
+}
+@media (min-width: 992px) {
+  /* On lg+ the off-canvas becomes a static, full-height column. */
+  .sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+  }
+  .offcanvas-lg .offcanvas-body { display: flex; }
+}
+.sidebar .nav-link.active { background-color: rgba(255, 255, 255, 0.15); }
+.sidebar-brand { border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
+
+.main { min-height: 100vh; background: var(--bs-body-bg); }
+
+.stat-card .display-6 { line-height: 1.1; }
+.border-dashed { border-style: dashed !important; }
+
+/* Login */
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.login-card { width: 100%; max-width: 380px; }
+
+/* Width rules that used to live in inline style="" attributes. Moved here so
+   the CSP can keep style-src at 'self' with no 'unsafe-inline': a nonce cannot
+   whitelist a style ATTRIBUTE, only a <style> element. */
+.w-event-cell { max-width: 520px; }
+.w-limit-col { min-width: 180px; }
+.w-search-input { min-width: 220px; }

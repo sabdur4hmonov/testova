@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Messaging — Testova Admin{% endblock %}
+{% block heading_mobile %}Messaging{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Xabar yuborish</h1>
+  <span class="small text-muted">bot orqali (Telegram)</span>
+</div>
+
+<div class="row g-3">
+  <!-- Segment picker + composer -->
+  <div class="col-12 col-lg-7">
+    <div class="card"><div class="card-body">
+      <h2 class="h6 text-muted">Guruhga e’lon</h2>
+
+      {# One form: the radio picks the segment, the textarea carries the body.
+         data-confirm (not onsubmit — the CSP drops inline handlers) gates the
+         send, because there is no undo once Telegram has it. #}
+      <form method="post" action="/messaging/broadcast"
+            data-confirm="E’lon tanlangan guruhdagi HAMMA foydalanuvchiga yuboriladi. Davom etasizmi?">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <input type="hidden" name="send_intent" value="{{ send_intent(request, 'broadcast') }}">
+        <input type="hidden" name="confirmed" value="0">
+
+        <div class="list-group mb-3">
+          {% for s in segments %}
+          <label class="list-group-item d-flex gap-2 align-items-start">
+            <input class="form-check-input flex-shrink-0" type="radio" name="segment"
+                   value="{{ s.key }}" {% if loop.first %}checked{% endif %}
+                   {% if not s.count %}disabled{% endif %}>
+            <span class="flex-grow-1">
+              <span class="d-flex justify-content-between align-items-center">
+                <b {% if not s.count %}class="text-muted"{% endif %}>{{ s.label }}</b>
+                <span class="badge {% if s.count %}text-bg-primary{% else %}text-bg-secondary{% endif %}">
+                  {{ s.count }}</span>
+              </span>
+              <span class="small text-muted d-block">{{ s.description }}</span>
+              {% if s.slow %}
+              {# Above the threshold the send outgrows one HTTP request: the
+                 spacing alone is ~0.05s per recipient before Telegram's own
+                 round-trip. Say so rather than let the browser time out on a
+                 request that is still working. #}
+              <span class="small text-warning d-block">
+                ⏳ ~{{ s.seconds|round|int }} soniya — sahifa shuncha kutadi.
+              </span>
+              {% endif %}
+            </span>
+          </label>
+          {% endfor %}
+        </div>
+
+        <div class="mb-2">
+          <textarea class="form-control" name="text" rows="6" maxlength="{{ max_len }}"
+                    placeholder="E’lon matni…" required aria-label="e’lon matni"></textarea>
+          <div class="form-text">Eng ko‘pi {{ max_len }} belgi.</div>
+        </div>
+        <button class="btn btn-primary">📢 E’lonni yuborish</button>
+      </form>
+    </div></div>
+  </div>
+
+  <!-- What the segments mean / what is not built -->
+  <div class="col-12 col-lg-5">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Guruhlar qanday aniqlanadi</h2>
+      <ul class="small text-muted mb-3 ps-3">
+        <li><b>Sinov guruhlari</b> — <code>plans.is_trial()</code> ta’rifi bo‘yicha,
+          keyin sinov hisoblagichi (<code>uses_left</code>) tegilgan-tegilmaganiga qarab
+          ikkiga bo‘linadi.</li>
+        <li><b>Pullik guruhlar</b> — <code>plans.plan_for()</code> ta’rifi bo‘yicha.</li>
+        <li><b>To‘lov guruhlari</b> — <code>payments</code> jadvalidan
+          (<a href="/revenue">Revenue</a>).</li>
+      </ul>
+
+      <h2 class="h6 text-muted">Yuborish tezligi</h2>
+      <p class="small text-muted mb-3">
+        Har bir xabar orasida {{ '%.2f'|format(0.05) }} soniya tanaffus
+        (~17 xabar/soniya o‘lchangan) — Telegram’ning ~30/soniya chegarasidan past.
+        Telegram flood-control qaytarsa, kutib bir marta qayta urinadi.
+      </p>
+
+      <h2 class="h6 text-muted">Saqlanmaydi</h2>
+      <p class="small text-muted mb-0">
+        Xabarlar tarixi, shablonlar va yetkazib berish holati <b>saqlanmaydi</b> —
+        bu ataylab shunday. Har bir yuborish faqat
+        <a href="/audit?action=broadcast">audit jurnaliga</a> yoziladi.
+      </p>
+    </div></div>
+  </div>
+</div>
+{% endblock %}

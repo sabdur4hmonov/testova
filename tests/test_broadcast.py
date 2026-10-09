@@ -2,13 +2,11 @@
 Phase 4 — admin broadcast.
 
 Sending & counting and the confirmation gate are proven WITHOUT a live bot or
-DB (fakes). The audit-log write is proven against real Postgres (skips if
-unavailable).
+DB (fakes). The audit-log write is proven against real Postgres (the per-run
+test database from the conftest `engine` fixture, never the live one).
 """
 import uuid
 from types import SimpleNamespace
-
-import pytest
 
 from aiogram.exceptions import TelegramForbiddenError
 
@@ -118,10 +116,13 @@ async def test_broadcast_non_admin_refused(monkeypatch):
 
     monkeypatch.setattr(admin, "async_session_factory", boom)
     msg, state = _RecMsg(), _FakeState()
-    await admin.cmd_broadcast(
-        msg, CommandObject(command="broadcast", args="hi"),
-        SimpleNamespace(is_admin=False, telegram_id=999), state,
-    )
+    non_admin = SimpleNamespace(is_admin=False, telegram_id=999)
+    cmd = CommandObject(command="broadcast", args="hi")
+
+    async def call_next(ev, data):
+        return await admin.cmd_broadcast(ev, cmd, non_admin, state)
+
+    await admin.AdminOnlyMiddleware()(call_next, msg, {"db_user": non_admin, "state": state})
     assert any("admin" in a.lower() for a in msg.answers)
 
 
@@ -183,38 +184,23 @@ async def test_broadcast_confirm_non_admin_refused(monkeypatch):
 
     cb = _CB("adm:bc:ok")
     state = _FakeState({"bc_text": "x", "bc_scope": "all"})
-    await admin.cmd_broadcast_send(
-        cb, state, SimpleNamespace(is_admin=False, telegram_id=999), bot=object()
-    )
+    non_admin = SimpleNamespace(is_admin=False, telegram_id=999)
+
+    async def call_next(ev, data):
+        return await admin.cmd_broadcast_send(ev, state, non_admin, bot=object())
+
+    await admin.AdminOnlyMiddleware()(call_next, cb, {"db_user": non_admin, "state": state})
     assert any("admin" in e.lower() for e in cb.message.edits)
 
 
 # ── audit log write (real DB) ────────────────────────────────────────────────
 
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT 1 FROM admin_log LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_log_broadcast_writes_admin_log():
+async def test_log_broadcast_writes_admin_log(engine):
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.models.admin_log import AdminLog
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres/admin_log not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     admin_id = int(uuid.uuid4().int % 10**11)
     try:
@@ -231,4 +217,3 @@ async def test_log_broadcast_writes_admin_log():
         async with sm() as s:
             await s.execute(delete(AdminLog).where(AdminLog.admin_id == admin_id))
             await s.commit()
-        await engine.dispose()

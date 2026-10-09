@@ -369,7 +369,9 @@ async def test_blank_is_neither_letter_nor_text(patched):
 
 async def test_only_one_gemini_call_per_sheet(patched):
     patched('{"answers": {"1": "A", "22": "PHONE"}}')
-    await SR.read_answer_sheet(b"x", 22)
+    # CP-2: the response covers q1 and q22 only, so those ARE the sheet here —
+    # an incomplete read is (correctly) retried, which would add calls.
+    await SR.read_answer_sheet(b"x", 2, expected_questions=[1, 22])
     # Letters AND written answers come from the SAME single call.
     assert len(patched.calls) == 1
 

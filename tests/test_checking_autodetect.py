@@ -1,236 +1,140 @@
 """
 Saqlangan-mode auto-detect wiring: OCR variant → auto-grade vs picker,
-caption fast-path, name fallback, unreadable sheet. Drives the real handlers
-with light fakes (no DB, no Gemini, no Telegram).
+caption fast-path, name fallback, unreadable sheet.
+
+CP-4: drives the real handlers against a seeded project on the per-run database
+(tests/sheet_harness.py). "Graded" means the sheet row reached `graded` and a
+check_results row names the student and variant; "picker" means the sheet waits
+in `needs_variant` with the buttons on screen.
 """
 from __future__ import annotations
 
-import io
-
-import pytest
-
 import app.bot.handlers.checking as C
-from app.bot.states.forms import CheckingStates
+from app.services import sheet_checks as S
+from tests.sheet_harness import FakeMsg, buttons, sheet_env  # noqa: F401
+
+KEY = {"1": ["A"], "2": ["B"], "3": ["C"], "4": ["D"]}
 
 
-# ── Fakes ─────────────────────────────────────────────────────────────────────
-class _Sent:
-    async def delete(self):  # the "checking..." status message
-        pass
+async def _run(env, variants=(1, 2, 3)):
+    project_id = await env.saved_project({n: KEY for n in variants})
+    return await env.run_state("saved", project_id=project_id)
 
 
-class _Photo:
-    def __init__(self, fid):
-        self.file_id = fid
+async def _photo(env, st, *, caption=None, **read) -> FakeMsg:
+    env.script_reads(P=read)
+    msg = FakeMsg(photo="P", caption=caption)
+    await C.handle_answer_sheet_upload(msg, st, env.teacher, None)
+    return msg
 
 
-class FakeMsg:
-    def __init__(self, caption=None, photo_id="F1", text=None):
-        self.caption = caption
-        self.photo = [_Photo(photo_id)] if photo_id else None
-        self.document = None
-        self.text = text
-        self.chat = type("C", (), {"id": 999})()
-        self.answers = []  # list of (text, reply_markup)
-
-    async def answer(self, text, reply_markup=None, **kw):
-        self.answers.append((text, reply_markup))
-        return _Sent()
+async def _graded(env) -> list[dict]:
+    return [{"variant": r.variant_number, "name": r.student_name}
+            for r in await env.check_results()]
 
 
-class FakeState:
-    def __init__(self, data=None):
-        self._data = dict(data or {})
-        self.state = None
-
-    async def get_data(self):
-        return dict(self._data)
-
-    async def update_data(self, **kw):
-        self._data.update(kw)
-
-    async def set_state(self, s):
-        self.state = s
-
-    async def clear(self):
-        self._data = {}
-        self.state = None
-
-
-class FakeBot:
-    async def get_file(self, fid):
-        return type("F", (), {"file_path": "path"})()
-
-    async def download_file(self, path):
-        return io.BytesIO(b"imgbytes")
-
-
-class FakeUser:
-    def __init__(self):
-        self.id = "uid-1"
-        self.telegram_id = 123
-        self.language = type("L", (), {"value": "uz"})()
-
-
-@pytest.fixture
-def wired(monkeypatch):
-    """Patch the DB/Gemini/storage seams; capture _grade_saved calls."""
-    async def fake_save_file(content, folder=None, filename=None):
-        return "temp/key"
-    monkeypatch.setattr(C.storage, "save_file", fake_save_file)
-
-    graded = []
-    async def fake_grade_saved(message, state, db_user, variant_num, name):
-        graded.append({"variant": variant_num, "name": name})
-    monkeypatch.setattr(C, "_grade_saved", fake_grade_saved)
-
-    def set_project(valid, expected):
-        async def fake_project_variants(project_id, user_id):
-            return set(valid), expected
-        monkeypatch.setattr(C, "_project_variants", fake_project_variants)
-
-    def set_read(variant, student_name, answers, unclear=None, texts=None):
-        async def fake_read(content, expected_count, option_labels=None):
-            return {
-                "variant": variant, "student_name": student_name,
-                "answers": answers, "texts": texts or {}, "unclear": unclear or [],
-            }
-        monkeypatch.setattr(C, "read_answer_sheet", fake_read)
-
-    return set_project, set_read, graded
+async def _status(env) -> str:
+    rows = await env.sheets()
+    assert len(rows) == 1, rows
+    return rows[0].status
 
 
 # ── OCR variant matches a project variant → auto-grade, no typing ─────────────
-async def test_ocr_variant_matches_autogrades(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=2, student_name="Ali", answers={1: "A", 2: "B"})
+async def test_ocr_variant_matches_autogrades(sheet_env):
+    st = await _run(sheet_env)
+    await _photo(sheet_env, st, variant=2, student_name="Ali", answers={1: "A", 2: "B"})
 
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-
-    assert graded == [{"variant": 2, "name": "Ali"}]  # auto-graded, no picker
+    assert await _graded(sheet_env) == [{"variant": 2, "name": "Ali"}]  # no picker
 
 
 # ── OCR variant not in the project set → picker (no auto-grade) ───────────────
-async def test_ocr_variant_unknown_shows_picker(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=9, student_name="Ali", answers={1: "A"})
+async def test_ocr_variant_unknown_shows_picker(sheet_env):
+    st = await _run(sheet_env)
+    msg = await _photo(sheet_env, st, variant=9, student_name="Ali", answers={1: "A"})
 
-    st = FakeState({"project_id": "p1"})
-    msg = FakeMsg()
-    await C.handle_answer_sheet_upload(msg, st, FakeUser(), FakeBot())
-
-    assert graded == []  # did NOT guess
-    assert st.state == CheckingStates.waiting_for_variant_number
-    assert msg.answers[-1][1] is not None  # picker keyboard shown
+    assert await _graded(sheet_env) == []  # did NOT guess
+    assert await _status(sheet_env) == S.NEEDS_VARIANT
+    assert buttons(msg.last.reply_markup)  # picker keyboard shown
 
 
 # ── null OCR variant → picker too ─────────────────────────────────────────────
-async def test_ocr_variant_null_shows_picker(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2], 4)
-    set_read(variant=None, student_name="Ali", answers={1: "A"})
-
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-    assert graded == []
-    assert st.state == CheckingStates.waiting_for_variant_number
+async def test_ocr_variant_null_shows_picker(sheet_env):
+    st = await _run(sheet_env, variants=(1, 2))
+    await _photo(sheet_env, st, variant=None, student_name="Ali", answers={1: "A"})
+    assert await _graded(sheet_env) == []
+    assert await _status(sheet_env) == S.NEEDS_VARIANT
 
 
 # ── Caption fast-path: caption variant wins over a bad OCR read ───────────────
-async def test_caption_variant_fast_path(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=9, student_name=None, answers={1: "A"})  # OCR wrong/blank
+async def test_caption_variant_fast_path(sheet_env):
+    st = await _run(sheet_env)
+    await _photo(sheet_env, st, caption="Ali 2",
+                 variant=9, student_name=None, answers={1: "A"})  # OCR wrong/blank
 
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(caption="Ali 2"), st, FakeUser(), FakeBot())
-
-    assert graded == [{"variant": 2, "name": "Ali"}]  # caption's 2 + name used
+    assert await _graded(sheet_env) == [{"variant": 2, "name": "Ali"}]  # caption's 2 + name
 
 
 # ── Name unreadable but variant good → prompt for name first, then grade ─────
-async def test_name_unreadable_prompts_then_grades(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=2, student_name=None, answers={1: "A"})  # no name anywhere
-
-    st = FakeState({"project_id": "p1"})
-    msg = FakeMsg()
-    await C.handle_answer_sheet_upload(msg, st, FakeUser(), FakeBot())
+async def test_name_unreadable_prompts_then_grades(sheet_env):
+    st = await _run(sheet_env)
+    await _photo(sheet_env, st, variant=2, student_name=None, answers={1: "A"})
 
     # Grading is deferred until the optional name prompt is answered.
-    assert graded == []
-    assert st.state == CheckingStates.waiting_for_saved_name
+    assert await _graded(sheet_env) == []
+    assert await _status(sheet_env) == S.NEEDS_NAME
 
     # Teacher types the name → now it grades against the good variant.
-    await C.handle_saved_student_name(FakeMsg(text="Aziz"), st, FakeUser())
-    assert graded == [{"variant": 2, "name": "Aziz"}]
+    await C.handle_sheet_text(FakeMsg(text="Aziz"), st, sheet_env.teacher)
+    assert await _graded(sheet_env) == [{"variant": 2, "name": "Aziz"}]
 
 
 # ── Both unreadable (name+variant) but answers OK → name prompt, then picker ──
-async def test_both_unreadable_falls_back(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=None, student_name=None, answers={1: "A", 2: "B"})
-
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-    assert st.state == CheckingStates.waiting_for_saved_name  # name asked first
+async def test_both_unreadable_falls_back(sheet_env):
+    st = await _run(sheet_env)
+    await _photo(sheet_env, st, variant=None, student_name=None, answers={1: "A", 2: "B"})
+    assert await _status(sheet_env) == S.NEEDS_NAME  # name asked first
 
     # /skip the name → then the variant picker (manual fallback, never hard-break).
     msg2 = FakeMsg(text="/skip")
-    await C.handle_saved_student_name(msg2, st, FakeUser())
-    assert graded == []
-    assert st.state == CheckingStates.waiting_for_variant_number
-    assert msg2.answers[-1][1] is not None  # picker shown
+    await C.handle_sheet_text(msg2, st, sheet_env.teacher)
+    assert await _graded(sheet_env) == []
+    assert await _status(sheet_env) == S.NEEDS_VARIANT
+    assert buttons(msg2.last.reply_markup)  # picker shown
 
 
 # ── Unreadable SHEET (no answers at all) → retake, never grade ────────────────
-async def test_unreadable_sheet_asks_retake(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=2, student_name="Ali", answers={}, unclear=[])
-
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-    assert graded == []  # can't grade an unreadable sheet
+async def test_unreadable_sheet_asks_retake(sheet_env):
+    st = await _run(sheet_env)
+    msg = await _photo(sheet_env, st, variant=2, student_name="Ali", answers={}, unclear=[])
+    assert await _graded(sheet_env) == []  # can't grade an unreadable sheet
+    assert await _status(sheet_env) == S.UNREADABLE
+    assert msg.last.text == C._UNREADABLE["uz"]
 
 
 # ── Stage 5: a WRITTEN-only sheet (no marked options) still auto-grades ───────
-async def test_written_only_sheet_autogrades(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
+async def test_written_only_sheet_autogrades(sheet_env):
+    st = await _run(sheet_env)
     # all answers came through the written channel — none marked as options
-    set_read(variant=2, student_name="Ali", answers={}, texts={1: "8,23", 2: "temurbek"})
+    await _photo(sheet_env, st, variant=2, student_name="Ali",
+                 answers={}, texts={1: "8,23", 2: "temurbek"})
 
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-
-    assert graded == [{"variant": 2, "name": "Ali"}]  # readable via texts, graded
+    assert await _graded(sheet_env) == [{"variant": 2, "name": "Ali"}]  # readable via texts
 
 
 # ── Stage 5: nothing on the sheet (no options, no texts, no unclear) → retake ──
-async def test_fully_blank_sheet_asks_retake(wired):
-    set_project, set_read, graded = wired
-    set_project([1, 2, 3], 4)
-    set_read(variant=2, student_name="Ali", answers={}, texts={}, unclear=[])
-
-    st = FakeState({"project_id": "p1"})
-    await C.handle_answer_sheet_upload(FakeMsg(), st, FakeUser(), FakeBot())
-    assert graded == []  # truly unreadable → no grade
+async def test_fully_blank_sheet_asks_retake(sheet_env):
+    st = await _run(sheet_env)
+    await _photo(sheet_env, st, variant=2, student_name="Ali", answers={}, texts={}, unclear=[])
+    assert await _graded(sheet_env) == []  # truly unreadable → no grade
+    assert await _status(sheet_env) == S.UNREADABLE
 
 
 # ── No variants for the project → clear message, no crash ─────────────────────
-async def test_no_variants_message(wired):
-    set_project, set_read, graded = wired
-    set_project([], 0)
-    set_read(variant=1, student_name="Ali", answers={1: "A"})
+async def test_no_variants_message(sheet_env):
+    project_id = await sheet_env.saved_project({})
+    st = await sheet_env.run_state("saved", project_id=project_id)
+    msg = await _photo(sheet_env, st, variant=1, student_name="Ali", answers={1: "A"})
 
-    st = FakeState({"project_id": "p1"})
-    msg = FakeMsg()
-    await C.handle_answer_sheet_upload(msg, st, FakeUser(), FakeBot())
-    assert graded == []
-    assert msg.answers  # a message was sent
+    assert await _graded(sheet_env) == []
+    assert msg.last.text == C._NO_KEY["uz"]   # a message was sent
+    assert await sheet_env.sheets() == []     # no sheet: no read happened, nothing charged

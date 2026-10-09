@@ -1,0 +1,18 @@
+# LOCAL DEVELOPMENT ONLY. Compose merges this over docker-compose.yml
+# automatically; deployments that do not copy this file are unaffected.
+#
+# Why it exists: docker-compose.yml is the PRODUCTION stack, where the bot runs
+# as a container on the compose network and Redis is deliberately unpublished
+# ("reachable only from other containers ... never from the host/internet").
+# Locally the bot and the test suite run on the HOST and reach Redis through
+# REDIS_URL=redis://...@localhost:6379, so the port has to be published or every
+# Redis-backed path fails with "Redis ishlamayapti" (9 tests in
+# test_book_handlers.py, plus the real upload flow).
+#
+# Bound to 127.0.0.1 rather than 0.0.0.0 so this stays a loopback-only hole,
+# which keeps the production comment's intent (never exposed off the machine)
+# while making local dev work. Postgres is already published the same way.
+services:
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"

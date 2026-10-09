@@ -126,3 +126,44 @@ def test_saved_flow_numeric_guards():
     assert check_answers({"1": "2,3"}, {"1": ["2/3"]}).wrong == 1     # comma ≠ fraction
     assert check_answers({"1": "0.67"}, {"1": ["2/3"]}).wrong == 1    # decimal ≠ fraction
     assert check_answers({"1": "-5"}, {"1": ["5"]}).wrong == 1        # sign preserved
+
+
+# ── CP32: the CP22 digit-vs-written ambiguity is grading-neutral ─────────────
+#
+# The open worry: on a NUMERIC-labelled test, a bare digit could be a marked
+# option OR a written numeric answer, and a written question's digit was once
+# read as the wrong thing. These tests PIN that the routing (option-bucket vs
+# written-bucket) never changes the grade — grading is by VALUE, and the handler
+# merges both buckets into one per-position dict before check_answers sees it
+# (checking.py). So there is NO grading bug here; the only residual is the raw
+# Vision VALUE read, which is a printed-sheet re-test question, not a code one.
+
+_NUMERIC_KEY = {"1": ["5"], "2": ["8"]}   # q1 = MC label "5", q2 = written "8"
+
+
+def test_a_written_digit_grades_the_same_whichever_bucket_it_was_read_into():
+    # The handler merges read["answers"] and read["texts"] into ONE dict keyed by
+    # position, so by the time check_answers runs, the bucket is gone — the value
+    # "8" at position 2 is all that remains, and it is graded against ["8"].
+    merged = {"1": "5", "2": "8"}
+    result = check_answers(merged, _NUMERIC_KEY)
+    assert result.correct == 2 and result.wrong == 0
+
+
+def test_numeric_written_answers_grade_by_decimal_value():
+    # is_correct falls back to Decimal, so a written "08" or "8.0" still matches
+    # the expected "8" — the label-vs-written routing cannot affect this.
+    assert check_answers({"1": "5", "2": "08"}, _NUMERIC_KEY).correct == 2
+    assert check_answers({"1": "5", "2": "8.0"}, _NUMERIC_KEY).correct == 2
+
+
+def test_only_a_wrong_VALUE_loses_the_point_not_the_routing():
+    # The actual failure mode was a VALUE misread (8 read as 5). THAT loses the
+    # point — and no routing choice can rescue a wrong value, which is exactly why
+    # the fix lives in the reader's look-alike caution (output "?" when 8/5 are
+    # ambiguous), not in the grading code.
+    misread = {"1": "5", "2": "5"}          # position 2 read as 5 instead of 8
+    result = check_answers(misread, _NUMERIC_KEY)
+    assert result.wrong == 1                # position 2
+    q2 = next(q for q in result.question_results if q.position == 2)
+    assert q2.is_correct is False

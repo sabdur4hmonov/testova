@@ -15,6 +15,8 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 
+from PIL import Image
+
 from app.database import async_session_factory
 from app.models.project import Project, ProjectStatus
 from app.models.question import Question
@@ -32,7 +34,9 @@ from app.services.option_label_recovery import (
     flag_mixed_case_labels,
     recover_pdf_option_labels,
 )
+from app.services.docx_limits import InvalidDocx, validate_docx
 from app.services.file_processor import (
+    PageTooLargeError,
     attach_docx_inline_images,
     attach_images_to_questions,
     compute_page_infos,
@@ -51,11 +55,19 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 MAX_PAGES = 20
+# Soft wall-clock cap on page rendering (S1.3). asyncio.wait_for can abandon
+# the await but — same limitation noted in gemini_rest.py — cannot force-kill
+# a CPU-bound worker thread, so a pathologically slow parse still occupies a
+# thread-pool slot until it eventually finishes. This bounds the user-facing
+# wait and turns a hang into a clean rejection instead of a stuck status
+# message; it is not a full fix for thread-pool exhaustion under a sustained
+# attack (see the S1 security report for the process-isolation alternative).
+PAGE_RENDER_TIMEOUT = 60
 
 
 @dataclass
 class PipelineResult:
-    status: str                      # "ok" | "no_questions" | "refused_multi_section"
+    status: str                      # "ok" | "no_questions" | "refused_multi_section" | "file_rejected"
     questions: list = field(default_factory=list)
     sections: list = field(default_factory=list)
     quality: dict = field(default_factory=dict)
@@ -131,6 +143,21 @@ async def process_file(
     # the image store variant generation reads later, so they are left alone.
     await asyncio.to_thread(prune_debug_crops)
 
+    # ── F08: DOCX archive limits, before ANY reader sees the bytes ───────────
+    # The shape probe, python-docx and LibreOffice all expand the ZIP; a small
+    # upload that expands to gigabytes would OOM the whole bot. Rejected the
+    # same way as any other unsafe file (the teacher sees "file_rejected").
+    if file_type == "docx":
+        try:
+            await asyncio.to_thread(validate_docx, content)
+        except InvalidDocx as e:
+            logger.warning("file_rejected_docx_limits",
+                           project_id=project_id, reason=str(e))
+            await _set_project_status(
+                project_id, ProjectStatus.FAILED, f"rejected: {e}"
+            )
+            return PipelineResult(status="file_rejected")
+
     # ── Defect 3: DOCX with VML drawings / OMML equations → render via PDF ────
     # docx_to_images drops those shapes, so a segment diagram prints as "[Rasm]"
     # text and a stacked equation vanishes. When they're present, render the
@@ -140,7 +167,9 @@ async def process_file(
     # falls back to that same text render — visible degradation, never silent.
     effective_type = file_type
     effective_bytes = content
-    if file_type == "docx" and docx_has_renderable_shapes(content):
+    # Off the event loop: the probe decompresses document.xml (up to the F08
+    # part limit), which would otherwise stall every other teacher's update.
+    if file_type == "docx" and await asyncio.to_thread(docx_has_renderable_shapes, content):
         pdf_bytes = await asyncio.to_thread(docx_to_pdf, content)
         if pdf_bytes:
             effective_type = "pdf"
@@ -155,14 +184,42 @@ async def process_file(
             )
 
     # ── Convert to page images ────────────────────────────────────────────────
-    if effective_type == "pdf":
-        # Cap at render time (not just the slice below) so a many-page PDF
-        # never rasterises hundreds of pages into memory.
-        raw_pages = await asyncio.to_thread(pdf_to_images, effective_bytes, max_pages=MAX_PAGES)
-    elif effective_type == "docx":
-        raw_pages, _ = await asyncio.to_thread(docx_to_images, effective_bytes)
-    else:
-        raw_pages = await asyncio.to_thread(image_to_pages, effective_bytes)
+    # S1: a malicious/pathological file can fail here in several ways — a
+    # decompression-bomb image (Image.DecompressionBombError), an oversized
+    # PDF page (PageTooLargeError, see file_processor.pdf_to_images), a
+    # corrupt/malformed file PyMuPDF or PIL can't parse (their own generic
+    # exceptions), or a pathologically slow parse (asyncio.TimeoutError, soft
+    # cap only — see PAGE_RENDER_TIMEOUT above). All are caught the same way:
+    # a clean "file_rejected" result instead of an unhandled exception
+    # propagating up through the bot handler and leaving the teacher's status
+    # message stuck with no explanation.
+    try:
+        if effective_type == "pdf":
+            # Cap at render time (not just the slice below) so a many-page PDF
+            # never rasterises hundreds of pages into memory.
+            raw_pages = await asyncio.wait_for(
+                asyncio.to_thread(pdf_to_images, effective_bytes, max_pages=MAX_PAGES),
+                timeout=PAGE_RENDER_TIMEOUT,
+            )
+        elif effective_type == "docx":
+            raw_pages, _ = await asyncio.wait_for(
+                asyncio.to_thread(docx_to_images, effective_bytes),
+                timeout=PAGE_RENDER_TIMEOUT,
+            )
+        else:
+            raw_pages = await asyncio.wait_for(
+                asyncio.to_thread(image_to_pages, effective_bytes),
+                timeout=PAGE_RENDER_TIMEOUT,
+            )
+    except (Image.DecompressionBombError, PageTooLargeError, asyncio.TimeoutError) as e:
+        logger.warning("file_rejected_unsafe", project_id=project_id,
+                        reason=type(e).__name__, error=str(e))
+        await _set_project_status(project_id, ProjectStatus.FAILED, f"rejected: {e}")
+        return PipelineResult(status="file_rejected")
+    except Exception as e:  # noqa: BLE001 — any other parse failure, same graceful outcome
+        logger.warning("file_rejected_parse_error", project_id=project_id, error=str(e))
+        await _set_project_status(project_id, ProjectStatus.FAILED, f"parse error: {e}")
+        return PipelineResult(status="file_rejected")
 
     if not raw_pages:
         await _set_project_status(project_id, ProjectStatus.FAILED, "no pages")

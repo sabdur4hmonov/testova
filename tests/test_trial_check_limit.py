@@ -6,34 +6,15 @@ users are untouched; and the existing check quota gate blocks at the cap.
 import uuid
 from datetime import datetime, timezone
 
-import pytest
-
 from app.config import settings
 
 
-async def _engine():
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT monthly_check_limit FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_new_user_gets_trial_check_limit_existing_untouched():
+async def test_new_user_gets_trial_check_limit_existing_untouched(engine):
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.services.subscription import get_or_create_user
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     new_tg = int(uuid.uuid4().int % 10**11)
     old_tg = int(uuid.uuid4().int % 10**11)
@@ -58,18 +39,14 @@ async def test_new_user_gets_trial_check_limit_existing_untouched():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id.in_([new_tg, old_tg])))
             await s.commit()
-        await engine.dispose()
 
 
-async def test_trial_check_quota_blocks_at_cap():
+async def test_trial_check_quota_blocks_at_cap(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.services import quota
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     try:
@@ -94,4 +71,3 @@ async def test_trial_check_quota_blocks_at_cap():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()

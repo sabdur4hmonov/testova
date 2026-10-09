@@ -26,10 +26,11 @@ def test_support_and_help_use_admin_username(monkeypatch):
     from app.bot.handlers import settings as settings_handler  # noqa: F401
     from app.bot.handlers import start as start_handler  # noqa: F401
 
-    # the source references settings.ADMIN_USERNAME (single source of truth)
+    # the source references settings.ADMIN_USERNAME (single source of truth).
+    # notification_tasks.py (part of the dead Celery stack, AUDIT D-6) is
+    # deleted, not fixed, so it no longer belongs in this live-file list.
     for mod in ("app/bot/handlers/settings.py",
-                "app/bot/handlers/start.py",
-                "app/tasks/notification_tasks.py"):
+                "app/bot/handlers/start.py"):
         src = (APP_DIR.parent / mod).read_text(encoding="utf-8")
         assert "settings.ADMIN_USERNAME" in src, mod
     assert settings.ADMIN_USERNAME  # configured

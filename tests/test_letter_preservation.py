@@ -143,6 +143,43 @@ def test_correct_answers_new_row_list():
     assert q.correct_answers_ordered == ["PHONE", "TELEPHONE"]
 
 
+# ── CP22: wider Latin range (A–H) and numeric option labels ──────────────────
+def test_option_letters_now_reach_h():
+    from app.services.option_letters import is_option_letter
+    assert is_option_letter("G") and is_option_letter("H")
+    assert not is_option_letter("I"), "cap is H, not the whole alphabet"
+
+
+def test_norm_letter_reads_a_numeric_option_mark():
+    # A numeric-labelled test (allow_numeric=True): a single digit is a marked
+    # option. Without that flag it stays a written answer (the default), so a
+    # short-answer "5" is never misread as an option.
+    assert _norm_letter("3", allow_numeric=True) == "3"
+    assert _norm_letter("1", allow_numeric=True) == "1"
+    assert _norm_letter("3") is None            # default: digit is written text
+    # a multi-digit value is a written answer, not a label, either way
+    assert _norm_letter("42", allow_numeric=True) is None
+
+
+def test_numeric_labels_grade_by_value():
+    from app.services.checker import is_correct
+    # student marked "2", key is "2" → correct; "3" vs "2" → wrong.
+    assert is_correct("2", ["2"]) is True
+    assert is_correct("3", ["2"]) is False
+
+
+def test_numeric_labelled_variant_round_trips_through_grading():
+    qs = [{"question_id": "q1", "question_number": 1, "question_text": "t",
+           "options": {"1": "ta", "2": "tb", "3": "tc"}, "correct_answer": "2",
+           "correct_answers": ["2"]}]
+    v = generate_variants(qs, count=1, seed=5)[0]
+    key = v["answer_key"]["1"][0]
+    qd = v["questions_data"][0]
+    # the label the key points at, marked by the student, reads back and matches
+    correct_label = next(L for L in qd["options"] if L == key)
+    assert _norm_letter(correct_label, allow_numeric=True) == key
+
+
 def test_correct_answers_old_row_fallback_to_scalar():
     # options=NULL, correct_answers=NULL (pre-008 row) → falls back to the
     # legacy single-letter correct_answer, so old rows grade unchanged.

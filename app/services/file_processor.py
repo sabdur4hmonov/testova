@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -23,9 +24,37 @@ from docx.table import Table as _DocxTable
 from docx.text.paragraph import Paragraph as _DocxParagraph
 from PIL import Image, ImageDraw, ImageFont
 
+from app.services.docx_limits import InvalidDocx, validate_docx
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Decompression-bomb guard (S1.1). Pillow ships its own default (~89.5 MP),
+# but we set an explicit, documented value instead of relying on whatever a
+# future Pillow version's default happens to be. 50 MP is generous headroom
+# over any legitimate use here — even an A3 page at CROP_DPI=400 is only
+# ~31 MP — while still well below "allocates gigabytes" territory (50 MP RGB
+# is ~150 MB, not the ~11 GB a maliciously huge image/PDF page can demand).
+# Exceeding it raises Image.DecompressionBombError, which callers must catch
+# (see pipeline.process_file) rather than let crash the upload ungracefully.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
+# Same cap applied to PDF PAGE GEOMETRY before rendering (pdf_to_images): a
+# malicious PDF can declare a page size (MediaBox) far beyond any real sheet
+# of paper — e.g. the PDF-legal ~200x200in max — which Image.MAX_IMAGE_PIXELS
+# can't catch because the bomb happens inside PyMuPDF's get_pixmap(), before
+# any PIL Image ever exists. Verified empirically: an extreme case (60000x
+# 60000px, 10.8GB) makes PyMuPDF raise a catchable error FAST on this
+# machine — but that's an allocator implementation detail, not a guarantee;
+# on a host with more RAM/swap the same request could succeed until the OS
+# OOM-killer intervenes, which is not a catchable Python exception. Checking
+# projected pixel count before ever calling get_pixmap is the actual fix.
+MAX_PDF_PAGE_PIXELS = 50_000_000
+
+
+class PageTooLargeError(ValueError):
+    """A PDF page's geometry would render to a pathologically large image."""
+
 
 SUPPORTED_MIME_TYPES = {
     "application/pdf": "pdf",
@@ -100,11 +129,18 @@ def detect_file_type(filename: str, content: bytes) -> str:
         return "pdf"
     if content[:4] == b"PK\x03\x04":
         return "docx"
-    if content[:3] in (b"\xff\xd8\xff", b"\x89PNG", b"GIF"):
+    # AUDIT B-43: b"\x89PNG" is FOUR bytes, so `content[:3] in (...)` could
+    # never match it — PNG magic-byte detection was dead code, and a PNG fell
+    # through to the extension map or to file_type="unknown" when the filename
+    # was unhelpful. "unknown" then feeds the B-25 dispatch.
+    if content[:3] in (b"\xff\xd8\xff", b"GIF") or content[:4] == b"\x89PNG":
         return "image"
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image"   # the upload gate accepts .webp; detection did not
     ext = Path(filename).suffix.lower()
     return {"pdf": "pdf", ".pdf": "pdf", ".docx": "docx", ".jpg": "image",
-            ".jpeg": "image", ".png": "image"}.get(ext, "unknown")
+            ".jpeg": "image", ".png": "image",
+            ".webp": "image"}.get(ext, "unknown")
 
 
 # ── PDF utilities ─────────────────────────────────────────────────────────────
@@ -152,6 +188,18 @@ def pdf_to_images(
         page = doc[page_num]
         page_dpi = dpi if page.get_images() else min(dpi, 150)
         zoom = page_dpi / 72
+        # Reject a pathological page BEFORE rendering it (S1.2): a PDF page's
+        # declared size (MediaBox) is attacker-controlled and can be far
+        # larger than any real sheet of paper. Checked here, not just via
+        # Image.MAX_IMAGE_PIXELS, because that only sees a PIL Image AFTER
+        # get_pixmap() already rendered it — too late to avoid the cost.
+        projected_pixels = (page.rect.width * zoom) * (page.rect.height * zoom)
+        if projected_pixels > MAX_PDF_PAGE_PIXELS:
+            raise PageTooLargeError(
+                f"page {page_num + 1} would render to "
+                f"{projected_pixels / 1_000_000:.0f} MP at {page_dpi} DPI "
+                f"(page size {page.rect.width:.0f}x{page.rect.height:.0f}pt)"
+            )
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         pages.append(PageImage(page_number=page_num + 1, image=img))
@@ -751,9 +799,20 @@ def _find_drawing_figure_rect(
 # Case-INSENSITIVE: a paper may label its options lowercase (a), b), d), e)) —
 # those must be recognised as the options boundary too, otherwise a figure crop
 # can run straight through them and the garbage/recrop guards can't stop at them.
-_OPTION_MARKER_RE = re.compile(r'^[A-Ea-eА-Еа-е]\)')
+# AUDIT B-24: A-E only, while option_letters.py supports A-H (widened for
+# CP22's 3-8 option range) and sheet_reader supports NUMERIC labels 1-8.
+# MEASURED: F) G) H) 1) 5) and Cyrillic Zhe all failed, so on a paper with
+# 6+ options or digit labels the options boundary was invisible - figure
+# crops ran through the option block and the garbage detector's
+# "2+ option markers" guard never fired. Bounded on purpose: I) and Z)
+# are outside A-H, and 9)/0) outside the supported 1-8 numeric range.
+_OPTION_MARKER_RE = re.compile(r'^(?:[A-Ha-h]|[А-За-з]|[1-8])\)')
 # Question-number word: "12." / "12)" but NOT decimals like "0.5"
-_QNUM_WORD_RE = re.compile(r'^(\d{1,2})[.)](?!\d)')
+# AUDIT B-26: capped at 2 digits, so on a 100+ question paper every question
+# numbered 100+ was invisible to _rect_is_garbage's contains_question_number
+# check and to _expand_with_labels. Widened to 3 digits and bounded at 999:
+# a 4-digit run is a year or a page count, not a question number.
+_QNUM_WORD_RE = re.compile(r'^(\d{1,3})[.)](?!\d)')
 
 MAX_CROP_PAGE_RATIO = 0.35  # a figure never legitimately covers >35% of a page
 
@@ -1478,7 +1537,9 @@ def docx_to_images(docx_bytes: bytes) -> tuple[list[PageImage], str]:
 
     Returns (pages, text). Falls back to a plain-text render if structured
     walking fails, so a malformed DOCX still produces at least one page.
+    Raises InvalidDocx for an archive over the F08 limits (docx_limits).
     """
+    validate_docx(docx_bytes)
     doc = Document(io.BytesIO(docx_bytes))
     canvas = _DocxCanvas()
     body_font = _docx_font(_DOCX_BODY_PT)
@@ -1554,6 +1615,23 @@ SOFFICE_BIN = os.environ.get("SOFFICE_BIN", "soffice")
 # A hung conversion must never block the extraction pipeline.
 SOFFICE_TIMEOUT = 60  # seconds
 
+# AUDIT C-7: cap concurrent LibreOffice processes.
+#
+# docx_to_pdf spawns a full `soffice` per call (hundreds of MB resident) and is
+# dispatched via asyncio.to_thread onto a 32-worker pool, so N simultaneous
+# DOCX uploads previously meant N simultaneous soffice processes with nothing
+# bounding them — the realistic OOM path on a small VPS, where the kernel is as
+# likely to kill Postgres as the bot.
+#
+# threading, NOT asyncio: docx_to_pdf is a SYNC function executed on worker
+# threads, so an asyncio.Semaphore would not bound it.
+#
+# Failing to acquire returns None, which is already the function's documented
+# "any failure falls back to the text render" contract — a visible degradation,
+# never a crash.
+SOFFICE_MAX_CONCURRENT = int(os.environ.get("SOFFICE_MAX_CONCURRENT", "2"))
+_SOFFICE_SEMAPHORE = threading.BoundedSemaphore(SOFFICE_MAX_CONCURRENT)
+
 
 def docx_has_renderable_shapes(docx_bytes: bytes) -> bool:
     """True when the DOCX carries VML drawings, OMML equations, or DrawingML
@@ -1563,9 +1641,11 @@ def docx_has_renderable_shapes(docx_bytes: bytes) -> bool:
     headers/footers can never false-trigger a conversion of the body text.
 
     Best-effort: any error → False, so a probe failure keeps the current text
-    path rather than forcing a conversion. Never raises.
+    path rather than forcing a conversion. Never raises. An archive over the
+    F08 limits is never read (z.read would expand it whole).
     """
     try:
+        validate_docx(docx_bytes)
         with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
             xml = z.read("word/document.xml")
     except Exception as e:
@@ -1593,8 +1673,25 @@ def docx_to_pdf(docx_bytes: bytes, timeout: int = SOFFICE_TIMEOUT) -> bytes | No
     never collide on the default profile lock, and the non-root app user always
     has a writable profile HOME.
     """
-    tmp = Path(tempfile.mkdtemp(prefix="docx2pdf_"))
+    # F08: LibreOffice expands the archive and follows linked resources, so an
+    # over-limit file never reaches it (and never holds a conversion slot).
     try:
+        validate_docx(docx_bytes)
+    except InvalidDocx as e:
+        logger.warning("docx_to_pdf_rejected", reason=str(e))
+        return None
+    # Wait for a conversion slot. The bound is generous (a queued call may sit
+    # through one full conversion ahead of it) but finite, so a stuck pool
+    # degrades to the text render instead of pinning threads forever.
+    if not _SOFFICE_SEMAPHORE.acquire(timeout=timeout * 2):
+        logger.warning("docx_to_pdf_busy", max_concurrent=SOFFICE_MAX_CONCURRENT)
+        return None
+    # mkdtemp is INSIDE the try: a failure between acquire() and the try would
+    # otherwise leak a permit for the life of the process, and the semaphore is
+    # bounded — leak them all and DOCX conversion is dead until a restart.
+    tmp = None
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="docx2pdf_"))
         src = tmp / "in.docx"
         src.write_bytes(docx_bytes)
         profile_uri = (tmp / "profile").as_uri()
@@ -1633,7 +1730,9 @@ def docx_to_pdf(docx_bytes: bytes, timeout: int = SOFFICE_TIMEOUT) -> bytes | No
         logger.info("docx_to_pdf_ok", pdf_bytes=len(data))
         return data
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+        _SOFFICE_SEMAPHORE.release()
 
 
 def _save_docx_image(pic: Image.Image) -> str | None:
@@ -1667,6 +1766,7 @@ def docx_extract_ordered_images(docx_bytes: bytes) -> list[Image.Image]:
     """
     out: list[Image.Image] = []
     try:
+        validate_docx(docx_bytes)
         doc = Document(io.BytesIO(docx_bytes))
     except Exception as e:
         logger.warning("docx_open_failed", error=str(e))
@@ -1721,6 +1821,7 @@ def attach_docx_inline_images(questions: list[dict], docx_bytes: bytes) -> int:
 
 
 def docx_extract_text(docx_bytes: bytes) -> str:
+    validate_docx(docx_bytes)
     doc = Document(io.BytesIO(docx_bytes))
     lines: list[str] = []
     for para in doc.paragraphs:
@@ -1733,6 +1834,29 @@ def docx_extract_text(docx_bytes: bytes) -> str:
 def image_to_pages(image_bytes: bytes) -> list[PageImage]:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return [PageImage(page_number=1, image=img)]
+
+
+def deskew_correction(raw_angle: float) -> float:
+    """Rotation (degrees, counter-clockwise) that undoes `cv2.minAreaRect`'s
+    reported angle. Always within (-45, 45] — a deskew can never quarter-turn
+    a page (AUDIT B-1).
+
+    The previous logic branched on `angle < -45`, which assumed OpenCV's
+    PRE-4.5 range of [-90, 0). Installed is 4.11, whose range is (0, 90], so
+    that branch was dead and an already-straight page (reported as 90.0)
+    became a -90 degree rotation. MEASURED over the 18 real answer-sheet
+    photos in storage/temp/answer_sheets/: raw 90.00 -> applied -90.00 on
+    EVERY one of them.
+
+    A rectangle's orientation is only defined modulo 90 degrees, so the fold
+    below is version-agnostic by construction rather than trading one release's
+    convention for another's: 90.0 and 0.0 both mean "straight", 87.0 means
+    "3 degrees the other way".
+    """
+    angle = raw_angle % 90.0          # -> [0, 90)
+    if angle > 45.0:
+        angle -= 90.0                 # -> (-45, 45]
+    return -angle
 
 
 def preprocess_image(img: Image.Image, max_dim: int = PREPROCESS_MAX_DIM) -> Image.Image:
@@ -1754,13 +1878,20 @@ def preprocess_image(img: Image.Image, max_dim: int = PREPROCESS_MAX_DIM) -> Ima
 
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
+    # KNOWN LIMITATION, measured while fixing B-1 and deliberately NOT changed
+    # here: on a phone photo `gray < 200` selects 64-80% of the frame (the page
+    # is off-white under room light and the desk around it is darker), so the
+    # "ink" cloud fills the image and minAreaRect returns the frame itself.
+    # Proven by rotating real sheets 3/7/-5/12 degrees: the reported angle
+    # stayed pinned at exactly 90.00 in every case. So on the answer-sheet path
+    # this deskew now correctly does NOTHING rather than wrongly quarter-turning
+    # the page. It still works where the threshold does select real ink — a
+    # clean scan or document upload — which is why it is kept rather than
+    # deleted. Making it measure skew on photos needs a real ink mask (Otsu or
+    # adaptive threshold, page-region only); that is a separate change.
     coords = np.column_stack(np.where(gray < 200))
     if coords.size > 0:
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
+        angle = deskew_correction(cv2.minAreaRect(coords)[-1])
         if abs(angle) > 0.5:
             h, w = gray.shape
             center = (w // 2, h // 2)

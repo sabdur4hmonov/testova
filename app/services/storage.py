@@ -9,7 +9,7 @@ from typing import BinaryIO
 import aiofiles
 import aiofiles.os
 
-from app.config import settings
+from app.config import secret_value, settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -44,8 +44,8 @@ async def _s3_save(data: bytes | BinaryIO, key: str) -> str:
 
     s3 = boto3.client(
         "s3",
-        aws_access_key_id=settings.S3_ACCESS_KEY,
-        aws_secret_access_key=settings.S3_SECRET_KEY,
+        aws_access_key_id=secret_value(settings.S3_ACCESS_KEY) or None,
+        aws_secret_access_key=secret_value(settings.S3_SECRET_KEY) or None,
         endpoint_url=settings.S3_ENDPOINT_URL,
         region_name=settings.S3_REGION,
     )
@@ -72,8 +72,8 @@ async def _s3_read(key: str) -> bytes:
 
     s3 = boto3.client(
         "s3",
-        aws_access_key_id=settings.S3_ACCESS_KEY,
-        aws_secret_access_key=settings.S3_SECRET_KEY,
+        aws_access_key_id=secret_value(settings.S3_ACCESS_KEY) or None,
+        aws_secret_access_key=secret_value(settings.S3_SECRET_KEY) or None,
         endpoint_url=settings.S3_ENDPOINT_URL,
         region_name=settings.S3_REGION,
     )
@@ -93,8 +93,8 @@ async def delete_file(key: str) -> None:
         import boto3
         s3 = boto3.client(
             "s3",
-            aws_access_key_id=settings.S3_ACCESS_KEY,
-            aws_secret_access_key=settings.S3_SECRET_KEY,
+            aws_access_key_id=secret_value(settings.S3_ACCESS_KEY) or None,
+            aws_secret_access_key=secret_value(settings.S3_SECRET_KEY) or None,
             endpoint_url=settings.S3_ENDPOINT_URL,
         )
         s3.delete_object(Bucket=settings.S3_BUCKET, Key=key)

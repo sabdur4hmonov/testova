@@ -13,10 +13,25 @@ from app.models.user import Language, User
 
 router = Router(name="settings")
 
+# AUDIT B-2. Main-menu ENTRY handlers live here, not on `router`, and main.py
+# includes this ahead of every flow router. A menu button carries no state
+# filter, so it competes with each flow's `State, F.text` handler — and the
+# flow routers used to be included first, which meant the flow won and the
+# button's label was consumed as flow input. Registering the entry points on a
+# router that comes first makes the button win in EVERY state instead of only
+# in the states nobody happened to be in. Only the entry points belong here;
+# `router` keeps everything stateful.
+nav_router = Router(name="settings_nav")
 
-@router.message(F.text.in_({v["language"] for v in MAIN_MENU_TEXTS.values()}))
+
+@nav_router.message(F.text.in_({v["language"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_language_button(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
+    # Drop any abandoned flow's data first. Since B-2 this button wins in every
+    # state, so it is routinely pressed MID-flow — and set_state() replaces the
+    # state string while leaving `data` untouched. Same reason
+    # handle_check_button clears.
+    await state.clear()
     prompts = {
         "uz": "🌐 Tilni tanlang:",
         "en": "🌐 Select language:",
@@ -67,18 +82,21 @@ async def handle_language_selection(
 
 _TARIFLAR = {
     "uz": {"title": "Tariflar", "admin": "♾ Admin — cheksiz.", "month": "oy",
-           "gen": "ta test yaratish", "chk": "ta rasm tekshirish",
+           "gen": "ta test (kitobdan yoki fayldan)", "chk": "ta rasm tekshirish",
+           "book": "ta kitob yuklash",
            "manual": "To'lov qo'lda amalga oshiriladi — admin bilan bog'laning."},
     "en": {"title": "Pricing", "admin": "♾ Admin — unlimited.", "month": "month",
-           "gen": "test generations", "chk": "sheet checks",
+           "gen": "tests (from a book or a file)", "chk": "sheet checks",
+           "book": "book uploads",
            "manual": "Payment is manual — contact the admin."},
     "ru": {"title": "Тарифы", "admin": "♾ Админ — без ограничений.", "month": "мес",
-           "gen": "генераций тестов", "chk": "проверок листов",
+           "gen": "тестов (из книги или файла)", "chk": "проверок листов",
+           "book": "загрузок книг",
            "manual": "Оплата вручную — свяжитесь с админом."},
 }
 
 
-@router.message(F.text.in_({v["pricing"] for v in MAIN_MENU_TEXTS.values()}))
+@nav_router.message(F.text.in_({v["pricing"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_pricing(message: Message, db_user: User) -> None:
     from app.bot.keyboards.inline import pricing_keyboard
     from app.services import account, plans
@@ -96,17 +114,19 @@ async def handle_pricing(message: Message, db_user: User) -> None:
         f"{current}\n\n"
         "━━━━━━━━━━━━━━━━\n"
         f"📘 <b>{s.name} — {s.price_som:,} so'm/{tr['month']}</b>\n"
-        f"   • {s.variant_limit} {tr['gen']}\n"
-        f"   • {s.check_limit} {tr['chk']}\n\n"
+        f"   • {s.test_limit} {tr['gen']}\n"
+        f"   • {s.check_limit} {tr['chk']}\n"
+        f"   • {s.book_limit} {tr['book']}\n\n"
         f"💎 <b>{p.name} — {p.price_som:,} so'm/{tr['month']}</b>\n"
-        f"   • {p.variant_limit} {tr['gen']}\n"
-        f"   • {p.check_limit} {tr['chk']}\n\n"
+        f"   • {p.test_limit} {tr['gen']}\n"
+        f"   • {p.check_limit} {tr['chk']}\n"
+        f"   • {p.book_limit} {tr['book']}\n\n"
         f"💳 {tr['manual']}"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=pricing_keyboard(lang))
 
 
-@router.message(F.text.in_({v["support"] for v in MAIN_MENU_TEXTS.values()}))
+@nav_router.message(F.text.in_({v["support"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_support(message: Message, db_user: User) -> None:
     lang = db_user.language.value
     handle = f"@{settings.ADMIN_USERNAME}"

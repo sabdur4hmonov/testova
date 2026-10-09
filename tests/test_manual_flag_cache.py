@@ -1,86 +1,33 @@
 """
-The manual "Javob orqali" photo handler caches the read into FSM so a later step
-(name confirm / grading) can use it. Drives the real handler with light fakes
-(no DB, no Gemini, no Telegram) — the name-None path stops at the name prompt
-before any grading/DB work.
+The manual "Javob orqali" photo handler keeps the read so a later step (name
+confirm / grading) can use it without a second Gemini call.
+
+CP-4: the read is kept on the sheet's own sheet_checks row (it used to be
+cached in shared FSM keys). Drives the real handler against the per-run
+database; the name-None path stops at the name prompt before any grading.
 
 (The v0.14 low_confidence flag was removed once Design B switched the answer
 confirm to trigger on wrong-written answers; only name_unclear remains.)
 """
 from __future__ import annotations
 
-import io
-
 import app.bot.handlers.checking as C
-from app.bot.states.forms import CheckingStates
+from app.services import sheet_checks as S
+from tests.sheet_harness import FakeMsg, sheet_env  # noqa: F401
 
 
-class _Sent:
-    async def delete(self):
-        pass
+async def test_read_is_kept_on_the_sheet_row(sheet_env):
+    st = await sheet_env.run_state("manual", manual_key={"22": ["PHONE"]},
+                                   manual_total=22, manual_written=[22])
+    sheet_env.script_reads(P={"student_name": None, "texts": {22: "PHONE"}})
 
+    await C.handle_manual_sheet(FakeMsg(photo="P"), st, sheet_env.teacher, None)
 
-class _Photo:
-    def __init__(self, fid):
-        self.file_id = fid
-
-
-class FakeMsg:
-    def __init__(self, caption=None):
-        self.caption = caption
-        self.photo = [_Photo("F1")]
-        self.document = None
-        self.answers = []
-
-    async def answer(self, text, reply_markup=None, **kw):
-        self.answers.append(text)
-        return _Sent()
-
-
-class FakeState:
-    def __init__(self, data=None):
-        self._data = dict(data or {})
-        self.state = None
-
-    async def get_data(self):
-        return dict(self._data)
-
-    async def update_data(self, **kw):
-        self._data.update(kw)
-
-    async def set_state(self, s):
-        self.state = s
-
-
-class FakeBot:
-    async def get_file(self, fid):
-        return type("F", (), {"file_path": "p"})()
-
-    async def download_file(self, path):
-        return io.BytesIO(b"imgbytes")
-
-
-class FakeUser:
-    def __init__(self):
-        self.id = "uid"
-        self.telegram_id = 123
-        self.language = type("L", (), {"value": "uz"})()
-
-
-async def test_read_is_cached_into_fsm(monkeypatch):
-    async def fake_read(content, total, option_labels=None):
-        return {
-            "variant": None, "student_name": None, "name_unclear": False,
-            "answers": {}, "texts": {22: "PHONE"}, "unclear": [],
-        }
-    monkeypatch.setattr(C, "read_answer_sheet", fake_read)
-
-    st = FakeState({"manual_key": {"22": ["PHONE"]}, "manual_total": 22})
-    msg = FakeMsg()
-    await C.handle_manual_sheet(msg, st, FakeUser(), FakeBot())
-
+    rows = await sheet_env.sheets()
+    assert len(rows) == 1
     # student_name is None -> stops at the name prompt BEFORE grading.
-    assert st.state == CheckingStates.waiting_for_manual_name
-    # The read survived into the cache for the later grading step.
-    assert st._data["manual_texts"] == {"22": "PHONE"}
-    assert st._data["manual_name_unclear"] is False
+    assert rows[0].status == S.NEEDS_NAME
+    # The read survived onto the row for the later grading step.
+    assert rows[0].read["typed"]["texts"] == {"22": "PHONE"}
+    assert rows[0].name_unclear is False
+    assert await sheet_env.check_results() == []

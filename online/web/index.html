@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Testova — onlayn test</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <span class="brand">Testova</span>
+  <span id="title" class="title"></span>
+  <select id="lang" aria-label="Til / Язык / Language">
+    <option value="uz">O'zbek</option>
+    <option value="ru">Русский</option>
+    <option value="en">English</option>
+  </select>
+</header>
+
+<main>
+  <section id="loading" class="card"><p data-t="loading"></p></section>
+
+  <section id="start" class="card" hidden>
+    <h1 id="start-title"></h1>
+    <p id="start-meta" class="muted"></p>
+    <form id="start-form" autocomplete="off">
+      <label><span data-t="last_name"></span><input name="last_name" required maxlength="64"></label>
+      <label><span data-t="first_name"></span><input name="first_name" required maxlength="64"></label>
+      <label><span data-t="class_name"></span><input name="class_name" required maxlength="32"></label>
+      <ul class="rules">
+        <li data-t="rule_once"></li>
+        <li data-t="rule_leave"></li>
+        <li data-t="rule_saved"></li>
+      </ul>
+      <button type="submit" class="primary" data-t="start"></button>
+    </form>
+  </section>
+
+  <section id="exam" hidden>
+    <div class="exam-top">
+      <span id="pos" class="pos"></span>
+      <span id="qtimer" class="timer" hidden></span>
+      <span id="timer" class="timer"></span>
+    </div>
+    <article id="question" class="card question">
+      <div id="watermark" class="watermark" aria-hidden="true"></div>
+      <p id="context" class="context" hidden></p>
+      <p id="qtext" class="qtext"></p>
+      <img id="qimg" class="qimg" alt="" hidden>
+      <p id="multi-hint" class="muted" data-t="multi_hint" hidden></p>
+      <div id="options" class="options" role="group"></div>
+      <p id="saved" class="saved" aria-live="polite"></p>
+    </article>
+    <div class="nav-buttons">
+      <button id="prev" type="button" data-t="prev"></button>
+      <button id="next" type="button" class="primary" data-t="next"></button>
+    </div>
+    <nav id="panel" class="panel" aria-label="questions"></nav>
+    <button id="finish" type="button" class="finish" data-t="finish"></button>
+  </section>
+
+  <section id="done" class="card" hidden>
+    <h1 id="done-title"></h1>
+    <p id="done-text"></p>
+  </section>
+
+  <section id="error" class="card" hidden>
+    <p id="error-text"></p>
+  </section>
+</main>
+
+<div id="modal" class="modal" hidden role="alertdialog" aria-modal="true">
+  <div class="modal-box">
+    <p id="modal-text"></p>
+    <div class="modal-buttons">
+      <button id="modal-cancel" type="button" data-t="cancel" hidden></button>
+      <button id="modal-ok" type="button" class="primary" data-t="ok"></button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

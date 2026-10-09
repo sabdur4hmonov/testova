@@ -19,3 +19,6 @@ temp_images/
 *.db
 *.sqlite3
 docker/certs/
+
+# Internal reviews, drills and handoffs (laptop paths, ports, infra notes)
+docs/private/

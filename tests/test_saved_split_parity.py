@@ -1,114 +1,46 @@
 """
-Stage 6/7 step 3 proof: splitting _grade_saved into score-and-maybe-confirm +
-finalize must NOT change the no-confirm path. A saved check with zero
-wrong-written produces the identical report, Submission, and check_results row as
-the pre-split flow — which is exactly check_answers(sheet_answers, key).
+Splitting saved grading into score-and-maybe-confirm + finalize must NOT change
+the no-confirm path: a saved check with zero wrong-written answers produces the
+identical report, Submission and check_results row as check_answers(answers,
+key) on its own.
 
-Driven with light fakes; the two persistence sessions are captured so we can
-assert the exact rows written.
+CP-4: driven through the real handler against a seeded project on the per-run
+database (tests/sheet_harness.py); the rows are read back from the database.
 """
 from __future__ import annotations
 
-import uuid
-
 import app.bot.handlers.checking as C
-from app.bot.states.forms import CheckingStates
+from app.services import sheet_checks as S
 from app.services.answer_checker import check_answers
+from tests.sheet_harness import FakeMsg, sheet_env  # noqa: F401
 
 
-class _Sent:
-    async def delete(self):
-        pass
+async def _grade(env, variants: dict, number: int, *, open_positions=(), caption, **read):
+    project_id = await env.saved_project(variants, open_positions=open_positions)
+    st = await env.run_state("saved", project_id=project_id)
+    env.script_reads(P=read)
+    msg = FakeMsg(photo="P", caption=caption)
+    await C.handle_answer_sheet_upload(msg, st, env.teacher, None)
+    return project_id, st, msg
 
 
-class FakeMsg:
-    def __init__(self):
-        self.answers = []
-
-    async def answer(self, text, reply_markup=None, **kw):
-        self.answers.append((text, reply_markup))
-        return _Sent()
-
-
-class FakeState:
-    def __init__(self, data=None):
-        self._data = dict(data or {})
-        self.state = None
-
-    async def get_data(self):
-        return dict(self._data)
-
-    async def update_data(self, **kw):
-        self._data.update(kw)
-
-    async def set_state(self, s):
-        self.state = s
-
-
-class FakeUser:
-    telegram_id = 123
-    language = type("L", (), {"value": "uz"})()
-
-
-class _CapSession:
-    """Records every ORM object added, across all sessions opened."""
-    def __init__(self, sink):
-        self.sink = sink
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    def add(self, x):
-        self.sink.append(x)
-
-    async def commit(self):
-        pass
-
-
-_VID = str(uuid.uuid4())
-
-
-def _fsm(sheet_answers, key, sheet_texts):
-    return FakeState({
-        "sheet_answers": sheet_answers,
-        "sheet_answer_key": key,
-        "sheet_texts": sheet_texts,
-        "answer_sheet_key": "sheetkey",
-        "project_id": None,
-        "sheet_variant_id": _VID,
-        "run_results": [],
-    })
-
-
-def _rows(sink, cls_name):
-    return [x for x in sink if type(x).__name__ == cls_name]
-
-
-async def test_no_wrong_written_matches_check_answers(monkeypatch):
-    sink: list = []
-    monkeypatch.setattr(C, "async_session_factory", lambda: _CapSession(sink))
-
+async def test_no_wrong_written_matches_check_answers(sheet_env):
     key = {"1": ["A"], "2": ["B"], "3": ["TOSHKENT"]}   # Q3 is written
-    # Q2 is a WRONG marked option; Q3 written is CORRECT → NO wrong-written.
+    # Q2 is a WRONG mark; Q3 written is CORRECT → NO wrong-written.
+    project_id, _st, msg = await _grade(
+        sheet_env, {1: key}, 1, open_positions=[3], caption="ALI 1",
+        answers={1: "A", 2: "X"}, texts={3: "TOSHKENT"},
+    )
     sheet_answers = {"1": "A", "2": "X", "3": "TOSHKENT"}
-    sheet_texts = {"3": "TOSHKENT"}
-    st = _fsm(sheet_answers, key, sheet_texts)
-    msg = FakeMsg()
-
-    await C._score_and_maybe_confirm_saved(msg, st, FakeUser(), 1, "ALI")
-
     ref = check_answers(sheet_answers, key)
 
     # identical report body
-    assert ref.format_telegram_report("uz") in msg.answers[-1][0]
-    # back to the loop state
-    assert st.state == CheckingStates.waiting_for_answer_sheet
+    assert ref.format_telegram_report("uz") in msg.last.text
+    rows = await sheet_env.sheets()
+    assert [r.status for r in rows] == [S.GRADED]
 
     # identical Submission
-    subs = _rows(sink, "Submission")
+    subs = await sheet_env.submissions()
     assert len(subs) == 1
     s = subs[0]
     assert s.correct_count == ref.correct
@@ -116,47 +48,32 @@ async def test_no_wrong_written_matches_check_answers(monkeypatch):
     assert s.skipped_count == ref.skipped
     assert s.score == ref.score_percent
     assert s.student_answers == sheet_answers          # untouched (no overrides)
-    assert str(s.variant_id) == _VID
+    assert s.variant_id == await sheet_env.variant_id(project_id, 1)
 
     # identical check_results row
-    crs = _rows(sink, "CheckResult")
+    crs = await sheet_env.check_results()
     assert len(crs) == 1
     assert crs[0].score == ref.correct and crs[0].total == ref.total
 
 
-async def test_all_correct_clean_path(monkeypatch):
-    sink: list = []
-    monkeypatch.setattr(C, "async_session_factory", lambda: _CapSession(sink))
-
+async def test_all_correct_clean_path(sheet_env):
     key = {"1": ["A"], "2": ["B"]}
-    sheet_answers = {"1": "A", "2": "B"}
-    st = _fsm(sheet_answers, key, {})
-    msg = FakeMsg()
+    await _grade(sheet_env, {2: key}, 2, caption="ALI 2", answers={1: "A", 2: "B"})
 
-    await C._score_and_maybe_confirm_saved(msg, st, FakeUser(), 2, None)
-
-    ref = check_answers(sheet_answers, key)
+    ref = check_answers({"1": "A", "2": "B"}, key)
     assert ref.correct == 2 and ref.wrong == 0
-    subs = _rows(sink, "Submission")
+    subs = await sheet_env.submissions()
     assert subs[0].correct_count == 2 and subs[0].score == ref.score_percent
 
 
-async def test_wrong_written_enters_confirm(monkeypatch):
-    # Step 4: a wrong WRITTEN answer now enters the confirm state (Design B)
-    # instead of finalizing directly — tagged confirm_flow="saved", nothing
-    # persisted yet.
-    sink: list = []
-    monkeypatch.setattr(C, "async_session_factory", lambda: _CapSession(sink))
+async def test_wrong_written_enters_confirm(sheet_env):
+    # A wrong WRITTEN answer enters the confirm step instead of finalizing
+    # directly — nothing persisted yet.
+    await _grade(sheet_env, {1: {"1": ["TOSHKENT"]}}, 1, open_positions=[1],
+                 caption="ALI 1", texts={1: "TOSHKUNT"})   # written, WRONG (a misread)
 
-    key = {"1": ["TOSHKENT"]}
-    sheet_answers = {"1": "TOSHKUNT"}     # written, WRONG (a misread)
-    sheet_texts = {"1": "TOSHKUNT"}
-    st = _fsm(sheet_answers, key, sheet_texts)
-    msg = FakeMsg()
-
-    await C._score_and_maybe_confirm_saved(msg, st, FakeUser(), 1, "ALI")
-
-    assert st.state == CheckingStates.waiting_for_confirm
-    assert st._data.get("confirm_flow") == "saved"
-    assert st._data.get("confirm_pending") == [1]
-    assert len(_rows(sink, "Submission")) == 0   # NOT finalized yet
+    rows = await sheet_env.sheets()
+    assert rows[0].status == S.NEEDS_CONFIRM
+    assert rows[0].flow == "saved"
+    assert rows[0].confirm_pending == [1]
+    assert await sheet_env.submissions() == []   # NOT finalized yet

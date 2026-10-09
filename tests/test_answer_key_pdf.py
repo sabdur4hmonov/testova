@@ -83,6 +83,72 @@ def test_layout_many_variants_builds():
     assert build_answer_key_pdf([_variant(i) for i in range(1, 11)], "Many")[:4] == b"%PDF"
 
 
+# ── Regression: a variant taller than one page must FLOW, not crash ──────────
+# Production LayoutError: a 2-variant, ~46-question test built a ~968pt answer
+# column nested in a table cell (which cannot split), so doc.build hard-crashed
+# with "Flowable ... too large on page 2" and the teacher never got the PDF.
+def _long_variant(n: int, q: int = 46) -> dict:
+    """A realistic biology+chemistry-sized variant: MCQ letters, a couple of
+    open (unanswered) positions, and long written answers that widen the column
+    so the pair does not fit side by side — the exact production shape."""
+    key = {}
+    for p in range(1, q + 1):
+        if p % 9 == 0:
+            key[str(p)] = None                              # open → ✍ marker
+        elif p % 5 == 0:
+            key[str(p)] = ["1000 g, 400 g, 600 g"]          # long written → wide
+        elif p % 4 == 0:
+            key[str(p)] = ["A", "B"]                        # multi-accept
+        else:
+            key[str(p)] = ["E"]
+    return {"variant_number": n, "answer_key": key}
+
+
+def test_long_two_variant_key_splits_across_pages_without_crash():
+    fitz = pytest.importorskip("fitz")
+    pdf = build_answer_key_pdf([_long_variant(1), _long_variant(2)], "Biologiya + Kimyo")
+    assert pdf[:4] == b"%PDF"
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    assert len(doc) > 1, "a 46-answer key must span multiple pages, not overflow one"
+
+
+def test_single_variant_taller_than_a_page_splits():
+    fitz = pytest.importorskip("fitz")
+    pdf = build_answer_key_pdf([_long_variant(1, q=60)], "Huge")
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    assert len(doc) > 1
+
+
+def test_blast_radius_sweep_no_count_crashes():
+    """Blast-radius guard: the OLD builder crashed at ~44 questions/variant (the
+    column exceeded the page frame) — 47 in production was just past that cliff,
+    not a fluke. The new builder must clear the whole realistic range, and the
+    large sizes must span multiple pages (proving they flow, not shrink)."""
+    fitz = pytest.importorskip("fitz")
+    for q in (10, 20, 30, 40, 44, 46, 50, 60):
+        pdf = build_answer_key_pdf([_long_variant(1, q), _long_variant(2, q)], "Sweep")
+        assert pdf[:4] == b"%PDF", f"build failed at q={q}"
+        if q >= 44:
+            doc = fitz.open(stream=pdf, filetype="pdf")
+            assert len(doc) > 1, f"q={q} should span pages, got {len(doc)}"
+            doc.close()
+
+
+def test_long_key_still_renders_all_content_after_the_split():
+    """Not just 'does not crash' — the fixed layout must still show the headers,
+    the open marker, multi-accept joins, and long written answers (task 5)."""
+    fitz = pytest.importorskip("fitz")
+    pdf = build_answer_key_pdf([_long_variant(1), _long_variant(2)], "Bio+Kimyo")
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    txt = "".join(p.get_text() for p in doc)
+    assert "1-Variant" in txt and "2-Variant" in txt          # per-variant headers
+    assert _OPEN_MARKER in txt                                # open questions
+    assert "A / B" in txt                                     # multi-accept
+    assert "1000 g, 400 g, 600 g" in txt                      # long written answer
+    # repeatRows reprints the header on the continuation page.
+    assert txt.count("1-Variant") >= 2
+
+
 # ── Bug C: the marker is a clean write-in glyph, explained by a legend ───────
 def test_marker_is_writein_not_old_wording():
     assert _OPEN_MARKER not in ("ochiq", "-", "")           # not the old error-ish text

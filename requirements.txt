@@ -21,7 +21,7 @@ google-generativeai==0.8.3
 
 # ── Image Processing ──────────────────────────────────────────────────────────
 opencv-python-headless==4.11.0.86
-Pillow==12.2.0
+Pillow==12.3.0
 numpy==2.4.6
 
 # ── Document Processing ───────────────────────────────────────────────────────
@@ -39,10 +39,18 @@ aiofiles==24.1.0
 fastapi==0.115.12
 uvicorn[standard]==0.34.3
 
+# ── Admin web panel (HTML dashboard, separate app: app/admin/web) ─────────────
+# Session-cookie login + Jinja2 templates. Bootstrap 5 is vendored under
+# app/admin/web/static (no CDN at runtime). bcrypt is used directly (no passlib).
+jinja2==3.1.6
+itsdangerous==2.2.0
+python-multipart==0.0.32
+bcrypt==5.0.0
+
 # ── Config & Validation ───────────────────────────────────────────────────────
 pydantic==2.11.5
 pydantic-settings==2.9.1
-python-dotenv==1.1.0
+python-dotenv==1.2.2
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 structlog==25.3.0

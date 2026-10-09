@@ -8,34 +8,14 @@ Feature 1 — admin notification on a user's first-ever charged use.
 """
 import uuid
 
-import pytest
 
-
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT first_charged_at FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_register_first_charge_fires_exactly_once():
+async def test_register_first_charge_fires_exactly_once(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.models.user import User
     from app.services import access
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres / first_charged_at column not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     try:
@@ -63,7 +43,6 @@ async def test_register_first_charge_fires_exactly_once():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()
 
 
 # ── notify formatting + resilience (no network) ──────────────────────────────
@@ -137,20 +116,25 @@ class _RecordBot:
         return True
 
 
-async def test_charge_single_and_notify_sends_once_on_first_charge(monkeypatch):
+async def test_charge_single_and_notify_sends_once_on_first_charge(engine, monkeypatch):
     """End-to-end: a metered user's first charge decrements a use AND actually
     delivers the admin notification; a subsequent charge does NOT re-notify."""
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    from app import database
     from app.config import settings
     from app.models.user import User
     from app.services import access
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres / first_charged_at column not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
+    # charge_single_and_notify opens its OWN session via
+    # `from app.database import async_session_factory` at call time — the app's
+    # engine on the live database. Without this patch it charges a user that
+    # only exists in the per-run test database: the UPDATE matches no row and
+    # the test can only fail (or, with an id that happened to exist live, write
+    # to a real account). It passed before only because both pointed at live.
+    monkeypatch.setattr(database, "async_session_factory", sm)
     tg = int(uuid.uuid4().int % 10**11)
     monkeypatch.setattr(settings, "ADMIN_IDS", [777001, 777002])
     try:
@@ -183,4 +167,3 @@ async def test_charge_single_and_notify_sends_once_on_first_charge(monkeypatch):
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()

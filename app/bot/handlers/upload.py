@@ -12,6 +12,8 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from app.bot.file_download import fetch_telegram_file
+from app.bot.guards import AlreadyRunning, single_flight
 from app.bot.keyboards.inline import (
     delete_confirm_keyboard, dup_resolution_keyboard, exam_timer_offer_keyboard,
     format_choice_keyboard, key_finish_keyboard, reextract_keyboard,
@@ -55,9 +57,28 @@ from app.services.pdf_generator import (
     build_answer_key_pdf, build_variants_pdf, build_variants_pdf_compact,
 )
 from app.services.variant_generator import generate_variants, validate_questions
+from app.services.variant_store import create_edition, reserve_edition_code
+from app.bot.handlers import online
 from app.utils.logging import get_logger
 
 router = Router(name="upload")
+
+# Shown when a second variant count arrives while the first generation is still
+# building (same wording as multi_source's B-7 guard).
+_BUSY_GEN = {
+    "uz": "⏳ Variantlar allaqachon tayyorlanmoqda — kuting.",
+    "en": "⏳ Generation is already running — please wait.",
+    "ru": "⏳ Генерация уже идёт — подождите.",
+}
+
+# AUDIT B-2. The main-menu ENTRY handler lives on this router, not on `router`,
+# and main.py includes it ahead of every flow router. A menu button carries no
+# state filter, so it competes with each flow's `State, F.text` handler — and
+# the flow routers used to be included first, which meant the flow won and the
+# button's label was consumed as flow input. Only entry points belong here;
+# `router` keeps everything stateful.
+nav_router = Router(name="upload_nav")
+
 logger = get_logger(__name__)
 
 MAX_PAGES = 20
@@ -69,9 +90,11 @@ T = {
     "send_file_now": {"uz": "📎 Endi test faylini yuboring (PDF):", "en": "📎 Now send the test file (PDF):", "ru": "📎 Теперь отправьте файл теста (PDF):"},
     "send_file":  {"uz": "📤 Test faylini yuboring (PDF, DOCX yoki rasm):", "en": "📤 Send your test file (PDF, DOCX or image):", "ru": "📤 Отправьте файл теста (PDF, DOCX или изображение):"},
     "too_big":    {"uz": "❌ Fayl {mb}MB dan katta bo'lmasin.", "en": "❌ File must be under {mb}MB.", "ru": "❌ Файл должен быть меньше {mb}МБ."},
+    "download_failed": {"uz": "❌ Faylni yuklab bo'lmadi (ulanish sekin bo'lishi mumkin). Iltimos, qaytadan yuboring.", "en": "❌ Couldn't download the file (the connection may be slow). Please send it again.", "ru": "❌ Не удалось загрузить файл (возможно, медленное соединение). Пожалуйста, отправьте его ещё раз."},
     "bad_format": {"uz": "❌ Faqat PDF, DOCX yoki rasm yuboring.", "en": "❌ Send PDF, DOCX or image only.", "ru": "❌ Отправьте PDF, DOCX или изображение."},
     "analyzing":  {"uz": "⏳ Tahlil qilinmoqda... (bir oz kuting)", "en": "⏳ Analysing... (please wait)", "ru": "⏳ Анализирую... (подождите)"},
     "no_q":       {"uz": "❌ Hech qanday savol topilmadi.\n\nFayl aniq va o'qilishi oson bo'lishi kerak.", "en": "❌ No questions found.\n\nMake sure the file is clear and readable.", "ru": "❌ Вопросы не найдены.\n\nУбедитесь, что файл чёткий и читаемый."},
+    "file_rejected": {"uz": "❌ Faylni qayta ishlab bo'lmadi (juda katta yoki buzilgan).\n\nBoshqa fayl yuboring.", "en": "❌ This file couldn't be processed (too large or corrupted).\n\nPlease try a different file.", "ru": "❌ Не удалось обработать файл (слишком большой или повреждён).\n\nПопробуйте другой файл."},
     "ans_missing": {
         "uz": "✅ <b>{n} ta savol</b> topildi!\n\n⚠️ Bu savollarda javob aniqlanmadi: <code>{missing}</code>\n\n📋 Har bir savol variantlari (aynan shu harflarni kiriting):\n{labels}\n\nMasalan: <code>1a 2b</code>. O'tkazib yuborish: <code>-</code>",
         "en": "✅ <b>{n} questions</b> found!\n\n⚠️ Correct answers not detected for: <code>{missing}</code>\n\n📋 Each question's real options (type exactly these letters):\n{labels}\n\nExample: <code>1a 2b</code>. Skip: <code>-</code>",
@@ -223,6 +246,21 @@ T = {
         "uz": "ℹ️ Qayta o'qishdan yangi natija olinmadi.",
         "en": "ℹ️ Re-reading produced no new result.",
         "ru": "ℹ️ Повторное чтение не дало нового результата.",
+    },
+    "reextract_frozen": {
+        "uz": "🔒 Bu test uchun variantlar allaqachon yaratilgan. Tarqatilgan variantlar va javob kalitlari o'zgartirilmaydi.\n\nSavollarni qayta o'qish kerak bo'lsa, faylni qaytadan yuboring — u yangi nusxa sifatida tekshiriladi.",
+        "en": "🔒 Variants were already generated for this test. Delivered variants and answer keys are never changed.\n\nTo re-read the questions, send the file again — it will be checked as a new copy.",
+        "ru": "🔒 Для этого теста варианты уже созданы. Выданные варианты и ключи ответов не изменяются.\n\nЧтобы перечитать вопросы, отправьте файл заново — он будет проверен как новая копия.",
+    },
+    "reextract_reanswer": {
+        "uz": "⚠️ Qayta o'qilgandan keyin bu savollarning avvalgi to'g'ri javobi yangi variantlar orasida topilmadi: <code>{nums}</code>\n\nJavobni qayta belgilang (aynan shu harflar bilan):\n{labels}\n\nMasalan: <code>{example}</code>",
+        "en": "⚠️ After re-reading, the previous correct answer of these questions is not among the new options: <code>{nums}</code>\n\nPlease mark the answer again (use exactly these letters):\n{labels}\n\nExample: <code>{example}</code>",
+        "ru": "⚠️ После повторного чтения прежний правильный ответ этих вопросов не найден среди новых вариантов: <code>{nums}</code>\n\nОтметьте ответ заново (именно этими буквами):\n{labels}\n\nНапример: <code>{example}</code>",
+    },
+    "reextract_need_answers": {
+        "uz": "⚠️ Avval qayta o'qilgan savollarning javobini belgilang: <code>{nums}</code>. Javobsiz savol bilan variant yaratilmaydi.",
+        "en": "⚠️ First mark the answers of the re-read questions: <code>{nums}</code>. Variants are not generated with an unanswered question.",
+        "ru": "⚠️ Сначала отметьте ответы перечитанных вопросов: <code>{nums}</code>. Варианты с вопросом без ответа не создаются.",
     },
     "unanswerable_info": {
         "uz": "⛔ Javob berib bo'lmaydigan savollar (reaksiyasi yo'qolgan): {nums}\nAsl fayl bilan solishtiring.",
@@ -672,9 +710,14 @@ async def _maybe_start_dup_resolution(
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
 
-@router.message(F.text.in_({v["upload"] for v in MAIN_MENU_TEXTS.values()}))
+@nav_router.message(F.text.in_({v["upload"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_upload_button(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
+    # Drop any abandoned flow's data first. Since B-2 this button wins in every
+    # state, so it is routinely pressed MID-flow — and set_state() replaces the
+    # state string while leaving `data` untouched, which would carry the old
+    # flow's keys into this one. Same reason handle_check_button clears.
+    await state.clear()
     # Name FIRST — held in FSM; NO project row is created until the file arrives.
     await state.set_state(UploadStates.waiting_for_test_name)
     await message.answer(t("ask_name", lang))
@@ -732,9 +775,10 @@ async def handle_file(message: Message, state: FSMContext, db_user: User, bot: B
     test_name = data.get("test_name") or filename
     fmt = data.get("pdf_format", "standard")
 
-    tg_file = await bot.get_file(file_id)
-    raw = await bot.download_file(tg_file.file_path)
-    content = raw.read()
+    content = await fetch_telegram_file(bot, file_id, size_bytes=file_size)
+    if content is None:
+        await message.answer(t("download_failed", lang))
+        return  # stay in waiting_for_file — nothing created yet, they can resend
 
     project_id = str(uuid.uuid4())
     file_key = await storage.save_file(
@@ -804,6 +848,11 @@ async def _run_extraction(
         await state.clear()
         return
 
+    if result.status == "file_rejected":
+        await status_msg.edit_text(t("file_rejected", lang))
+        await state.clear()
+        return
+
     if result.status == "refused_multi_section":
         await state.set_state(UploadStates.waiting_for_file)
         await status_msg.edit_text(
@@ -870,6 +919,11 @@ async def handle_reextract(
         return
 
     await callback.answer()
+    # CP-5: once variants exist their keys were delivered from these questions;
+    # rewriting them would desync what students hold. Refuse before the paid read.
+    if await _variants_exist(project_id):
+        await callback.message.answer(t("reextract_frozen", lang))
+        return
     status = await callback.message.answer(t("reextracting", lang))
 
     async with async_session_factory() as session:
@@ -922,6 +976,8 @@ async def handle_reextract(
         await status.edit_text(t("reextract_none", lang))
         return
 
+    carried: dict[int, list[str]] = {}
+    cleared: dict[int, list[str]] = {}   # number -> its new labels, for the re-ask
     async with async_session_factory() as session:
         from sqlalchemy import select
         qres = await session.execute(
@@ -935,18 +991,119 @@ async def handle_reextract(
             if not item:
                 continue
             opts = item.get("options", {})
-            r.question_text = item.get("question_text", r.question_text)
-            # Re-extract re-writes the label-preserving options JSON.
-            r.options = [
+            new_options = [
                 {"letter": str(k), "text": v}
                 for k, v in opts.items() if v and str(v).strip()
             ]
+            old_answers = r.correct_answers_ordered
+            r.question_text = item.get("question_text", r.question_text)
+            if old_answers:
+                # The answer follows its option TEXT, never its old letter: a
+                # re-read may relabel (A/B -> a/b) or reorder the options.
+                new_answers = _carry_answers(old_answers, r.options_ordered, new_options)
+                if new_answers:
+                    r.correct_answers = new_answers
+                    r.correct_answer = _legacy_letter(new_answers)
+                    carried[r.question_number] = new_answers
+                else:
+                    r.correct_answers = None
+                    r.correct_answer = None
+                    cleared[r.question_number] = [o["letter"] for o in new_options]
+            # Re-extract re-writes the label-preserving options JSON.
+            r.options = new_options
         await session.commit()
+
+    # The FSM answer map mirrors the database (it drives the missing-answer
+    # loop). Same value shape as before: a bare letter stays a bare letter.
+    data = await state.get_data()
+    answers = dict(data.get("answers") or {})
+    for num, new in carried.items():
+        old = answers.get(str(num))
+        answers[str(num)] = new[0] if isinstance(old, str) and len(new) == 1 else list(new)
+    for num in cleared:
+        answers[str(num)] = None
+    update: dict = {"answers": answers}
+    if cleared:
+        update["reextract_cleared"] = sorted(
+            set(data.get("reextract_cleared") or []) | set(cleared)
+        )
+    await state.update_data(**update)
 
     await status.edit_text(t(
         "reextract_done", lang,
         n=len(fresh), nums=", ".join(str(n) for n in sorted(fresh)),
     ))
+    if cleared:
+        # The cleared answers must be marked again before any generation
+        # (_proceed_after_key enforces it), whatever step the teacher was on.
+        await state.set_state(UploadStates.waiting_for_answers)
+        first = min(cleared)
+        await callback.message.answer(
+            t("reextract_reanswer", lang,
+              nums=", ".join(str(n) for n in sorted(cleared)),
+              labels="\n".join(
+                  f"{n}) {', '.join(labels) if labels else '✍️'}"
+                  for n, labels in sorted(cleared.items())
+              ),
+              example=f"{first}{cleared[first][0]}" if cleared[first] else f"{first}: ..."),
+            parse_mode="HTML",
+        )
+
+
+def _norm_option_text(text) -> str:
+    """Whitespace-insensitive, case-SENSITIVE: "x" and "X" can be different
+    options in a maths question."""
+    return " ".join(str(text).split())
+
+
+def _carry_answers(
+    old_answers: list[str], old_options: list[dict], new_options: list[dict],
+) -> list[str] | None:
+    """Map accepted answers onto re-read options by option text.
+
+    Returns the new labels, or None when any answer cannot be placed exactly
+    once (its text is gone or now ambiguous, or the question changed between
+    multiple-choice and open). A written (open) question keeps its texts while
+    it stays open."""
+    if not old_options:
+        return list(old_answers) if not new_options else None
+    if not new_options:
+        return None
+    old_text = {o["letter"]: _norm_option_text(o["text"]) for o in old_options}
+    carried: list[str] = []
+    for label in old_answers:
+        text = old_text.get(label)
+        if text is None:
+            return None
+        matches = [o["letter"] for o in new_options if _norm_option_text(o["text"]) == text]
+        if len(matches) != 1:
+            return None
+        carried.append(matches[0])
+    return carried
+
+
+def _legacy_letter(answers: list[str]) -> str | None:
+    """The legacy single-letter column, kept in sync as apply_key_text does."""
+    one = answers[0] if len(answers) == 1 else ""
+    return one if len(one) == 1 and one.isalpha() else None
+
+
+async def _reextract_unanswered(project_id: str, nums) -> list[int]:
+    """Of the questions whose answer re-extract cleared, those still without
+    one (deleted questions no longer count)."""
+    if not nums:
+        return []
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+        res = await session.execute(
+            select(Question).where(
+                Question.project_id == uuid.UUID(project_id),
+                Question.is_deleted.is_(False),
+                Question.question_number.in_([int(n) for n in nums]),
+            )
+        )
+        return sorted(r.question_number for r in res.scalars().all()
+                      if not r.correct_answers_ordered)
 
 
 async def _variants_exist(project_id: str) -> bool:
@@ -967,10 +1124,33 @@ async def _proceed_after_key(
     message: Message, state: FSMContext, lang: str, project_id: str
 ) -> None:
     """Key entry finished → duplicates to the teacher, else ask variant count."""
+    # A re-extract that could not carry an answer cleared it; every path to
+    # generation (🏁 Yakunlash, "skip", a complete key) passes here, so none of
+    # them may print a question without its answer.
+    data = await state.get_data()
+    unanswered = await _reextract_unanswered(project_id, data.get("reextract_cleared"))
+    if unanswered:
+        await state.set_state(UploadStates.waiting_for_answers)
+        await message.answer(
+            t("reextract_need_answers", lang, nums=", ".join(map(str, unanswered))),
+            parse_mode="HTML",
+        )
+        return
+    if data.get("reextract_cleared"):
+        await state.update_data(reextract_cleared=[])
     if await _maybe_start_dup_resolution(message, state, lang, project_id):
         return
+    await online.offer_mode(message, state, lang, "upload")
+
+
+async def _ask_variant_count(message: Message, state: FSMContext, lang: str) -> None:
+    """The offline next step: ask how many variants. Online tests branch off
+    here (handlers/online.py); with ONLINE_TEST_ENABLED off this runs at once."""
     await state.set_state(UploadStates.waiting_for_variant_count)
     await message.answer(t("ask_count", lang))
+
+
+online.register_offline("upload", _ask_variant_count)
 
 
 async def _reask_or_proceed(
@@ -1207,8 +1387,7 @@ async def handle_dup_resolution(
         )
     else:
         await callback.message.edit_text(note, parse_mode="HTML")
-        await state.set_state(UploadStates.waiting_for_variant_count)
-        await callback.message.answer(t("ask_count", lang))
+        await online.offer_mode(callback.message, state, lang, "upload")
     await callback.answer()
 
 
@@ -1220,9 +1399,8 @@ async def handle_dup_skip(
     (the safe default — nothing is ever removed without an explicit tap)."""
     lang = db_user.language.value
     logger.info("dup_resolution_skipped")
-    await state.set_state(UploadStates.waiting_for_variant_count)
     await message.answer(t("dup_skipped", lang))
-    await message.answer(t("ask_count", lang))
+    await online.offer_mode(message, state, lang, "upload")
 
 
 @router.message(UploadStates.waiting_for_variant_count, F.text)
@@ -1242,7 +1420,15 @@ async def handle_variant_count(message: Message, state: FSMContext, db_user: Use
         await state.clear()
         return
 
-    await _generate_and_send(message, db_user, project_id, count, state)
+    # The state stays waiting_for_variant_count for the whole build, so a second
+    # count past the 500ms throttle used to start a second paid generation (the
+    # B-7 class; proven in the CP-5 audit). Since CP-5 that second run can no
+    # longer rewrite a key — it would be a second edition — so this guards cost.
+    try:
+        async with single_flight(state, "variant_count"):
+            await _generate_and_send(message, db_user, project_id, count, state)
+    except AlreadyRunning:
+        await message.answer(_BUSY_GEN.get(lang, _BUSY_GEN["uz"]))
 
 
 # ── Core: generate variants + PDFs ───────────────────────────────────────────
@@ -1354,6 +1540,11 @@ async def _generate_and_send(
         ))
 
     variants     = await asyncio.to_thread(generate_variants, raw_qs, count)
+    # CP-5: every generation is a new edition; its code is printed on both PDFs.
+    async with async_session_factory() as session:
+        edition_code = await reserve_edition_code(session)
+    for v in variants:
+        v["edition_code"] = edition_code
     # The teacher's test name becomes the PDF title (variants + answer key).
     exam_title   = data_pre.get("test_name") or ((db_user.full_name or "Test") + " — Test")
     # compact (2-column) only when the teacher chose it before extraction;
@@ -1367,15 +1558,13 @@ async def _generate_and_send(
     key_pdf      = await asyncio.to_thread(build_answer_key_pdf, variants, exam_title)
 
     async with async_session_factory() as session:
-        for v in variants:
-            vrec = Variant(
-                project_id=uuid.UUID(project_id),
-                variant_number=v["variant_number"],
-                question_order=v["question_order"],
-                option_mapping=v["option_mapping"],
-                answer_key=v["answer_key"],
-            )
-            session.add(vrec)
+        # CP-5 (B-17): a NEW edition, never an update. Repeating this step (a
+        # retry after a failed send) used to rewrite the keys of the variants.pdf
+        # already delivered; now the earlier edition stays exactly as printed.
+        await create_edition(
+            session, project_id, variants, source="upload", title=exam_title,
+            pdf_format=data_pre.get("pdf_format") or "standard", code=edition_code,
+        )
         await session.commit()
 
     await status.edit_text(t("done", lang, n=count))

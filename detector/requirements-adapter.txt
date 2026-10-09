@@ -1,0 +1,2 @@
+# Optional future bot integration, independent of aiogram and production DB.
+httpx==0.28.1

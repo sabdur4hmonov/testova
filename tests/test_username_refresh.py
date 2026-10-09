@@ -5,29 +5,13 @@ get_or_create_user must mirror Telegram's CURRENT username/full_name on each
 call, so a changed @handle is reflected and /user @newname finds the user, and
 NULL usernames captured before this existed get backfilled on next contact.
 
-Runs against local Postgres; skips cleanly if unavailable.
+Runs against the per-run test database from the conftest `engine` fixture,
+never the live one.
 """
 import uuid
 
-import pytest
 
-
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT 1 FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_username_change_is_reflected_and_searchable():
+async def test_username_change_is_reflected_and_searchable(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -35,9 +19,6 @@ async def test_username_change_is_reflected_and_searchable():
     from app.services import admin_users
     from app.services.subscription import get_or_create_user
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     handle_old = f"old_{tg}"
@@ -63,10 +44,9 @@ async def test_username_change_is_reflected_and_searchable():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()
 
 
-async def test_null_username_is_backfilled_on_next_contact():
+async def test_null_username_is_backfilled_on_next_contact(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -74,9 +54,6 @@ async def test_null_username_is_backfilled_on_next_contact():
     from app.services import admin_users
     from app.services.subscription import get_or_create_user
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     handle = f"backfill_{tg}"
@@ -99,4 +76,3 @@ async def test_null_username_is_backfilled_on_next_contact():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()

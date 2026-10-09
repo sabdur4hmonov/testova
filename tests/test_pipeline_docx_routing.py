@@ -42,6 +42,9 @@ def _install_stubs(monkeypatch, calls, *, has_shapes, convert_result):
             return ret
         return _fn
 
+    # archive limits pass (the fake bytes aren't a ZIP; limits have their own
+    # tests in test_docx_archive_limits.py)
+    monkeypatch.setattr(pipeline, "validate_docx", lambda b: None)
     # source detection + conversion (the code under test)
     monkeypatch.setattr(pipeline, "docx_has_renderable_shapes",
                         lambda b: has_shapes)

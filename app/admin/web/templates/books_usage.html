@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Book usage — Testova Admin{% endblock %}
+{% block heading_mobile %}Books{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Kitob foydalanishi <span class="text-muted fs-6">({{ rows|length }} o‘qituvchi)</span></h1>
+  <div class="d-flex align-items-center gap-2">
+    {% if counts.at %}<span class="badge text-bg-danger">limitda: {{ counts.at }}</span>{% endif %}
+    {% if counts.near %}<span class="badge text-bg-warning">yaqin: {{ counts.near }}</span>{% endif %}
+    <a href="/books/library" class="btn btn-sm btn-outline-secondary">Ommaviy kutubxona ›</a>
+  </div>
+</div>
+
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead>
+      <tr>
+        <th>O‘qituvchi</th>
+        <th class="text-end">Kitoblar / limit</th>
+        <th></th>
+        <th class="text-end">Tahlil (oy)</th>
+        <th class="text-end">Tahlil (jami)</th>
+        <th class="w-limit-col">Limitni o‘zgartirish</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr class="{% if r.status == 'at' %}table-danger{% elif r.status == 'near' %}table-warning{% endif %}">
+        <td>
+          <a href="/users/{{ r.telegram_id }}" class="text-decoration-none">
+            {% if r.username %}@{{ r.username }}{% else %}{{ r.full_name[:24] }}{% endif %}
+          </a>
+          <div class="small text-muted"><code>{{ r.telegram_id }}</code></div>
+        </td>
+        <td class="text-end">
+          <b>{{ r.books_owned }}</b> / {% if r.book_limit is none %}∞{% else %}{{ r.book_limit }}{% endif %}
+        </td>
+        <td>
+          {% if r.status == 'at' %}<span class="badge text-bg-danger">limitda</span>
+          {% elif r.status == 'near' %}<span class="badge text-bg-warning">yaqin</span>
+          {% elif r.status == 'unlimited' %}<span class="badge text-bg-secondary">∞</span>
+          {% endif %}
+        </td>
+        <td class="text-end">{{ r.analysis_month }} / {% if r.analysis_month_limit is none %}∞{% else %}{{ r.analysis_month_limit }}{% endif %}</td>
+        <td class="text-end">{{ r.analysis_total }}</td>
+        <td>
+          <form class="input-group input-group-sm" method="post" action="/books/{{ r.telegram_id }}/setbooklimit">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input class="form-control" type="number" name="n"
+                   value="{{ r.book_limit if r.book_limit is not none else -1 }}" title="-1 = cheksiz">
+            <button class="btn btn-outline-primary">Saqlash</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="text-center text-muted py-4">Kitobga oid faollik yo‘q.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="small text-muted">
+  «Kitoblar / limit» — egalik qilinган kitoblar soni /setbooklimit chegarasiga nisbatan.
+  «Tahlil (jami)» — gemini_usage’dagi tahlil chaqiruvlari (biriktirilmagan eski yozuvlar hisobga olinmaydi).
+</p>
+{% endblock %}

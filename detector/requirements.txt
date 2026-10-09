@@ -1,0 +1,10 @@
+# Detector SERVICE runtime only — no torch, no transformers (see README.md).
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+pydantic==2.11.5
+python-multipart==0.0.32
+onnxruntime==1.30.0
+tokenizers==0.23.2
+numpy==2.4.6
+pillow==12.3.0
+pytesseract==0.3.13

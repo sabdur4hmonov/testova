@@ -65,8 +65,15 @@ async def run_broadcast(
             try:
                 await bot.send_message(chat_id, body)
                 sent += 1
-            except Exception:
+            except Exception as retry_exc:  # noqa: BLE001
                 failed += 1
+                # AUDIT B-57: this used to swallow silently while its sibling
+                # below logged, so systematic POST-FLOOD failures were
+                # misattributed to "the user blocked the bot".
+                logger.warning(
+                    "broadcast_retry_failed", chat_id=chat_id,
+                    error=str(retry_exc), error_type=type(retry_exc).__name__,
+                )
         except (TelegramForbiddenError, TelegramBadRequest):
             failed += 1  # blocked the bot / chat not found → skip gracefully
         except Exception as e:  # never let one bad recipient abort the rest

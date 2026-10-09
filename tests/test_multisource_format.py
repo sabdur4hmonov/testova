@@ -100,6 +100,26 @@ def _run_route(monkeypatch, data: dict) -> list[str]:
         return len(selections), build_one
     monkeypatch.setattr(MS, "pool_variant_builder", fake_builder)
 
+    # Never the live database. _do_generate opens sessions for the quota gate
+    # and (CP-5) to reserve the edition code printed on the PDFs; unpatched,
+    # both queried the real testova_db. A dummy session makes any unexpected
+    # query fail loudly here instead.
+    class _NoDb:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def _allow(*a, **k):
+        return True
+
+    async def _code(session):
+        return "K7Q2"
+    monkeypatch.setattr(MS, "async_session_factory", lambda: _NoDb())
+    monkeypatch.setattr(MS.quota, "check_and_consume", _allow)
+    monkeypatch.setattr(MS, "reserve_edition_code", _code)
+
     state = AsyncMock()
     state.get_data = AsyncMock(return_value=data)
     try:

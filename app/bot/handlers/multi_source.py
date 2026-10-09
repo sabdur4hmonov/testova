@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from aiogram import Bot, F, Router
+
+from app.bot.file_download import fetch_telegram_file
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
@@ -39,6 +41,7 @@ from app.bot.keyboards.inline import (
     format_choice_keyboard,
 )
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS
+from app.bot.guards import AlreadyRunning, single_flight
 from app.bot.states.forms import BuilderStates
 from app.config import settings
 from app.database import async_session_factory
@@ -64,12 +67,31 @@ from app.services.variant_generator import (
     predicted_reuse,
     select_for_variants,
 )
+from app.services.variant_store import create_edition, reserve_edition_code
+from app.bot.handlers import online
 from app.utils.logging import get_logger
 
 router = Router(name="multi_source")
+
+# AUDIT B-2. The main-menu ENTRY handler lives on this router, not on `router`,
+# and main.py includes it ahead of every flow router. A menu button carries no
+# state filter, so it competes with each flow's `State, F.text` handler — and
+# the flow routers used to be included first, which meant the flow won and the
+# button's label was consumed as flow input. Only entry points belong here;
+# `router` keeps everything stateful.
+nav_router = Router(name="multi_source_nav")
+
 logger = get_logger(__name__)
 
 MAX_VARIANTS = 50
+
+# B-7: shown when a teacher re-triggers generation while the first run is
+# still going.
+_BUSY_GEN = {
+    "uz": "⏳ Variantlar allaqachon tayyorlanmoqda — kuting.",
+    "en": "⏳ Generation is already running — please wait.",
+    "ru": "⏳ Генерация уже идёт — подождите.",
+}
 
 BT = {
     "start": {
@@ -101,6 +123,11 @@ BT = {
         "uz": "❌ Bu fayldan savol olinmadi. Sessiya saqlanib qoldi ({files} ta fayl).",
         "en": "❌ No questions from this file. Your session is intact ({files} file(s)).",
         "ru": "❌ Из файла не извлечены вопросы. Сессия сохранена ({files} файл(ов)).",
+    },
+    "file_rejected": {
+        "uz": "❌ Faylni qayta ishlab bo'lmadi (juda katta yoki buzilgan). Boshqa fayl yuboring. Sessiya saqlanib qoldi ({files} ta fayl).",
+        "en": "❌ This file couldn't be processed (too large or corrupted). Please send a different file. Your session is intact ({files} file(s)).",
+        "ru": "❌ Не удалось обработать файл (слишком большой или повреждён). Отправьте другой файл. Сессия сохранена ({files} файл(ов)).",
     },
     "dup_file": {
         "uz": "⚠️ Bu fayl sessiyaga allaqachon qo'shilgan ({filename}). Yana qo'shilsa, har bir savol ikki marta hisoblanadi.",
@@ -202,10 +229,13 @@ BT = {
         "en": "🗑 Session deleted.",
         "ru": "🗑 Сессия удалена.",
     },
+    # Navigation text — must name the CURRENT path. The flow moved under
+    # "Tayyor testdan" in the Kitobdan restructuring; the old single button no
+    # longer exists, so the previous wording sent teachers looking for it.
     "no_session": {
-        "uz": "ℹ️ Faol sessiya topilmadi. Boshlash uchun «📚 Ko'p manbadan test yaratish» tugmasini bosing.",
-        "en": "ℹ️ No active session. Tap \"📚 Multi-source test builder\" to start.",
-        "ru": "ℹ️ Активной сессии нет. Нажмите «📚 Тест из нескольких источников», чтобы начать.",
+        "uz": "ℹ️ Faol sessiya topilmadi. Boshlash uchun «📤 Tayyor testdan» → «📚 Bir nechta fayldan» tugmalarini bosing.",
+        "en": "ℹ️ No active session. Tap \"📤 From a ready test\" → \"📚 From several files\" to start.",
+        "ru": "ℹ️ Активной сессии нет. Нажмите «📤 Из готового теста» → «📚 Из нескольких файлов», чтобы начать.",
     },
     "stray": {
         "uz": "📚 Sessiya faol. Davom etish yoki bekor qilishni tanlang:",
@@ -340,9 +370,14 @@ async def _load_pool(session_id: str) -> tuple[list[dict], list[list], list[list
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
-@router.message(F.text.in_({v["multi"] for v in MAIN_MENU_TEXTS.values()}))
+@nav_router.message(F.text.in_({v["multi"] for v in MAIN_MENU_TEXTS.values()}))
 async def handle_builder_button(message: Message, state: FSMContext, db_user: User) -> None:
     lang = db_user.language.value
+    # Drop any abandoned flow's data first. Since B-2 this button wins in every
+    # state, so it is routinely pressed MID-flow — and set_state() replaces the
+    # state string while leaving `data` untouched. This MUST precede the
+    # builder_session_id write below, or resume would clear its own key.
+    await state.clear()
     active = await _get_active_session(db_user.id)
     if active:
         files, questions = await _session_counts(str(active.id))
@@ -445,16 +480,24 @@ async def handle_builder_file(
         await message.answer(ut("bad_format", lang))
         return
 
-    tg_file = await bot.get_file(file_id)
-    raw = await bot.download_file(tg_file.file_path)
-    content = raw.read()
+    content = await fetch_telegram_file(bot, file_id, size_bytes=file_size)
+    if content is None:
+        await message.answer(ut("download_failed", lang))
+        return  # stay put — they can resend the file
 
     # P3: same file twice? confirm before doubling every question.
     file_hash = hashlib.sha256(content).hexdigest()
     sources = await _load_sources(session_id)
     dup = next((s for s in sources if s.file_hash == file_hash), None)
     if dup:
-        await state.update_data(pending_file_id=file_id, pending_filename=filename)
+        # AUDIT B-52: stash the SIZE too. handle_dupfile_add re-downloads
+        # this file and was the one call site of eight that omitted
+        # size_bytes, losing the large-file timeout protection the
+        # shared helper exists to provide.
+        await state.update_data(
+            pending_file_id=file_id, pending_filename=filename,
+            pending_file_size=file_size,
+        )
         await message.answer(
             bt("dup_file", lang, filename=dup.filename),
             reply_markup=builder_dup_file_keyboard(lang),
@@ -476,11 +519,15 @@ async def handle_dupfile_add(
     await callback.answer()
     if not file_id or not session_id:
         return
-    tg_file = await bot.get_file(file_id)
-    raw = await bot.download_file(tg_file.file_path)
+    content = await fetch_telegram_file(
+        bot, file_id, size_bytes=data.get("pending_file_size"),
+    )
+    if content is None:
+        await callback.message.answer(ut("download_failed", db_user.language.value))
+        return  # the dup-file offer is gone, but nothing was corrupted; they can resend
     sources = await _load_sources(session_id)
     await _process_builder_file(
-        callback.message, state, db_user, raw.read(),
+        callback.message, state, db_user, content,
         data.get("pending_filename") or "file", session_id, len(sources) + 1,
     )
 
@@ -544,12 +591,16 @@ async def _process_builder_file(
         )
         return
 
-    if result.status == "no_questions":
-        # P5: the session survives a failed file.
+    if result.status in ("no_questions", "file_rejected"):
+        # P5: the session survives a failed file — including one rejected as
+        # unsafe to process (oversized/corrupted), same as any other failure.
         files, _q = await _session_counts(session_id)
         await state.set_state(BuilderStates.waiting_for_next_action)
+        # A rejected file says WHY (too large / corrupted), so the teacher
+        # sends another file instead of retrying the same one.
+        key = "file_rejected" if result.status == "file_rejected" else "file_failed"
         await status_msg.edit_text(
-            bt("file_failed", lang, files=files),
+            bt(key, lang, files=files),
             reply_markup=builder_fail_keyboard(lang),
         )
         return
@@ -889,12 +940,21 @@ async def handle_finish(callback: CallbackQuery, state: FSMContext, db_user: Use
     )
     # Ask Oddiy/Ixcham BEFORE the variant-count prompt. All extraction is
     # already done (per-file at upload) and generation is pure shuffle+render,
-    # so this costs no extra Gemini call.
+    # so this costs no extra Gemini call. Online tests branch off first
+    # (handlers/online.py); with ONLINE_TEST_ENABLED off this is unchanged.
+    await online.offer_mode(callback.message, state, lang, "multi")
+
+
+async def _ask_builder_format(message: Message, state: FSMContext, lang: str) -> None:
+    """The offline next step after the pool summary."""
     await state.set_state(BuilderStates.waiting_for_builder_format)
-    await callback.message.answer(
+    await message.answer(
         "Variantlarni qanday formatda olmoqchisiz?",
         reply_markup=format_choice_keyboard(),
     )
+
+
+online.register_offline("multi", _ask_builder_format)
 
 
 @router.callback_query(BuilderStates.waiting_for_builder_format, F.data.startswith("fmt:"))
@@ -953,13 +1013,24 @@ async def handle_builder_m(message: Message, state: FSMContext, db_user: User) -
             reply_markup=builder_reuse_keyboard(lang),
         )
         return
-    await _generate_from_pool(message, state, db_user)
+    # B-7: a second send would start a second paid generation.
+    try:
+        async with single_flight(state, "generate"):
+            await _generate_from_pool(message, state, db_user)
+    except AlreadyRunning:
+        await message.answer(_BUSY_GEN.get(lang, _BUSY_GEN["uz"]))
 
 
 @router.callback_query(BuilderStates.waiting_for_reuse_confirm, F.data == "bld:reuse_ok")
 async def handle_reuse_ok(callback: CallbackQuery, state: FSMContext, db_user: User) -> None:
     await callback.answer()
-    await _generate_from_pool(callback.message, state, db_user)
+    lang = db_user.language.value
+    # B-7: a second tap would start a second paid generation.
+    try:
+        async with single_flight(state, "generate"):
+            await _generate_from_pool(callback.message, state, db_user)
+    except AlreadyRunning:
+        await callback.answer(_BUSY_GEN.get(lang, _BUSY_GEN["uz"]), show_alert=True)
 
 
 @router.callback_query(BuilderStates.waiting_for_reuse_confirm, F.data == "bld:reuse_edit")
@@ -1081,6 +1152,12 @@ async def _do_generate(
         except Exception:
             pass
 
+    # CP-5: the edition code is printed on both PDFs, so choose it first.
+    async with async_session_factory() as session:
+        edition_code = await reserve_edition_code(session)
+    for v in variants:
+        v["edition_code"] = edition_code
+
     # The teacher's test name becomes the PDF title (variants + answer key).
     exam_title = data.get("test_name") or "Ko'p manbali test"
     # Layout choice only — compact if the teacher chose Ixcham at finish, else
@@ -1118,14 +1195,11 @@ async def _do_generate(
         # no ORM relationship on pool_project_id, so the unit-of-work emitted
         # the UPDATE before the INSERT → ForeignKeyViolationError.
         await session.flush()
-        for v in variants:
-            session.add(Variant(
-                project_id=pool_project_id,
-                variant_number=v["variant_number"],
-                question_order=v["question_order"],
-                option_mapping=v["option_mapping"],
-                answer_key=v["answer_key"],
-            ))
+        # CP-5: the pool project's first edition (a retry mints a new project).
+        await create_edition(
+            session, pool_project_id, variants, source="multi", title=exam_title,
+            pdf_format=data.get("pdf_format") or "standard", code=edition_code,
+        )
         from sqlalchemy import select
         res = await session.execute(
             select(BuilderSession).where(BuilderSession.id == uuid.UUID(session_id))
@@ -1173,7 +1247,13 @@ async def handle_gen_retry(callback: CallbackQuery, state: FSMContext, db_user: 
         await callback.answer()
         return
     await callback.answer()
-    await _generate_from_pool(callback.message, state, db_user)
+    lang = db_user.language.value
+    # B-7: a second tap would start a second paid generation.
+    try:
+        async with single_flight(state, "generate"):
+            await _generate_from_pool(callback.message, state, db_user)
+    except AlreadyRunning:
+        await callback.answer(_BUSY_GEN.get(lang, _BUSY_GEN["uz"]), show_alert=True)
 
 
 @router.callback_query(F.data == "bld:regen_params")

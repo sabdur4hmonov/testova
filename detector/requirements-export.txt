@@ -1,0 +1,9 @@
+# One-off ONNX export (scripts/export_onnx.py) and benchmark. Not in the image.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers>=4.45
+onnx
+safetensors
+huggingface_hub
+psutil

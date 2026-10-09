@@ -1,0 +1,9 @@
+# Build context is ./detector — ship only the service code.
+.venv/
+models/
+data/
+tests/
+scripts/
+notebooks/
+**/__pycache__/
+*.pyc

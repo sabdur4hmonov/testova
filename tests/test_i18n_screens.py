@@ -47,7 +47,7 @@ async def test_tariflar_all_langs_no_uz_leak():
         await handle_pricing(m, _pro(lang))
         assert "Standart" in m.text and "Pro" in m.text
         assert "so'm" in m.text                 # currency kept in every language
-        assert "50,000" in m.text and "100,000" in m.text
+        assert "75,000" in m.text and "150,000" in m.text
         if lang != "uz":
             for w in UZ_LEAK:
                 assert w not in m.text, f"Uzbek {w!r} leaked into {lang}"

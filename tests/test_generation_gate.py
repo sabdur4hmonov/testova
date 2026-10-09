@@ -4,39 +4,20 @@ BEFORE the paid Gemini extraction, while the check quota stays independent.
 
 Service level proves the shared-vs-independent counters; handler level proves
 both flows short-circuit before extraction when the shared counter is spent.
-Real Postgres; skips if unavailable.
+Real Postgres: the per-run test database from the conftest `engine` fixture,
+never the live one.
 """
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-import pytest
 
-
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT monthly_variant_limit FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_has_quota_shared_variant_vs_independent_check():
+async def test_has_quota_shared_variant_vs_independent_check(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.services import quota
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     now = datetime.now(timezone.utc)
@@ -58,7 +39,6 @@ async def test_has_quota_shared_variant_vs_independent_check():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()
 
 
 async def test_check_available_fails_open_on_error():
@@ -103,16 +83,18 @@ async def _exhausted_user(sm, tg):
         await s.commit()
 
 
-async def test_single_upload_blocks_before_extraction(monkeypatch):
+async def test_single_upload_blocks_before_extraction(engine, monkeypatch):
+    """Pinned with shadow mode OFF. While QUOTA_SHADOW_MODE is True the paid
+    caps log a would-have-blocked event and let the action through by design,
+    so leaving the flag on here would test the flag, not the gate. The shadowed
+    behaviour is covered in test_combined_test_quota.py."""
+    from app.config import settings
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.bot.handlers import upload
     from app.services import access
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     monkeypatch.setattr(upload, "async_session_factory", sm)
@@ -120,6 +102,7 @@ async def test_single_upload_blocks_before_extraction(monkeypatch):
     async def boom_pipeline(*a, **k):
         raise AssertionError("extraction ran despite exhausted generation quota")
 
+    monkeypatch.setattr(settings, "QUOTA_SHADOW_MODE", False)
     monkeypatch.setattr(upload, "run_pipeline_with_heartbeat", boom_pipeline)
     db_user = SimpleNamespace(telegram_id=tg, id=uuid.uuid4(),
                               language=SimpleNamespace(value="uz"))
@@ -132,19 +115,20 @@ async def test_single_upload_blocks_before_extraction(monkeypatch):
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()
 
 
-async def test_multi_source_blocks_before_extraction(monkeypatch):
+async def test_multi_source_blocks_before_extraction(engine, monkeypatch):
+    """Pinned with shadow mode OFF. While QUOTA_SHADOW_MODE is True the paid
+    caps log a would-have-blocked event and let the action through by design,
+    so leaving the flag on here would test the flag, not the gate. The shadowed
+    behaviour is covered in test_combined_test_quota.py."""
+    from app.config import settings
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.bot.handlers import multi_source
     from app.services import access
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     monkeypatch.setattr(multi_source, "async_session_factory", sm)
@@ -152,6 +136,7 @@ async def test_multi_source_blocks_before_extraction(monkeypatch):
     async def boom_save(*a, **k):
         raise AssertionError("save/extraction ran despite exhausted generation quota")
 
+    monkeypatch.setattr(settings, "QUOTA_SHADOW_MODE", False)
     monkeypatch.setattr(multi_source.storage, "save_file", boom_save)
     db_user = SimpleNamespace(telegram_id=tg, id=uuid.uuid4(),
                               language=SimpleNamespace(value="uz"))
@@ -166,4 +151,3 @@ async def test_multi_source_blocks_before_extraction(monkeypatch):
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()

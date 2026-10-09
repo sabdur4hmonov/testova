@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Public library — Testova Admin{% endblock %}
+{% block heading_mobile %}Library{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Ommaviy kutubxona <span class="text-muted fs-6">({{ books|length }})</span></h1>
+  <a href="/books" class="btn btn-sm btn-outline-secondary">‹ Kitob foydalanishi</a>
+</div>
+
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead>
+      <tr><th>Nomi</th><th>Fan / sinf</th><th class="text-end">Sahifa</th>
+          <th class="text-end">Mavzu</th><th class="text-end">Ishlatilgan</th>
+          <th>Yuklovchi</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for b in books %}
+      <tr>
+        <td>{{ b.title[:44] }}</td>
+        <td class="small">{{ b.subject or '—' }}{% if b.grade %} · {{ b.grade }}{% endif %}</td>
+        <td class="text-end">{{ b.page_count }}</td>
+        <td class="text-end">{{ b.themes }}</td>
+        <td class="text-end">{{ b.use_count }}</td>
+        <td>{% if b.owner_tg %}<a href="/users/{{ b.owner_tg }}"><code>{{ b.owner_tg }}</code></a>{% else %}—{% endif %}</td>
+        <td class="text-end">
+          <form method="post" action="/books/library/{{ b.id }}/delete"
+                data-confirm="«{{ b.title[:40] }}» kitobini butunlay o‘chirasizmi? Bu amalni ortga qaytarib bo‘lmaydi.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button class="btn btn-sm btn-outline-danger">O‘chirish</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="text-center text-muted py-4">Ommaviy kitob yo‘q.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="small text-muted">O‘chirish kitob yozuvini (mavzular, rasmlar, ruxsatlar bilan) o‘chiradi. PDF fayl xotirada qoladi.</p>
+{% endblock %}

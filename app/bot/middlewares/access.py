@@ -2,10 +2,37 @@
 Access-control middleware — the SINGLE gate for starting a metered action.
 
 Runs after AuthMiddleware (so db_user exists). Gates only the three entry
-BUTTON texts:
-  - "Variant yaratish"        → full has_access
-  - "Ko'p manbadan ..."       → has_access OR an active builder session (resume)
+BUTTON texts (the `upload` / `multi` / `check` keys of MAIN_MENU_TEXTS):
+  - "Bitta fayldan"           → full has_access
+  - "Bir nechta fayldan"      → has_access OR an active builder session (resume)
   - "Test tekshirish"         → can_check (block/date only, ignores uses)
+
+The first two are SUB-menu buttons under "Tayyor testdan" since the Kitobdan
+restructuring. The navigation buttons themselves ("Tayyor testdan",
+"Kitobdan", "Orqaga") are deliberately NOT gated here — pressing them only
+opens a menu. Because the label sets below are derived from MAIN_MENU_TEXTS,
+that move needed no change here; never hardcode a button string, or the gate
+can drift off the buttons and leave metered entry silently free.
+
+WHERE THE BOOK PATH IS GATED — it is NOT here, and that is deliberate.
+"Kitobdan" does lead to paid work (Vision extraction, then generation), but
+not from the button: the metered steps are several callbacks deep, and this
+middleware gates message BUTTON TEXTS only — callbacks and mid-flow messages
+pass by design, so an already-started flow always runs to completion. Gating
+the entry button would also be wrong on policy, because Bepul users are
+*allowed* into Kitobdan; they just cannot upload a book of their own.
+
+So the book path carries its own gates, in app/bot/handlers/book.py:
+
+  * `handle_book_add` refuses upload for Bepul (`plans.is_trial`), and
+    `book_entry_menu_keyboard(can_upload=...)` hides the button to match;
+  * `_run_page_range_generation` peeks (`access.has_access` +
+    `quota.check_available`) BEFORE the paid extraction;
+  * `_generate_one_attempt_inner` consumes `quota.TEST` and charges the Bepul
+    lifetime use.
+
+If you add a new metered book step, gate it THERE, next to the spend — not by
+adding a label to this file.
 
 Everything else passes: admins bypass; /start, /help, /myaccess and admin
 commands don't match the gated texts; mid-flow messages (files, keys,

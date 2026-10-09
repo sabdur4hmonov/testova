@@ -123,6 +123,14 @@ def init_scheduler():
     return _scheduler
 
 
+def get_scheduler():
+    """Expose the running scheduler so other in-process jobs (e.g. the
+    temp_images crop-retention cleanup) can register on the SAME instance
+    instead of starting a second one. None if init_scheduler was never
+    called or failed — callers must treat that as "no scheduler"."""
+    return _scheduler
+
+
 def shutdown_scheduler() -> None:
     """
     Stop the scheduler cleanly. Safe no-op if it was never started (e.g. startup

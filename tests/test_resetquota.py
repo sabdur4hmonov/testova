@@ -6,34 +6,16 @@ now (matching /plan), and leaves the plan tier + both limits unchanged. Logged.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import pytest
+from tests.synthetic_ids import TEST_ADMIN_ID
 
 
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT period_start FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_reset_quota_fresh_cycle_keeps_limits():
+async def test_reset_quota_fresh_cycle_keeps_limits(engine):
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.admin_log import AdminLog
     from app.models.user import User
     from app.services import admin_users, plans
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tg = int(uuid.uuid4().int % 10**11)
     old = datetime.now(timezone.utc) - timedelta(days=25)
@@ -42,8 +24,8 @@ async def test_reset_quota_fresh_cycle_keeps_limits():
         async with sm() as s:
             s.add(User(
                 telegram_id=tg, full_name="Reset T",
-                monthly_variant_limit=50, monthly_check_limit=1000,
-                variant_count_this_period=50, check_count_this_period=1000,
+                monthly_variant_limit=40, monthly_check_limit=800,
+                variant_count_this_period=40, check_count_this_period=800,
                 period_start=old, access_until=old + timedelta(days=30),
                 uses_left=None,
             ))
@@ -51,13 +33,13 @@ async def test_reset_quota_fresh_cycle_keeps_limits():
 
         before = datetime.now(timezone.utc)
         async with sm() as s:
-            u = await admin_users.reset_quota(s, 8206475760, tg)
+            u = await admin_users.reset_quota(s, TEST_ADMIN_ID, tg)
 
         # counts zeroed, fresh period + access, limits/tier UNCHANGED
         assert u.variant_count_this_period == 0 and u.check_count_this_period == 0
         assert u.period_start >= before
         assert u.access_until >= before + timedelta(days=29)   # ~now + 30d
-        assert u.monthly_variant_limit == 50 and u.monthly_check_limit == 1000
+        assert u.monthly_variant_limit == 40 and u.monthly_check_limit == 800
         assert plans.plan_name(u) == "Pro"                     # tier untouched
 
         # access window matches what /plan would set (now + PLAN_DAYS)
@@ -74,4 +56,3 @@ async def test_reset_quota_fresh_cycle_keeps_limits():
             await s.execute(delete(AdminLog).where(AdminLog.target == tg))
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()

@@ -54,16 +54,42 @@ def _num_pat(n: int) -> re.Pattern:
     return re.compile(rf'^{n}[.)]')
 
 
-def _locate_numbers(doc, qnums: list[int]) -> dict[int, tuple[int, float]]:
-    """qnum -> (page_index, y0). Margin-aware, document-wide. The earliest-page,
-    top-most left-margin candidate wins."""
+def _locate_numbers(
+    doc, qnums: list[int], page_hint: dict[int, int] | None = None,
+) -> dict[int, tuple[int, float]]:
+    """qnum -> (page_index, y0). Margin-aware. The earliest-page, top-most
+    left-margin candidate wins WITHIN the pages that question may occupy.
+
+    AUDIT B-22. This used to scan the whole document and take the first
+    left-margin match per number, so a front-matter numbered instruction list,
+    a contents page, or a printed answer key at the front claimed question
+    numbers on page 1. The band then came from the WRONG page, and the only
+    guard before OVERWRITING q["options"] is a marker-count match — so a
+    coincidental count silently rewrote the labels and remapped correct_answer
+    by position. The mismatch path is safe (`label_doubt`); the coincidence
+    path was not.
+
+    `page_hint` maps a question number to its own analysis page (1-based). The
+    search is then limited to that page and the next one, because a question
+    can spill over a page break — the same window `_recover_missing_options`
+    already uses. A question with no hint keeps the document-wide behaviour,
+    so nothing regresses when page numbers are unavailable.
+    """
+    page_hint = page_hint or {}
+
+    def _allowed(n: int, pi: int) -> bool:
+        hint = page_hint.get(n)
+        if not hint:
+            return True                     # no hint: unchanged behaviour
+        return pi in (hint - 1, hint)       # own page, or the spillover page
+
     located: dict[int, tuple[int, float]] = {}
     for pi in range(len(doc)):
         page = doc[pi]
         margin_x = page.rect.width * _LEFT_MARGIN_FRAC
         words = page.get_text("words")
         for n in qnums:
-            if n in located:
+            if n in located or not _allowed(n, pi):
                 continue
             pat = _num_pat(n)
             best_y = None
@@ -127,7 +153,14 @@ def recover_pdf_option_labels(pdf_bytes: bytes | None,
             q["question_number"] for q in opt_questions
             if q.get("question_number")
         })
-        located = _locate_numbers(doc, qnums)
+        # B-22: give each question its OWN page so a front-matter list cannot
+        # claim its number.
+        page_hint = {
+            q["question_number"]: q.get("page_number")
+            for q in opt_questions
+            if q.get("question_number") and q.get("page_number")
+        }
+        located = _locate_numbers(doc, qnums, page_hint)
 
         applied = 0
         flagged = 0

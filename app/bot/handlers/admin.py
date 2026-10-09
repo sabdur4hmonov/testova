@@ -4,29 +4,32 @@ ADMIN_IDS. Every mutating action is written to admin_log.
 
 Handlers here are THIN: all DB logic lives in `app.services.admin_users`
 (so a future web admin panel calls the same functions). Handlers parse the
-command, enforce the admin check, call the service, and format the reply.
+command, call the service, and format the reply — the admin check itself is
+NOT repeated per-handler (see AdminOnlyMiddleware below): it is enforced
+once, centrally, for every message/callback routed through this router, so
+a new handler added here can never forget it.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import html
 
-from aiogram import Bot, F, Router
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
-from sqlalchemy import func, select
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from app.bot.keyboards.inline import broadcast_confirm_keyboard, revoke_confirm_keyboard
 from app.bot.states.forms import BroadcastStates
-from app.config import settings
+from app.config import GEMINI_ROLES, gemini_model_for, settings
 from app.database import async_session_factory
-from app.models.gemini_usage import GeminiUsage
 from app.models.user import User
 from app.services import admin_stats, admin_users, broadcast
-from app.services.usage_log import estimate_cost
+from app.services.usage_log import usage_summary
 from app.utils.logging import get_logger
 
-router = Router(name="admin")
 logger = get_logger(__name__)
 
 REFUSED = "⛔ Bu buyruq faqat adminlar uchun."
@@ -34,6 +37,53 @@ REFUSED = "⛔ Bu buyruq faqat adminlar uchun."
 
 def _is_admin(db_user: User) -> bool:
     return db_user.is_admin or db_user.telegram_id in settings.ADMIN_IDS
+
+
+class AdminOnlyMiddleware(BaseMiddleware):
+    """Router-level gate: EVERY message/callback routed through this router
+    requires _is_admin(db_user). Centralizes what used to be a duplicated
+    `if not _is_admin(db_user): ...; return` at the top of ~24 handlers, so
+    a future admin handler added to this router cannot accidentally skip
+    the check — there's no per-handler code to forget.
+
+    Preserves the exact pre-refactor UX: a non-admin still sees the same
+    REFUSED text (message.answer for commands, callback.answer() +
+    message.edit_text for button taps), and a refused callback still clears
+    any pending FSM state (matching the old broadcast-confirm handlers, so a
+    non-admin can never get stuck mid-flow in an admin-only confirmation).
+
+    Callback-vs-message is detected by `hasattr(event, "data")` rather than
+    isinstance(CallbackQuery) — real aiogram CallbackQuery objects have a
+    `.data` field and Message never does, and this also matches every
+    lightweight fake used across the test suite (which duck-types the same
+    way), so tests don't need real aiogram model instances to exercise this.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        db_user: User | None = data.get("db_user")
+        if db_user is not None and _is_admin(db_user):
+            return await handler(event, data)
+
+        if hasattr(event, "data"):  # CallbackQuery-shaped
+            await event.answer()
+            state: FSMContext | None = data.get("state")
+            if state is not None:
+                await state.clear()
+            if getattr(event, "message", None):
+                await event.message.edit_text(REFUSED)
+        else:  # Message-shaped
+            await event.answer(REFUSED)
+        return None  # short-circuit — the handler body never runs
+
+
+router = Router(name="admin")
+router.message.middleware(AdminOnlyMiddleware())
+router.callback_query.middleware(AdminOnlyMiddleware())
 
 
 def _now() -> datetime:
@@ -50,18 +100,42 @@ def _fmt_user(u: User) -> str:
         date_s = f"tugagan ({u.access_until:%Y-%m-%d})"
     from app.services.plans import plan_name
     uses_s = "cheksiz" if u.uses_left is None else str(u.uses_left)
-    handle = f"@{u.username}" if u.username else "yo‘q"
+    # AUDIT B-11. full_name / username / note are user-controlled (full_name
+    # is mirrored from Telegram on every update) and EVERY send is HTML-parsed
+    # (create_bot sets a global ParseMode.HTML), so a name containing "<" or
+    # "&" makes Telegram reject the whole message with 400 can't parse
+    # entities - breaking /users, /find and /user for the admin - and a
+    # crafted name can forge markup, e.g. a <code>-wrapped fake telegram id,
+    # in the admin's own view right before a /revoke.
+    handle = f"@{html.escape(u.username)}" if u.username else "yo‘q"
     vlim = "∞" if u.monthly_variant_limit is None else str(u.monthly_variant_limit)
     clim = "∞" if u.monthly_check_limit is None else str(u.monthly_check_limit)
+    blim = "∞" if u.book_limit is None else str(u.book_limit)
+    balim = ("∞" if u.monthly_book_analysis_limit is None
+             else str(u.monthly_book_analysis_limit))
+    bglim = ("∞" if u.monthly_book_generation_limit is None
+             else str(u.monthly_book_generation_limit))
+    # getattr, matching account.summary_lines: this renders ORM rows in
+    # production and hand-built fakes in the injection tests. A dash means no
+    # price was ever recorded, so the account page falls back to the plan's
+    # current one - which is exactly the state /setprice exists to correct.
+    paid = getattr(u, "price_som_at_purchase", None)
+    paid_s = "—" if paid is None else f"{paid:,} so‘m"
     return (
-        f"👤 <code>{u.telegram_id}</code> {u.full_name}\n"
+        f"👤 <code>{u.telegram_id}</code> {html.escape(u.full_name or '')}\n"
         f"🔗 Username: {handle}\n"
         f"💳 Tarif: {plan_name(u)}\n"
-        f"📝 Izoh: {u.note or '—'}\n"
+        f"💰 To‘langan: {paid_s}\n"
+        f"📝 Izoh: {html.escape(u.note) if u.note else '—'}\n"
         f"📅 Muddat: {date_s}\n"
         f"🔢 Ishlatish: {uses_s}\n"
         f"📦 Variant limiti: {u.variant_count_this_period}/{vlim} (oyiga)\n"
         f"📝 Tekshirish limiti: {u.check_count_this_period}/{clim} (oyiga)\n"
+        # Books: a TOTAL cap (no counter — measured live), and a separate
+        # monthly meter for the paid analysis pass.
+        f"📚 Kitob limiti: {blim} (jami)\n"
+        f"📖 Kitob tahlili: {u.book_analysis_count_this_period}/{balim} (oyiga)\n"
+        f"🧠 Savol yaratish: {u.book_generation_count_this_period}/{bglim} (oyiga)\n"
         f"⛔ Bloklangan: {'ha' if u.is_blocked else 'yo‘q'}\n"
         f"📤 Yuklamalar: {u.total_projects}\n"
         f"🕐 Oxirgi faollik: {u.updated_at:%Y-%m-%d %H:%M}"
@@ -76,17 +150,18 @@ def _user_line(u: User) -> str:
     """One compact list row, shared by /users and /find."""
     mark = "⛔" if u.is_blocked else "✅"
     uses_s = "∞" if u.uses_left is None else str(u.uses_left)
-    handle = f"@{u.username}" if u.username else "—"
-    return f"{mark} <code>{u.telegram_id}</code> {handle} {u.full_name[:18]} · {uses_s}"
+    handle = f"@{html.escape(u.username)}" if u.username else "—"
+    # Truncate the RAW name FIRST, then escape: escaping first would let a
+    # long entity be cut mid-sequence ("&amp" without its ";"), which is
+    # itself a broken send. See B-11.
+    name = html.escape((u.full_name or "")[:18])
+    return f"{mark} <code>{u.telegram_id}</code> {handle} {name} · {uses_s}"
 
 
 # ── /grant ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("grant"))
 async def cmd_grant(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if len(parts) < 2:
         await message.answer("Foydalanish: /grant <user_id> <days> [uses] [note...]")
@@ -115,9 +190,6 @@ async def cmd_grant(message: Message, command: CommandObject, db_user: User) -> 
 
 @router.message(Command("extend"))
 async def cmd_extend(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if len(parts) < 2:
         await message.answer("Foydalanish: /extend <user_id> <days>")
@@ -137,9 +209,6 @@ async def cmd_extend(message: Message, command: CommandObject, db_user: User) ->
 
 @router.message(Command("setuses"))
 async def cmd_setuses(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if len(parts) < 2:
         await message.answer("Foydalanish: /setuses <user_id> <n>  (n=-1 → cheksiz)")
@@ -159,9 +228,6 @@ async def cmd_setuses(message: Message, command: CommandObject, db_user: User) -
 
 @router.message(Command("plan"))
 async def cmd_plan(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     from app.services.plans import get_plan, PLANS
     parts = _args(command)
     if len(parts) < 2:
@@ -189,7 +255,25 @@ async def cmd_plan(message: Message, command: CommandObject, db_user: User) -> N
     await message.answer(f"{wrapper}\n{text}", parse_mode="HTML")
 
 
-# ── /setvariantlimit, /setchecklimit ──────────────────────────────────────────
+# ── /setvariantlimit, /setchecklimit, /setbooklimit, /setbookanalysislimit ────
+#
+# One shared body; each kind maps to its command name and its service function.
+# A dispatch table rather than an if/else chain, so adding the two book limits
+# could not drift from the two that already existed.
+# The third field is what -1 MEANS for that kind. It is not cosmetic: for every
+# limit -1 is "unlimited", but for the price it is "forget what I recorded and
+# fall back to the plan's current price". Same convention, opposite sense, so
+# the usage line has to say which one the admin is about to get.
+_LIMIT_KINDS = {
+    "variant": ("/setvariantlimit", "set_variant_limit", "cheksiz"),
+    "check": ("/setchecklimit", "set_check_limit", "cheksiz"),
+    "book": ("/setbooklimit", "set_book_limit", "cheksiz"),
+    "book_analysis": ("/setbookanalysislimit", "set_book_analysis_limit", "cheksiz"),
+    "book_generation": ("/setbookgenerationlimit", "set_book_generation_limit",
+                        "cheksiz"),
+    "price": ("/setprice", "set_price", "standart narx"),
+}
+
 
 @router.message(Command("setvariantlimit"))
 async def cmd_setvariantlimit(message: Message, command: CommandObject, db_user: User) -> None:
@@ -201,14 +285,40 @@ async def cmd_setchecklimit(message: Message, command: CommandObject, db_user: U
     await _set_limit(message, command, db_user, kind="check")
 
 
+@router.message(Command("setbooklimit"))
+async def cmd_setbooklimit(message: Message, command: CommandObject, db_user: User) -> None:
+    """TOTAL cap on books owned (never resets), NOT a monthly quota."""
+    await _set_limit(message, command, db_user, kind="book")
+
+
+@router.message(Command("setbookanalysislimit"))
+async def cmd_setbookanalysislimit(message: Message, command: CommandObject, db_user: User) -> None:
+    """Monthly cap on book ANALYSIS runs (the recurring paid Gemini pass)."""
+    await _set_limit(message, command, db_user, kind="book_analysis")
+
+
+@router.message(Command("setbookgenerationlimit"))
+async def cmd_setbookgenerationlimit(message: Message, command: CommandObject, db_user: User) -> None:
+    """Monthly cap on book question GENERATION (the reasoning Gemini pass)."""
+    await _set_limit(message, command, db_user, kind="book_generation")
+
+
+@router.message(Command("setprice"))
+async def cmd_setprice(message: Message, command: CommandObject, db_user: User) -> None:
+    """Record what a teacher ACTUALLY paid, in so'm (-1 clears it).
+
+    Separate from /plan on purpose: /plan stamps the plan's CURRENT price, so it
+    can only ever record today's number, and it also resets both quota counters
+    and extends access by 30 days. This moves the price and nothing else.
+    """
+    await _set_limit(message, command, db_user, kind="price")
+
+
 async def _set_limit(message: Message, command: CommandObject, db_user: User, kind: str) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
-    cmd = "/setvariantlimit" if kind == "variant" else "/setchecklimit"
+    cmd, service_fn, zero_hint = _LIMIT_KINDS[kind]
     parts = _args(command)
     if len(parts) < 2:
-        await message.answer(f"Foydalanish: {cmd} <user_id> <n>  (n=-1 → cheksiz)")
+        await message.answer(f"Foydalanish: {cmd} <user_id> <n>  (n=-1 → {zero_hint})")
         return
     try:
         tg_id, n = int(parts[0]), int(parts[1])
@@ -216,10 +326,9 @@ async def _set_limit(message: Message, command: CommandObject, db_user: User, ki
         await message.answer("Sonlar noto‘g‘ri.")
         return
     async with async_session_factory() as session:
-        if kind == "variant":
-            user = await admin_users.set_variant_limit(session, db_user.telegram_id, tg_id, n)
-        else:
-            user = await admin_users.set_check_limit(session, db_user.telegram_id, tg_id, n)
+        user = await getattr(admin_users, service_fn)(
+            session, db_user.telegram_id, tg_id, n
+        )
         text = _fmt_user(user)
     await message.answer(f"✅ O‘rnatildi:\n{text}", parse_mode="HTML")
 
@@ -228,9 +337,6 @@ async def _set_limit(message: Message, command: CommandObject, db_user: User, ki
 
 @router.message(Command("resetquota"))
 async def cmd_resetquota(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if not parts:
         await message.answer("Foydalanish: /resetquota <user_id>")
@@ -259,9 +365,6 @@ async def cmd_addcheck(message: Message, command: CommandObject, db_user: User) 
 
 
 async def _add_quota(message: Message, command: CommandObject, db_user: User, kind: str) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     cmd = "/addvariant" if kind == "variant" else "/addcheck"
     parts = _args(command)
     if len(parts) < 2:
@@ -288,9 +391,6 @@ async def cmd_revoke(message: Message, command: CommandObject, db_user: User) ->
     """Destructive: do NOT act here — show a Ha/Yo'q gate naming the target so a
     mistyped id can't silently cut off a paying teacher. The actual block happens
     in handle_revoke_confirm only on an explicit Ha."""
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if not parts:
         await message.answer("Foydalanish: /revoke <user_id yoki @username>")
@@ -301,7 +401,8 @@ async def cmd_revoke(message: Message, command: CommandObject, db_user: User) ->
         await message.answer("Bunday foydalanuvchi topilmadi.")
         return
     await message.answer(
-        f"⚠️ <b>{user.full_name}</b> (<code>{user.telegram_id}</code>) "
+        f"⚠️ <b>{html.escape(user.full_name or '')}</b> "
+        f"(<code>{user.telegram_id}</code>) "
         f"foydalanuvchining ruxsati bekor qilinadi.\nTasdiqlaysizmi?",
         reply_markup=revoke_confirm_keyboard(user.telegram_id),
         parse_mode="HTML",
@@ -310,12 +411,10 @@ async def cmd_revoke(message: Message, command: CommandObject, db_user: User) ->
 
 @router.callback_query(F.data.startswith("adm:rev:"))
 async def handle_revoke_confirm(callback: CallbackQuery, db_user: User) -> None:
-    """Ha → block; Yo'q → no-op. Admin is RE-checked here (callbacks aren't
-    gated by the access middleware, so a non-admin tap must be refused)."""
+    """Ha → block; Yo'q → no-op. Admin access is enforced by
+    AdminOnlyMiddleware (callbacks aren't gated by the bot-wide access
+    middleware, so this router's own gate is what protects a button tap)."""
     await callback.answer()
-    if not _is_admin(db_user):
-        await callback.message.edit_text(REFUSED)
-        return
     parts = callback.data.split(":")  # ["adm","rev","ok"|"no","<tg_id>"]
     try:
         verdict, tg_id = parts[2], int(parts[3])
@@ -333,9 +432,6 @@ async def handle_revoke_confirm(callback: CallbackQuery, db_user: User) -> None:
 
 @router.message(Command("unblock"))
 async def cmd_unblock(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if not parts:
         await message.answer("Foydalanish: /unblock <user_id>")
@@ -354,9 +450,6 @@ async def cmd_unblock(message: Message, command: CommandObject, db_user: User) -
 
 @router.message(Command("user", "info"))
 async def cmd_user(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     if not parts:
         await message.answer("Foydalanish: /user <user_id yoki @username>")
@@ -385,9 +478,6 @@ async def cmd_user(message: Message, command: CommandObject, db_user: User) -> N
 
 @router.message(Command("users"))
 async def cmd_users(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = _args(command)
     page = int(parts[0]) if parts and parts[0].isdigit() else 1
     per = 20
@@ -408,9 +498,6 @@ async def cmd_users(message: Message, command: CommandObject, db_user: User) -> 
 
 @router.message(Command("find"))
 async def cmd_find(message: Message, command: CommandObject, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     query = (command.args or "").strip()
     if not query:
         await message.answer("Foydalanish: /find <username yoki ism qismi>")
@@ -436,9 +523,6 @@ async def cmd_find(message: Message, command: CommandObject, db_user: User) -> N
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     async with async_session_factory() as session:
         s = await admin_stats.compute_stats(session)
     ct = s["cost_today"]["cost"]
@@ -460,9 +544,6 @@ async def cmd_stats(message: Message, db_user: User) -> None:
 
 @router.message(Command("usage"))
 async def cmd_usage(message: Message, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     now = _now()
     windows = [
         ("Bugun", now.replace(hour=0, minute=0, second=0, microsecond=0)),
@@ -471,34 +552,36 @@ async def cmd_usage(message: Message, db_user: User) -> None:
     blocks: list[str] = []
     async with async_session_factory() as session:
         for label, start in windows:
-            calls, in_tok, out_tok = (await session.execute(
-                select(
-                    func.count(),
-                    func.coalesce(func.sum(GeminiUsage.prompt_tokens), 0),
-                    func.coalesce(
-                        func.sum(GeminiUsage.output_tokens + GeminiUsage.thinking_tokens), 0
-                    ),
-                ).where(GeminiUsage.created_at >= start)
-            )).one()
-            calls, in_tok, out_tok = int(calls), int(in_tok), int(out_tok)
-            # out_tok already includes thinking → pass thinking=0 to the cost fn
-            cost = estimate_cost(
-                in_tok, out_tok, 0,
-                settings.GEMINI_PRICE_IN_PER_M, settings.GEMINI_PRICE_OUT_PER_M,
-                settings.UZS_PER_USD,
+            # usage_summary costs each model at ITS OWN price (per-model map),
+            # not a single flat rate — the shared, correct cost path.
+            u = await usage_summary(session, start)
+            cost = u["cost"]
+            warn = (
+                f"\n   ⚠️ {u['unpriced_calls']} ta narxlanmagan model"
+                if u.get("unpriced_calls") else ""
             )
             blocks.append(
-                f"<b>{label}</b>: {calls} ta chaqiruv\n"
-                f"   📥 kirish: {in_tok:,} token\n"
-                f"   📤 chiqish (+thinking): {out_tok:,} token\n"
-                f"   💵 ~${cost['usd']:.4f}  ≈ {cost['som']:,.0f} so‘m"
+                f"<b>{label}</b>: {u['calls']} ta chaqiruv\n"
+                f"   📥 kirish: {u['prompt_tokens']:,} token\n"
+                f"   📤 chiqish (+thinking): {u['output_tokens']:,} token\n"
+                f"   💵 ~${cost['usd']:.4f}  ≈ {cost['som']:,.0f} so‘m" + warn
             )
     await message.answer(
-        "📈 <b>Gemini xarajati</b>\n"
-        f"model: <code>{settings.GEMINI_MODEL}</code>\n\n"
+        "📈 <b>Gemini xarajati</b>\n" + _usage_model_lines()
         + "\n\n".join(blocks),
         parse_mode="HTML",
     )
+
+
+def _usage_model_lines() -> str:
+    """One line while every role shares a model (the shipped state); one line
+    per role once they differ, so a split routing is never hidden."""
+    role_models = {role: gemini_model_for(role) for role in GEMINI_ROLES}
+    if len(set(role_models.values())) == 1:
+        return f"model: <code>{next(iter(role_models.values()))}</code>\n\n"
+    return "".join(
+        f"{role}: <code>{m}</code>\n" for role, m in role_models.items()
+    ) + "\n"
 
 
 # ── /broadcast, /announce, /broadcast_active (confirmation-gated) ──────────────
@@ -523,9 +606,6 @@ async def _start_broadcast(
 ) -> None:
     """Show the confirmation gate. Nothing is sent here — the pending text is
     stashed in FSM state and sent only on an explicit Ha."""
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     text = (command.args or "").strip()
     if not text:
         cmd = "/broadcast_active" if active_only else "/broadcast"
@@ -551,10 +631,6 @@ async def cmd_broadcast_cancel(
     callback: CallbackQuery, state: FSMContext, db_user: User
 ) -> None:
     await callback.answer()
-    if not _is_admin(db_user):  # uniform boundary — callbacks aren't gated upstream
-        await state.clear()
-        await callback.message.edit_text(REFUSED)
-        return
     await state.clear()
     await callback.message.edit_text("❌ Bekor qilindi. Xabar yuborilmadi.")
 
@@ -564,10 +640,6 @@ async def cmd_broadcast_send(
     callback: CallbackQuery, state: FSMContext, db_user: User, bot: Bot
 ) -> None:
     await callback.answer()
-    if not _is_admin(db_user):
-        await state.clear()
-        await callback.message.edit_text(REFUSED)
-        return
     data = await state.get_data()
     text = data.get("bc_text")
     scope = data.get("bc_scope", "all")
@@ -592,9 +664,6 @@ async def cmd_broadcast_send(
 async def cmd_message(
     message: Message, command: CommandObject, db_user: User, bot: Bot
 ) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer("Foydalanish: /message <user_id yoki @username> <matn>")
@@ -627,12 +696,13 @@ async def cmd_message(
 
 @router.message(Command("help_admin"))
 async def cmd_help_admin(message: Message, db_user: User) -> None:
-    if not _is_admin(db_user):
-        await message.answer(REFUSED)
-        return
     await message.answer(
         "🛠 <b>Admin buyruqlar</b>\n\n"
         "<code>/plan &lt;id&gt; &lt;standart|pro&gt;</code> — tarif berish (to‘lovdan keyin)\n"
+        "<code>/setprice &lt;id&gt; &lt;so‘m&gt;</code> — to‘langan narxni yozish "
+        "(-1 = standart narx)\n"
+        "   /plan JORIY narxni yozadi, shuning uchun eski narxda to‘lagan\n"
+        "   mijoz uchun shuni ishlating — kvota va muddatga tegmaydi.\n"
         "<code>/grant &lt;id&gt; &lt;days&gt; [uses] [izoh]</code> — kirish berish\n"
         "   masalan: <code>/grant 12345 30 5 Ali maktab 1</code>\n"
         "   uses ko‘rsatilmasa — cheksiz.\n"
@@ -640,6 +710,9 @@ async def cmd_help_admin(message: Message, db_user: User) -> None:
         "<code>/setuses &lt;id&gt; &lt;n&gt;</code> — ishlatish sonini o‘rnatish (-1 = cheksiz)\n"
         "<code>/setvariantlimit &lt;id&gt; &lt;n&gt;</code> — oylik variant limiti (-1 = cheksiz)\n"
         "<code>/setchecklimit &lt;id&gt; &lt;n&gt;</code> — oylik tekshirish limiti (-1 = cheksiz)\n"
+        "<code>/setbooklimit &lt;id&gt; &lt;n&gt;</code> — kitoblar soni, JAMI (-1 = cheksiz)\n"
+        "<code>/setbookanalysislimit &lt;id&gt; &lt;n&gt;</code> — oylik kitob tahlili (-1 = cheksiz)\n"
+        "<code>/setbookgenerationlimit &lt;id&gt; &lt;n&gt;</code> — oylik savol yaratish (-1 = cheksiz)\n"
         "<code>/addvariant &lt;id&gt; &lt;n&gt;</code> — variant limitiga qo‘shish (bonus)\n"
         "<code>/addcheck &lt;id&gt; &lt;n&gt;</code> — tekshirish limitiga qo‘shish (bonus)\n"
         "<code>/resetquota &lt;id&gt;</code> — kvotani yangilash (yangi 30 kun)\n"

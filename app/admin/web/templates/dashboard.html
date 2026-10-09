@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Testova Admin{% endblock %}
+{% block heading_mobile %}Dashboard{% endblock %}
+{% block content %}
+<h1 class="h3 mb-4">Dashboard</h1>
+
+<div class="row g-3">
+  <div class="col-6 col-lg-3">
+    <div class="card stat-card h-100"><div class="card-body">
+      <div class="text-muted small">Jami foydalanuvchilar</div>
+      <div class="display-6 fw-semibold">{{ stats.total_users }}</div>
+      <div class="small text-muted">faol (7 kun): {{ stats.active_week }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card stat-card h-100"><div class="card-body">
+      <div class="text-muted small">Faol obunalar</div>
+      <div class="display-6 fw-semibold">{{ active_paid }}</div>
+      <div class="small text-muted">to‘lovli, amaldagi</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card stat-card h-100"><div class="card-body">
+      <div class="text-muted small">Sinov (trial) foydalanuvchilar</div>
+      <div class="display-6 fw-semibold">{{ trial_users }}</div>
+      <div class="small text-muted">bepul, sinov limiti bilan</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card stat-card h-100"><div class="card-body">
+      <div class="text-muted small">Bugungi xarajat</div>
+      <div class="h3 fw-semibold mb-0">${{ '%.4f'|format(stats.cost_today.cost.usd) }}</div>
+      <div class="small text-muted">{{ '{:,.0f}'.format(stats.cost_today.cost.som) }} so‘m · {{ stats.cost_today.calls }} chaqiruv</div>
+    </div></div>
+  </div>
+</div>
+
+<div class="row g-3 mt-1">
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <div class="d-flex justify-content-between align-items-start">
+        <div>
+          <div class="text-muted small">Gemini balans (qolgan)</div>
+          {% if balance.baseline %}
+            <div class="display-6 fw-semibold {% if balance.remaining_usd < 1 %}text-danger{% endif %}">
+              ${{ '%.2f'|format(balance.remaining_usd) }}
+            </div>
+            <div class="small text-muted">
+              boshlang‘ich ${{ '%.2f'|format(balance.baseline.credit_usd) }}
+              − sarflandi ${{ '%.4f'|format(balance.spent_usd) }}
+              (dan {{ balance.baseline.as_of.strftime('%Y-%m-%d') }})
+            </div>
+          {% else %}
+            <div class="h4 text-muted mb-0">—</div>
+            <div class="small">Balans o‘rnatilmagan. <a href="/costs">Costs sahifasida kiriting</a>.</div>
+          {% endif %}
+        </div>
+        <span class="fs-1">💳</span>
+      </div>
+    </div></div>
+  </div>
+  <div class="col-12 col-lg-6">
+    <div class="card h-100 border-dashed"><div class="card-body">
+      <div class="text-muted small">Daromad (revenue)</div>
+      <div class="h4 text-muted mb-0">—</div>
+      <div class="small text-muted">To‘lovlar jadvali — revenue bosqichida (Phase 6).</div>
+    </div></div>
+  </div>
+</div>
+
+<div class="row g-3 mt-1">
+  <div class="col-6 col-lg-3"><div class="card"><div class="card-body py-2">
+    <div class="small text-muted">Testlar (jami)</div><div class="fs-5">{{ stats.tests_total }}</div></div></div></div>
+  <div class="col-6 col-lg-3"><div class="card"><div class="card-body py-2">
+    <div class="small text-muted">Tekshirilgan (bugun)</div><div class="fs-5">{{ stats.graded_today }}</div></div></div></div>
+  <div class="col-6 col-lg-3"><div class="card"><div class="card-body py-2">
+    <div class="small text-muted">Ruxsatli</div><div class="fs-5">{{ stats.with_access }}</div></div></div></div>
+  <div class="col-6 col-lg-3"><div class="card"><div class="card-body py-2">
+    <div class="small text-muted">Bloklangan</div><div class="fs-5">{{ stats.blocked }}</div></div></div></div>
+</div>
+{% endblock %}

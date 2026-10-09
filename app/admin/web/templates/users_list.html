@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Users — Testova Admin{% endblock %}
+{% block heading_mobile %}Users{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Foydalanuvchilar <span class="text-muted fs-6">({{ total }})</span></h1>
+  <form class="d-flex" method="get" action="/users">
+    <input class="form-control form-control-sm me-2 w-search-input" type="search" name="q"
+           value="{{ q }}" placeholder="id yoki username/ism…">
+    <button class="btn btn-sm btn-primary" type="submit">Qidirish</button>
+  </form>
+</div>
+
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead>
+      <tr>
+        <th></th><th>Telegram ID</th><th>Username</th><th>Ism</th>
+        <th>Tarif</th><th class="text-end">Uses</th><th>Muddat</th><th class="text-end">Testlar</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr role="button" data-href="/users/{{ u.telegram_id }}">
+        <td>{% if u.is_blocked %}<span title="bloklangan">⛔</span>{% else %}<span title="faol">✅</span>{% endif %}</td>
+        <td><code>{{ u.telegram_id }}</code></td>
+        <td>{% if u.username %}@{{ u.username }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+        <td>{{ u.full_name[:28] }}</td>
+        <td>{{ plan_name(u) }}</td>
+        <td class="text-end">{% if u.uses_left is none %}∞{% else %}{{ u.uses_left }}{% endif %}</td>
+        <td>
+          {% if u.access_until is none %}<span class="text-muted">cheksiz</span>
+          {% elif u.access_until > now %}<span class="text-success">{{ u.access_until.strftime('%Y-%m-%d') }}</span>
+          {% else %}<span class="text-danger">tugagan</span>{% endif %}
+        </td>
+        <td class="text-end">{{ u.total_projects }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="text-center text-muted py-4">Hech narsa topilmadi.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if pages > 1 %}
+<nav class="d-flex justify-content-center">
+  <ul class="pagination pagination-sm">
+    {% set qs = ('&q=' ~ q) if q else '' %}
+    <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+      <a class="page-link" href="/users?page={{ page - 1 }}{{ qs }}">‹</a></li>
+    <li class="page-item disabled"><span class="page-link">{{ page }} / {{ pages }}</span></li>
+    <li class="page-item {% if page >= pages %}disabled{% endif %}">
+      <a class="page-link" href="/users?page={{ page + 1 }}{{ qs }}">›</a></li>
+  </ul>
+</nav>
+{% endif %}
+{% endblock %}

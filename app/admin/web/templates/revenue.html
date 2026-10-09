@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}Revenue — Testova Admin{% endblock %}
+{% block heading_mobile %}Revenue{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+{% macro som(v) %}{{ '{:,}'.format(v|round|int).replace(',', ' ') }}{% endmacro %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Tushum va foyda</h1>
+  <span class="small text-muted">1 USD = {{ '{:,}'.format(r.uzs_per_usd|round|int).replace(',', ' ') }} so‘m</span>
+</div>
+
+<!-- Headline numbers -->
+<div class="row g-3 mb-3">
+  <div class="col-6 col-lg-3">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Tushum (jami)</h2>
+      <div class="fs-4 fw-semibold">{{ som(r.total_revenue_som) }}</div>
+      <div class="small text-muted">so‘m</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Tushum (30 kun)</h2>
+      <div class="fs-4 fw-semibold">{{ som(r.month_revenue_som) }}</div>
+      <div class="small text-muted">so‘m</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Gemini xarajati</h2>
+      <div class="fs-4 fw-semibold">{{ som(r.total_cost_som) }}</div>
+      <div class="small text-muted">so‘m · ${{ '%.4f'|format(r.cost.total_usd) }}</div>
+    </div></div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Marja</h2>
+      <div class="fs-4 fw-semibold {% if r.margin_som < 0 %}text-danger{% elif r.total_revenue_som %}text-success{% endif %}">
+        {{ som(r.margin_som) }}</div>
+      <div class="small text-muted">
+        {% if r.margin_pct is none %}tushum yo‘q{% else %}{{ '%.1f'|format(r.margin_pct) }}%{% endif %}</div>
+    </div></div>
+  </div>
+</div>
+
+{# The margin above compares revenue against ALL Gemini cost, attributed or
+   not. The per-user table below can only use the attributed part. Saying which
+   is which, with the real ratio, is the difference between a number someone
+   can price a tier off and a number that just looks good. #}
+{% if r.cost.unattributed_calls %}
+<div class="alert alert-warning py-2 small mb-3">
+  <b>Xarajatning {{ '%.0f'|format(100 - r.cost.attributed_pct) }}%</b> hech bir
+  foydalanuvchiga biriktirilmagan ({{ r.cost.unattributed_calls }} / {{ r.cost.attributed_calls + r.cost.unattributed_calls }} chaqiruv,
+  ${{ '%.4f'|format(r.cost.unattributed_usd) }}). Yuqoridagi <b>marja</b> butun xarajatni hisobga oladi;
+  pastdagi jadvaldagi foyda esa faqat biriktirilgan xarajatni — ya'ni u
+  <b>optimistik</b>. Biriktirilmagan qatorlar instrumentatsiya qilinmagan
+  chaqiruv joylaridan keladi.
+</div>
+{% endif %}
+
+<div class="row g-3">
+  <!-- Revenue by tariff -->
+  <div class="col-12 col-lg-5">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Tarif bo‘yicha</h2>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead><tr>
+            <th>Tarif</th><th class="text-end">To‘lov</th>
+            <th class="text-end">Tushum</th><th class="text-end">O‘rtacha</th>
+          </tr></thead>
+          <tbody>
+          {% for p in r.by_plan %}
+            <tr>
+              <td>{{ p.label }}
+                {% if p.list_price_som %}<span class="small text-muted d-block">narx {{ som(p.list_price_som) }}</span>{% endif %}
+              </td>
+              <td class="text-end">{{ p.payments }}</td>
+              <td class="text-end">{{ som(p.revenue_som) }}</td>
+              {# Average collected vs list price: they diverge on a discount or
+                 a grandfathered sale, which is exactly what is worth seeing. #}
+              <td class="text-end">
+                {% if p.avg_som is none %}<span class="text-muted">—</span>
+                {% else %}{{ som(p.avg_som) }}{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if not r.total_revenue_som %}
+      <p class="small text-muted mb-0 mt-2">
+        Hali to‘lov yozilmagan. To‘lovlar foydalanuvchi sahifasidan yoziladi.
+      </p>
+      {% endif %}
+    </div></div>
+  </div>
+
+  <!-- Users costing more than they bring in -->
+  <div class="col-12 col-lg-7">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">
+        Zarar keltirayotganlar
+        {% if r.underwater_count %}<span class="badge text-bg-danger">{{ r.underwater_count }}</span>{% endif %}
+      </h2>
+      {% if r.underwater %}
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead><tr>
+            <th>Foydalanuvchi</th><th>Tarif</th>
+            <th class="text-end">Tushum</th><th class="text-end">Xarajat</th><th class="text-end">Foyda</th>
+          </tr></thead>
+          <tbody>
+          {% for u in r.underwater %}
+            <tr>
+              <td><a class="text-decoration-none" href="/users/{{ u.telegram_id }}">
+                {{ u.full_name or u.telegram_id }}</a>
+                {% if u.username %}<span class="small text-muted d-block">@{{ u.username }}</span>{% endif %}
+              </td>
+              <td>{{ u.plan_label }}</td>
+              <td class="text-end">{{ som(u.revenue_som) }}</td>
+              <td class="text-end">{{ som(u.cost_som) }}</td>
+              <td class="text-end text-danger">{{ som(u.profit_som) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="small text-muted mb-0 mt-2">
+        Tushumi 0 bo‘lgan bepul/sinov foydalanuvchilar ham shu yerda —
+        ular xarajatning eng aniq holati.
+      </p>
+      {% else %}
+        <p class="text-muted mb-0">Hech kim zarar keltirmayapti.</p>
+      {% endif %}
+    </div></div>
+  </div>
+
+  <!-- Full per-user ledger -->
+  <div class="col-12">
+    <div class="card"><div class="card-body">
+      <h2 class="h6 text-muted">Foydalanuvchi bo‘yicha (foyda bo‘yicha o‘sish tartibida)</h2>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead><tr>
+            <th>Foydalanuvchi</th><th>Tarif</th><th>Oxirgi to‘lov</th>
+            <th class="text-end">Tushum</th><th class="text-end">Xarajat</th><th class="text-end">Foyda</th>
+          </tr></thead>
+          <tbody>
+          {% for u in r.rows %}
+            <tr>
+              <td><a class="text-decoration-none" href="/users/{{ u.telegram_id }}">
+                {{ u.full_name or u.telegram_id }}</a></td>
+              <td>{{ u.plan_label }}</td>
+              <td class="text-nowrap">
+                {% if u.last_paid_at %}{{ u.last_paid_at.strftime('%Y-%m-%d') }}
+                {% else %}<span class="text-muted">—</span>{% endif %}</td>
+              <td class="text-end">{{ som(u.revenue_som) }}</td>
+              <td class="text-end">{{ som(u.cost_som) }}</td>
+              <td class="text-end {% if u.profit_som < 0 %}text-danger{% endif %}">{{ som(u.profit_som) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="text-muted">Ma'lumot yo‘q.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div></div>
+  </div>
+</div>
+{% endblock %}

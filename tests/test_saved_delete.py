@@ -6,8 +6,6 @@ and deletion works end to end (real Postgres).
 import uuid
 from types import SimpleNamespace
 
-import pytest
-
 from app.bot.keyboards.inline import check_project_keyboard
 
 
@@ -26,21 +24,6 @@ def test_saved_picker_has_grade_and_delete_per_project():
     assert "cancel" in cbs
 
 
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT 1 FROM projects LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
 class _CBMsg:
     def __init__(self):
         self.edits = []
@@ -56,16 +39,13 @@ class _CB:
         pass
 
 
-async def test_delete_confirm_removes_project(monkeypatch):
+async def test_delete_confirm_removes_project(engine, monkeypatch):
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.project import Project, ProjectStatus
     from app.models.user import User
     from app.bot.handlers import projects
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(projects, "async_session_factory", sm)
     tg = int(uuid.uuid4().int % 10**11)
@@ -91,4 +71,3 @@ async def test_delete_confirm_removes_project(monkeypatch):
             await s.execute(delete(Project).where(Project.user_id == uid))
             await s.execute(delete(User).where(User.id == uid))
             await s.commit()
-        await engine.dispose()

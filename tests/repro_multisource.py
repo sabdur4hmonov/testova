@@ -205,14 +205,9 @@ async def part2_real():
                 name=f"📚 Bank ({len(pool)} savol)",
                 status=ProjectStatus.COMPLETED, question_count=len(pool),
             ))
-            for v in variants:
-                session.add(Variant(
-                    project_id=pool_project_id,
-                    variant_number=v["variant_number"],
-                    question_order=v["question_order"],
-                    option_mapping=v["option_mapping"],
-                    answer_key=v["answer_key"],
-                ))
+            await session.flush()
+            from app.services.variant_store import create_edition
+            await create_edition(session, pool_project_id, variants, source="multi")
             await session.flush()   # forces the INSERTs without committing
             print("DB write OK (flushed; rolling back)")
             await session.rollback()

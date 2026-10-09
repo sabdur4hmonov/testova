@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Alerts — Testova Admin{% endblock %}
+{% block heading_mobile %}Alerts{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Ogohlantirishlar va monitoring</h1>
+  {% if ev.active_count %}
+    <span class="badge text-bg-danger fs-6">{{ ev.active_count }} faol ogohlantirish</span>
+  {% else %}
+    <span class="badge text-bg-success fs-6">✓ ogohlantirish yo‘q</span>
+  {% endif %}
+</div>
+
+<!-- Cost alerts -->
+<div class="row g-3">
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Bugungi xarajat</h2>
+      <div class="display-6 fw-semibold {% if ev.daily.breached %}text-danger{% endif %}">
+        ${{ '%.4f'|format(ev.daily.spend_usd) }}</div>
+      <div class="small {% if ev.daily.breached %}text-danger{% else %}text-muted{% endif %}">
+        chegara: ${{ '%.2f'|format(ev.daily.threshold) }}
+        {% if ev.daily.breached %}— ⚠️ oshib ketdi{% else %}— normal{% endif %}
+      </div>
+    </div></div>
+  </div>
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Yuqori xarajatli foydalanuvchilar (30 kun ≥ ${{ '%.2f'|format(ev.user_threshold) }})</h2>
+      {% if ev.user_alerts %}
+      <table class="table table-sm mb-0">
+        <tbody>
+          {% for u in ev.user_alerts %}
+          <tr>
+            <td><a href="/users/{{ u.telegram_id }}">{% if u.username %}@{{ u.username }}{% else %}{{ u.telegram_id }}{% endif %}</a></td>
+            <td class="text-end text-danger">${{ '%.4f'|format(u.usd) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="text-muted mb-0">Chegaradan oshgan foydalanuvchi yo‘q.</p>{% endif %}
+    </div></div>
+  </div>
+</div>
+
+<!-- Reconciliation guard -->
+<div class="card mt-3"><div class="card-body">
+  <h2 class="h6 text-muted">Solishtirish nazorati (Google − biz &gt; {{ '%.0f'|format(ev.recon_tolerance) }}% yoki &gt; ${{ '%.2f'|format(ev.recon_tolerance_usd) }}; biz $0 qayd etgan bo‘lsa — kritik)</h2>
+  {% if ev.recon_alerts %}
+  <div class="table-responsive"><table class="table table-sm mb-0">
+    <thead><tr><th>Davr</th><th class="text-end">Google $</th><th class="text-end">Biz $</th><th class="text-end">Farq %</th><th>Vaqt</th></tr></thead>
+    <tbody>
+      {% for r in ev.recon_alerts %}
+      {% set sev = ev.recon_severity.get(r.id|string) %}
+      <tr class="{{ 'table-danger' if sev == 'critical' else 'table-warning' }}">
+        <td>{{ r.period_label }}</td>
+        <td class="text-end">${{ '%.4f'|format(r.google_total_usd) }}</td>
+        <td class="text-end">${{ '%.4f'|format(r.our_computed_usd) }}</td>
+        <td class="text-end">{% if r.our_computed_usd > 0 %}{{ '%+.1f'|format(r.delta_pct) }}%{% else %}—{% endif %}</td>
+        <td>{{ r.created_at.strftime('%Y-%m-%d') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="small text-muted mt-2 mb-0">Google hisobimizdan sezilarli oshsa — hisobga olinmagan (uninstrumented) xarajat belgisi.</p>
+  {% else %}
+  <p class="text-muted mb-0">Chegaradan oshgan solishtirish yo‘q.</p>
+  {% endif %}
+</div></div>
+
+<!-- Error / failure monitoring -->
+<div class="card mt-3"><div class="card-body">
+  <h2 class="h6 text-muted">Xatolik / uzilish monitoringi (log)</h2>
+  {% if not errors.log_available %}
+    <p class="text-muted mb-0">Log fayli topilmadi (logs/testova.log).</p>
+  {% else %}
+    <p class="mb-2">
+      <span class="badge text-bg-secondary">24 soat: {{ errors.total_24h }}</span>
+      <span class="badge text-bg-secondary">7 kun: {{ errors.total_7d }}</span>
+      {% if errors.truncated %}<span class="small text-muted">(log oxiridan {{ '4' }}MB o‘qildi)</span>{% endif %}
+    </p>
+    <div class="row g-3">
+      <div class="col-12 col-lg-5">
+        <table class="table table-sm mb-0">
+          <thead><tr><th>Turkum</th><th class="text-end">24s</th><th class="text-end">7k</th></tr></thead>
+          <tbody>
+            {% for b in errors.buckets %}
+            <tr class="{% if b.bucket in ('telegram_connectivity','timeout') and b.count_24h %}table-warning{% endif %}">
+              <td>{{ b.bucket }}</td>
+              <td class="text-end">{{ b.count_24h }}</td>
+              <td class="text-end">{{ b.count_7d }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="col-12 col-lg-7">
+        <h3 class="h6 text-muted">Eng ko‘p xatolar (24 soat)</h3>
+        <table class="table table-sm mb-0">
+          <tbody>
+            {% for e in errors.top_events %}
+            <tr><td class="small text-truncate w-event-cell">{{ e.event }}</td>
+                <td class="text-end">{{ e.count }}</td></tr>
+            {% else %}<tr><td class="text-muted">So‘nggi 24 soatda xatolik yo‘q.</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+</div></div>
+{% endblock %}

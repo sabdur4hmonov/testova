@@ -1,0 +1,52 @@
+# Build context exclusions.
+#
+# Without this file `COPY . .` ships ~845 MB of junk into the image: two
+# virtualenvs, every teacher-uploaded PDF under storage/, and the git history.
+# venv311/ is a WINDOWS virtualenv — copying it into a python:3.11-slim
+# container is not merely wasteful, its binaries cannot run there at all.
+#
+# Keep in mind what the runtime actually needs: app/, main.py, admin_main.py,
+# migrations/ + alembic.ini (alembic upgrade runs in the container),
+# requirements.txt, setup_db.py. Everything else is build-time or local-only.
+
+# Virtualenvs (venv311/ = 660 MB, venv/ = 26 MB)
+venv/
+venv311/
+.venv/
+
+# Runtime data — bind-mounted by docker-compose, never baked in.
+# The Dockerfile's own `mkdir -p storage/...` recreates the empty tree.
+storage/
+temp_images/
+logs/
+
+# VCS and local tooling
+.git/
+.gitignore
+.claude/
+
+# Python bytecode / caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests and docs — not needed to run the bot
+tests/
+docs/
+*.md
+
+# Secrets must never enter an image layer. .env is gitignored, but the build
+# context is the filesystem, not git — without this line it would be copied.
+.env
+.env.*
+!.env.example
+
+# The AI-text detector is its own image (detector/Dockerfile, build context
+# ./detector). The bot only talks to it over HTTP and never imports it; its
+# virtualenv (~1.5 GB with torch) and model files (hundreds of MB) must never
+# reach the bot/admin/online image.
+detector/

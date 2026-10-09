@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Costs — Testova Admin{% endblock %}
+{% block heading_mobile %}Costs{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0">Xarajatlar ({{ days }} kun)</h1>
+  <div class="d-flex flex-wrap gap-2">
+    <div class="btn-group btn-group-sm" role="group" aria-label="Davr">
+      {% for d in day_choices %}
+        <a class="btn btn-outline-secondary {% if d == days %}active{% endif %}"
+           href="/costs?days={{ d }}">{{ d }} kun</a>
+      {% endfor %}
+    </div>
+    <a class="btn btn-sm btn-outline-secondary" href="/export/usage.csv?days={{ days }}">Usage CSV</a>
+    <a class="btn btn-sm btn-outline-secondary" href="/export/user-costs.csv?days={{ days }}">User-costs CSV</a>
+  </div>
+</div>
+
+<!-- Balance -->
+<div class="row g-3 mb-3">
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Gemini balans</h2>
+      {% if balance.baseline %}
+        <div class="display-6 fw-semibold {% if balance.remaining_usd < 1 %}text-danger{% endif %}">
+          ${{ '%.2f'|format(balance.remaining_usd) }}</div>
+        <div class="small text-muted">boshlang‘ich ${{ '%.2f'|format(balance.baseline.credit_usd) }}
+          − sarflandi ${{ '%.4f'|format(balance.spent_usd) }} ({{ balance.baseline.as_of.strftime('%Y-%m-%d') }} dan)</div>
+      {% else %}
+        <p class="text-muted mb-2">Balans hali o‘rnatilmagan.</p>
+      {% endif %}
+      <form class="input-group input-group-sm mt-2" method="post" action="/costs/balance">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <span class="input-group-text">$</span>
+        <input class="form-control" type="number" step="0.01" name="credit_usd" placeholder="7.24" required>
+        <input class="form-control" type="text" name="note" placeholder="izoh (ixtiyoriy)">
+        <button class="btn btn-primary">Balansni o‘rnatish</button>
+      </form>
+    </div></div>
+  </div>
+
+  <!-- Reconciliation -->
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Google bilan solishtirish</h2>
+      <form class="row g-1" method="post" action="/costs/reconcile">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <div class="col-6"><input class="form-control form-control-sm" name="period_label" placeholder="davr (2026-08)"></div>
+        <div class="col-6"><input class="form-control form-control-sm" type="number" step="0.0001" name="google_total_usd" placeholder="Google $ jami" required></div>
+        <div class="col-6"><input class="form-control form-control-sm" name="since" placeholder="dan YYYY-MM-DD"></div>
+        <div class="col-6"><input class="form-control form-control-sm" name="until" placeholder="gacha YYYY-MM-DD"></div>
+        <div class="col-12"><input class="form-control form-control-sm" name="note" placeholder="izoh"></div>
+        <div class="col-12 d-grid"><button class="btn btn-sm btn-outline-primary">Solishtirish</button></div>
+      </form>
+      <p class="small text-muted mt-2 mb-0">Bo‘sh sana = oxirgi 30 kun.</p>
+    </div></div>
+  </div>
+</div>
+
+<!-- Chart -->
+<div class="card mb-3"><div class="card-body">
+  <h2 class="h6 text-muted">Kunlik xarajat (USD)</h2>
+  <canvas id="costChart" height="90"></canvas>
+</div></div>
+
+<div class="row g-3">
+  <!-- By kind -->
+  <div class="col-12 col-lg-5">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Tur bo‘yicha</h2>
+      <table class="table table-sm mb-0">
+        <thead><tr><th>Turi</th><th class="text-end">Chaqiruv</th><th class="text-end">USD</th></tr></thead>
+        <tbody>
+          {% for k in by_kind %}
+          <tr><td>{{ k.kind }}</td><td class="text-end">{{ k.calls }}</td><td class="text-end">${{ '%.4f'|format(k.usd) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div></div>
+  </div>
+
+  <!-- Per user -->
+  <div class="col-12 col-lg-7">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Foydalanuvchi bo‘yicha (eng qimmat 50)</h2>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover mb-0">
+          <thead><tr><th>Foydalanuvchi</th><th class="text-end">Chaqiruv</th><th class="text-end">USD</th></tr></thead>
+          <tbody>
+            {% for u in per_user %}
+            <tr>
+              <td>
+                {% if u.telegram_id %}<a href="/users/{{ u.telegram_id }}">
+                  {% if u.username %}@{{ u.username }}{% else %}{{ u.full_name or u.telegram_id }}{% endif %}</a>
+                {% else %}<span class="text-muted">{{ u.full_name }}</span>{% endif %}
+              </td>
+              <td class="text-end">{{ u.calls }}</td>
+              <td class="text-end">${{ '%.4f'|format(u.usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div></div>
+  </div>
+</div>
+
+<!-- Reconciliation history -->
+{% if recons %}
+<div class="card mt-3"><div class="card-body">
+  <h2 class="h6 text-muted">Solishtirish tarixi</h2>
+  <div class="table-responsive"><table class="table table-sm mb-0">
+    <thead><tr><th>Davr</th><th class="text-end">Google $</th><th class="text-end">Biz $</th><th class="text-end">Farq</th><th class="text-end">%</th><th>Vaqt</th></tr></thead>
+    <tbody>
+      {% for r in recons %}
+      {% set sev = recon_severity.get(r.id|string) %}
+      <tr class="{% if sev == 'critical' %}table-danger{% elif sev %}table-warning{% endif %}">
+        <td>{{ r.period_label }}</td>
+        <td class="text-end">${{ '%.4f'|format(r.google_total_usd) }}</td>
+        <td class="text-end">${{ '%.4f'|format(r.our_computed_usd) }}</td>
+        <td class="text-end">${{ '%+.4f'|format(r.delta_usd) }}</td>
+        <td class="text-end">{% if r.our_computed_usd > 0 %}{{ '%+.1f'|format(r.delta_pct) }}%{% else %}—{% endif %}</td>
+        <td>{{ r.created_at.strftime('%Y-%m-%d') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</div></div>
+{% endif %}
+
+<script src="/static/js/chart.umd.min.js"></script>
+{# The panel's ONE inline script. It carries the per-response CSP nonce; without
+   it the chart is blocked, because script-src deliberately omits
+   'unsafe-inline' (see app/admin/web/headers.py). #}
+<script nonce="{{ csp_nonce(request) }}">
+  const chartData = {{ chart|tojson }};
+  new Chart(document.getElementById('costChart'), {
+    type: 'line',
+    data: {
+      labels: chartData.labels,
+      datasets: [{
+        label: 'USD/kun', data: chartData.usd,
+        borderColor: '#0d6efd', backgroundColor: 'rgba(13,110,253,.1)',
+        fill: true, tension: 0.25, pointRadius: 3,
+      }]
+    },
+    options: { responsive: true, maintainAspectRatio: true,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true } } }
+  });
+</script>
+{% endblock %}

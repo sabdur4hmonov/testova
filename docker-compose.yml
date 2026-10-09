@@ -1,19 +1,33 @@
 version: "3.9"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Production stack: postgres + redis + bot ONLY.
+# Production stack: postgres + redis + bot + admin.
 #
-# The Celery worker/beat/flower, the FastAPI admin API, and nginx were REMOVED
-# on purpose:
+# Celery and the OLD FastAPI admin (app.admin.main, built on the dead
+# subscription model, guarded only by a default secret) were REMOVED on
+# purpose and stay removed:
 #   - Celery is dead code (app.tasks.file_tasks ImportErrors) — the worker/beat
 #     would crash-loop. Background work runs in-process (the exam timer is an
 #     in-process APScheduler; extraction runs on the event loop's thread pool).
-#   - The FastAPI admin (app.admin.main) is built on the dead subscription model
-#     and was guarded only by a default secret — administration is done via the
-#     in-bot admin commands (/grant, /stats, …) instead.
-#   - nginx required TLS certs that are not shipped, and the bot runs in polling
-#     mode, so no reverse proxy is needed.
-# Reintroduce them only with their own review.
+#   - app.admin.main no longer exists in this repo at all.
+#
+# The comment that used to be here also said "administration is done via
+# in-bot commands ... no reverse proxy is needed" — true when it was written,
+# false now. app.admin.web (a session-cookie HTML dashboard, NOT the removed
+# app.admin.main) replaced the in-bot-only story, and its login REQUIRES
+# HTTPS — the session cookie is https_only, so over plain HTTP the browser
+# silently refuses to store it and login redirects forever with no error
+# (see admin_main.py). The `admin` service below is therefore published to
+# loopback ONLY: reach it via an SSH tunnel, or put a real reverse proxy with
+# real TLS certs in front and change the publish rule accordingly (docs/
+# DEPLOY.md spells out both options — this repo picks neither for you, since
+# both are legitimate and the certs are not something a git commit can supply).
+#
+# nginx itself (Celery excepted) stays removed for now, not because it is
+# wrong, but because docker/nginx.conf is a stale leftover from BEFORE the
+# panel existed (wrong upstream port, a /webhook location for a bot that runs
+# in polling mode and has no listening port) — reintroduce it deliberately,
+# rewritten for what actually runs today, not by uncommenting the old file.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -21,14 +35,19 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: always
+    # AUDIT C-7: no service had a memory ceiling, so a LibreOffice fan-out in
+    # the bot could drive the host OOM killer into Postgres instead. Limits are
+    # per-service caps, not reservations — normal load sits well under them.
+    mem_limit: 768m
+    cpus: 1.0
     environment:
       POSTGRES_DB: testova_db
       POSTGRES_USER: testova
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strongpassword}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # No ports: mapping — reachable only from other containers on the
+    # compose network (bot service), never from the host/internet.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U testova -d testova_db"]
       interval: 10s
@@ -39,13 +58,29 @@ services:
   redis:
     image: redis:7-alpine
     restart: always
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # Headroom over the 512mb maxmemory below (the rest covers RDB fork +
+    # client buffers).
+    #
+    # AUDIT F10: noeviction, NOT allkeys-lru. This Redis holds only state —
+    # FSM conversations, single-flight operation leases, throttle windows — and
+    # no cache. Under allkeys-lru a full Redis silently evicted a teacher's
+    # mid-flow state AND the lease guarding a paid action, so a second paid run
+    # was allowed (reproduced on a 2mb Redis). With noeviction a full Redis
+    # refuses NEW writes loudly (OOM error; leases fail closed) and never drops
+    # existing state. FSM keys carry a TTL (FSM_TTL_DAYS) so abandoned
+    # conversations cannot fill it. Changing this needs the redis container
+    # recreated (docker compose up -d redis).
+    mem_limit: 640m
+    cpus: 0.5
+    command: >
+      redis-server --maxmemory 512mb --maxmemory-policy noeviction
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
+    # No ports: mapping — reachable only from other containers on the
+    # compose network (bot service), never from the host/internet.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}", "--no-auth-warning", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -58,6 +93,12 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: always
+    # The bot is the memory-hungry service: PDF rasterization, Pillow crops and
+    # one `soffice` process per concurrent DOCX. That last one is now bounded in
+    # code too (file_processor._SOFFICE_SEMAPHORE) — the two limits work
+    # together: the semaphore caps how many spawn, this caps what they may use.
+    mem_limit: 2g
+    cpus: 2.0
     command: python main.py
     env_file: .env
     volumes:
@@ -73,8 +114,108 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:-strongpassword}@postgres:5432/testova_db
-      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/testova_db
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
+
+  # ── Admin web panel (app/admin/web) ───────────────────────────────────────
+  # Same image as the bot (same Dockerfile), different entrypoint. Uses ONLY
+  # postgres — no Redis dependency (verified: no admin/web module imports it)
+  # and no storage/temp_images volume (moderation.delete_book removes only the
+  # DB row; nothing under app/admin/web touches the filesystem) — so this
+  # service gets none of the bot's volumes.
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    # A single-admin dashboard has no business holding the bot's 20+20
+    # connection budget (AUDIT C-28 already flags that budget as
+    # over-provisioned for ONE process; adding a second full-sized pool on the
+    # same postgres would double the risk of exhausting its default
+    # max_connections=100). Existing, already-env-configurable settings
+    # fields — no code change — capped here instead.
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/testova_db
+      - DATABASE_POOL_SIZE=5
+      - DATABASE_MAX_OVERFLOW=5
+    mem_limit: 512m
+    cpus: 0.5
+    command: python admin_main.py
+    env_file: .env
+    volumes:
+      # Read-only: the panel's error-monitoring page reads the bot's log; it
+      # never needs to write here.
+      - ./logs:/app/logs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Loopback-only by default — see the stack comment above for why, and
+      # docs/DEPLOY.md for the SSH-tunnel-vs-reverse-proxy decision. This is
+      # NOT "safe to open to 0.0.0.0"; https_only=True means an admin session
+      # over plain HTTP simply will not log in, and opening this without
+      # putting TLS in front of it does not fix that.
+      - "127.0.0.1:8001:8001"
+
+  # ── Online tests (online/) — students' browser page ─────────────────────
+  # OFF by default: starts only with `docker compose --profile online up`,
+  # and answers every link with "switched off" unless ONLINE_TEST_ENABLED=true.
+  # Same image as the bot (like admin), its own entrypoint. Published to
+  # LOOPBACK only: students reach it through a reverse proxy with TLS on the
+  # ONLINE_BASE_URL domain (docs/YANGI_FUNKSIYALAR.md). One worker on purpose:
+  # the code-guessing rate limit is per process.
+  online:
+    profiles: ["online"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m online.main
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://testova:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/testova_db
+      - DATABASE_POOL_SIZE=5
+      - DATABASE_MAX_OVERFLOW=5
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      # Question pictures, read-only: the bot writes them, the page shows them.
+      - ./temp_images:/app/temp_images:ro
+      - ./storage:/app/storage:ro
+      # No ./logs mount: two processes rotating the bot's logs/testova.log
+      # would corrupt it. Read this service's log with `docker compose logs online`.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8002:8002"
+
+  # ── AI-text detector (detector/) ─────────────────────────────────────────
+  # OFF by default: starts only with `docker compose --profile detector up`.
+  # The bot reaches it at DETECTOR_URL (http://detector:8010) and only when
+  # DETECTOR_ENABLED=true. No ports: mapping — compose network only.
+  # Model files are NOT in the image: export them into ./detector/models
+  # (detector/README.md), they are mounted read-only. Measured: ~600 MB peak
+  # RSS with the English model; the cap leaves room for the uz/ru model.
+  detector:
+    profiles: ["detector"]
+    build:
+      context: ./detector
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 1536m
+    cpus: ${DETECTOR_CPUS:-2.0}
+    environment:
+      - DETECTOR_THREADS=${DETECTOR_THREADS:-2}
+      - OMP_NUM_THREADS=${DETECTOR_THREADS:-2}
+      - DETECTOR_API_TOKEN=${DETECTOR_API_TOKEN:-}
+    volumes:
+      - ./detector/models:/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   postgres_data:

@@ -150,3 +150,37 @@ def test_shared_styles_are_not_mutated():
     # change may not touch. Pin the originals.
     assert STYLES["question"].spaceBefore == 8
     assert STYLES["option"].spaceBefore == 5   # stacked-fraction bleed guard
+
+
+# ── Regression: a long variant (>40 Q, some images) must build multi-page ────
+# The production LayoutError was in the answer-key builder, but the same "content
+# must flow across pages" invariant applies to the variants PDF. This proves a
+# biology+chemistry-sized variant (46 questions: MCQ + open + image) builds
+# without a LayoutError and spans multiple pages.
+def test_long_variant_with_images_and_open_builds_multipage():
+    questions = []
+    for n in range(1, 47):
+        if n % 8 == 0:
+            # image question (no file → exercises the fallback box, no asset dep)
+            questions.append({
+                "position_in_variant": n, "question_text": f"Rasmga qarang {n}",
+                "options": {"a": "bir", "b": "ikki", "d": "uch", "e": "tort"},
+                "correct_answer": "a", "has_image": True,
+                "image_description": "diagramma",
+            })
+        elif n % 5 == 0:
+            # open / write-in question (no options)
+            questions.append({"position_in_variant": n,
+                              "question_text": f"Javobni yozing: savol {n}", "options": {}})
+        else:
+            questions.append(_mc(n))
+    pdf = build_variants_pdf(_variant(questions), "Biologiya + Kimyo")
+    assert pdf[:4] == b"%PDF"
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        assert len(doc) > 1, "a 46-question variant must span multiple pages"
+        txt = "\n".join(doc[i].get_text() for i in range(len(doc)))
+    finally:
+        doc.close()
+    assert "Javobni yozing" in txt          # open questions render
+    assert "46." in txt                     # the last question made it in

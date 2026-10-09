@@ -1,0 +1,7 @@
+# Local tests: python -m pytest detector/tests
+-r requirements.txt
+-r requirements-train.txt
+pytest==8.4.0
+pytest-asyncio==1.0.0
+httpx==0.28.1
+psutil

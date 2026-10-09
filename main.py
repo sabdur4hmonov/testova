@@ -9,15 +9,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-from app.bot.main import create_bot, create_dispatcher
-from app.config import settings
+from app.bot.main import build_dispatcher, create_bot
+from app.config import secret_value, settings, validate_gemini_models, validate_security
 from app.database import async_session_factory
 from app.services import exam_timer
+from app.tasks import alert_check
+from app.services.image_retention import prune_expired_project_crops
+from app.services.original_retention import prune_orphan_originals
 from app.utils.logging import get_logger, setup_logging
+
+# Module level, not only inside main(): on_startup logs, and it was previously
+# reachable with `logger` unbound (it was assigned only via `global logger` in
+# main(), or in the __main__ block), so any caller outside main() -- a test, or
+# an embedding process -- hit NameError on the first log line. main() still
+# rebinds this after setup_logging() configures the handlers.
+logger = get_logger("main")
 
 
 async def on_startup(bot, dp) -> None:
@@ -36,11 +47,85 @@ async def on_startup(bot, dp) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("exam_scheduler_init_failed", error=str(exc))
 
+    # Daily temp_images/ crop retention — registered on the SAME scheduler as
+    # the exam timer (not a second scheduler). NON-FATAL, same as above: a
+    # failure here must never block the bot from starting.
+    try:
+        scheduler = exam_timer.get_scheduler()
+        if scheduler is not None:
+            async def _crop_cleanup_job() -> None:
+                try:
+                    await prune_expired_project_crops(async_session_factory)
+                except Exception as exc:  # noqa: BLE001 — one bad run must not kill the schedule
+                    logger.warning("temp_images_cleanup_failed", error=str(exc))
+
+            scheduler.add_job(
+                _crop_cleanup_job,
+                trigger="interval",
+                days=1,
+                id="temp_images_cleanup",
+                replace_existing=True,
+                next_run_time=datetime.now(timezone.utc),  # also catch up once at startup
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("temp_images_cleanup_schedule_failed", error=str(exc))
+
+    # Daily orphaned-original reaping (AUDIT C-8). Same scheduler, same
+    # non-fatal contract. Gated on ORIGINAL_RETENTION_ENABLED, which ships
+    # False — this one deletes teacher uploads, so it stays inert until an
+    # operator has read a dry run against the production database.
+    # Hourly cost-alert check (AUDIT B-31). The module existed but was
+    # scheduled NOWHERE, so ALERT_DAILY_USD / ALERT_USER_USD_30D rendered on a
+    # dashboard page and never notified anyone. Same scheduler, same non-fatal
+    # contract as the jobs above. It only sends when an alert is active, so a
+    # quiet system stays quiet. Alerting deliberately lands BEFORE the
+    # USER_TOKEN_BUDGET_30D enforcement path is ever enabled.
+    try:
+        scheduler = exam_timer.get_scheduler()
+        if scheduler is not None:
+            async def _cost_alert_job() -> None:
+                try:
+                    await alert_check.run_once(bot)
+                except Exception as exc:  # noqa: BLE001 — one bad run must not kill the schedule
+                    logger.warning("cost_alert_check_failed", error=str(exc))
+
+            scheduler.add_job(
+                _cost_alert_job,
+                trigger="interval",
+                hours=1,
+                id="cost_alert_check",
+                replace_existing=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cost_alert_schedule_failed", error=str(exc))
+
+    if settings.ORIGINAL_RETENTION_ENABLED:
+        try:
+            scheduler = exam_timer.get_scheduler()
+            if scheduler is not None:
+                async def _orphan_original_job() -> None:
+                    try:
+                        await prune_orphan_originals(
+                            async_session_factory, dry_run=False
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("orphan_originals_failed", error=str(exc))
+
+                scheduler.add_job(
+                    _orphan_original_job,
+                    trigger="interval",
+                    days=1,
+                    id="orphan_originals_cleanup",
+                    replace_existing=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("orphan_originals_schedule_failed", error=str(exc))
+
     if settings.is_webhook_mode:
         webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
         await bot.set_webhook(
             url=webhook_url,
-            secret_token=settings.WEBHOOK_SECRET,
+            secret_token=secret_value(settings.WEBHOOK_SECRET) or None,
             drop_pending_updates=True,
         )
         logger.info("webhook_set", url=webhook_url)
@@ -76,8 +161,18 @@ async def main() -> None:
     )
     logger.info("thread_pool_sized", max_workers=settings.THREAD_POOL_MAX_WORKERS)
 
+    # AUDIT B-9. BEFORE anything binds a port: refuse to start webhook mode
+    # without a real secret, since aiogram authenticates every request when the
+    # secret is empty. Raising here is deliberate — an open webhook is not a
+    # degraded mode to warn about and continue from.
+    validate_security(settings)
+    # Same fail-fast rule for model routing: a role set to a model we cannot
+    # drive (unknown, or without that role's thinking level) would otherwise
+    # 400 on its first real call, mid-lesson.
+    validate_gemini_models(settings)
+
     bot = create_bot()
-    dp = create_dispatcher()
+    dp = await build_dispatcher()
 
     async def _startup() -> None:
         await on_startup(bot, dp)
@@ -90,7 +185,7 @@ async def main() -> None:
 
     if settings.is_webhook_mode:
         app = web.Application()
-        handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=settings.WEBHOOK_SECRET)
+        handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret_value(settings.WEBHOOK_SECRET) or None)
         handler.register(app, path=settings.WEBHOOK_PATH)
         setup_application(app, dp, bot=bot)
         runner = web.AppRunner(app)
@@ -105,7 +200,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logger = None  # will be set after setup_logging()
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):

@@ -12,8 +12,8 @@ from app.services import account, quota
 def _paid_pro(**over):
     now = datetime.now(timezone.utc)
     d = dict(
-        monthly_variant_limit=50, variant_count_this_period=10,
-        monthly_check_limit=1000, check_count_this_period=20,
+        monthly_variant_limit=40, variant_count_this_period=10,
+        monthly_check_limit=800, check_count_this_period=20,
         period_start=now, access_until=now + timedelta(days=30),
         uses_left=None, is_admin=False,
     )
@@ -24,9 +24,9 @@ def _paid_pro(**over):
 def test_summary_paid_plan_numbers():
     lines = "\n".join(account.summary_lines(_paid_pro()))
     assert "Pro" in lines
-    assert "Test yaratish qolgan: <b>40/50</b>" in lines      # 50 - 10
-    assert "Rasm tekshirish qolgan: <b>980/1000</b>" in lines  # 1000 - 20
-    assert "100,000 so'm/oy" in lines
+    assert "Test yaratish qolgan: <b>30/40</b>" in lines      # 40 - 10
+    assert "Rasm tekshirish qolgan: <b>780/800</b>" in lines   # 800 - 20
+    assert "150,000 so'm/oy" in lines
     assert "kun" in lines
 
 
@@ -40,7 +40,8 @@ def test_summary_bepul_uses_trial_meter():
     )
     lines = "\n".join(account.summary_lines(u))
     assert "Bepul" in lines
-    assert "Test yaratish qolgan: <b>1 ta</b>" in lines        # trial uses, not x/limit
+    # LIFETIME, and labelled as such: the trial's one generation never refills
+    assert "Test yaratish qolgan (butun davrga): <b>1 ta</b>" in lines
     assert "Rasm tekshirish: <b>cheksiz</b>" in lines
     assert "Narx" not in lines                                  # no price for Bepul
 
@@ -48,9 +49,9 @@ def test_summary_bepul_uses_trial_meter():
 def test_summary_rolling_reset_shows_full():
     # window started 31 days ago and is spent → reads as full again
     old = datetime.now(timezone.utc) - timedelta(days=31)
-    u = _paid_pro(period_start=old, variant_count_this_period=50, check_count_this_period=1000)
-    assert quota.remaining(u, quota.VARIANT) == 50
-    assert quota.remaining(u, quota.CHECK) == 1000
+    u = _paid_pro(period_start=old, variant_count_this_period=40, check_count_this_period=800)
+    assert quota.remaining(u, quota.TEST) == 40
+    assert quota.remaining(u, quota.CHECK) == 800
 
 
 class _Msg:
@@ -73,9 +74,12 @@ async def test_handle_pricing_two_plans_one_contact_button():
 
     # only the two real plans, none of the retired ones
     assert "Standart" in m.text and "Pro" in m.text
-    assert "50,000" in m.text and "100,000" in m.text
+    assert "75,000" in m.text and "150,000" in m.text
     assert "Center" not in m.text and "29,000" not in m.text and "FREE" not in m.text
-    assert "25 ta test yaratish" in m.text and "500 ta rasm tekshirish" in m.text
+    # the SHARED pool is spelled out on the pricing screen, plus the book cap
+    assert "20 ta test (kitobdan yoki fayldan)" in m.text
+    assert "400 ta rasm tekshirish" in m.text
+    assert "4 ta kitob yuklash" in m.text
 
     # exactly one button, and it opens the admin chat (URL, not a dead callback)
     buttons = [b for row in m.markup.inline_keyboard for b in row]

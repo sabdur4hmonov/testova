@@ -5,12 +5,11 @@ Two levels of proof, both reproducible without a live Gemini key:
   * plumbing — the extraction and grading call paths pass the teacher's
     telegram_id into log_gemini_usage (the Gemini call itself is stubbed);
   * aggregation — usage_summary sums the REAL recorded tokens and scopes them
-    per user (runs against local Postgres; skips cleanly if unavailable).
+    per user (against the per-run test database from the conftest `engine`
+    fixture, never the live one).
 """
 import uuid
 from datetime import datetime, timedelta, timezone
-
-import pytest
 
 from app.services.usage_log import estimate_cost
 
@@ -23,9 +22,22 @@ class _FakeExtractResp:
     usage_metadata = None
 
 
-class _FakeModel:
-    def generate_content(self, parts, generation_config=None):
-        return _FakeExtractResp()
+class _FakeExtractHttp:
+    """Stubs the REST layer extraction now uses (it moved off the SDK — NEW-1)."""
+
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {
+            "usageMetadata": {},
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "[]"}]},
+            }],
+        }
 
 
 def test_extract_call_attributes_user_id(monkeypatch):
@@ -33,18 +45,24 @@ def test_extract_call_attributes_user_id(monkeypatch):
 
     captured: dict = {}
 
-    def fake_log(response, kind="extract", model="", user_id=None):
+    def fake_log(response, kind="extract", model="", user_id=None,
+                 call_site=None):
         captured["kind"] = kind
         captured["user_id"] = user_id
+        captured["call_site"] = call_site
 
     monkeypatch.setattr(usage_log, "log_gemini_usage", fake_log)
 
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeExtractHttp())
+
     analyzer = ai_analyzer.AIAnalyzer(user_id=555)
-    analyzer.model = _FakeModel()          # stub the Gemini SDK call
     analyzer._call_sync_multi("prompt", [b"imgbytes"])
 
     assert captured["kind"] == "extract"
     assert captured["user_id"] == 555      # attributed to the teacher
+    # kind alone cannot distinguish the four ai_analyzer sites; call_site can.
+    assert captured["call_site"] == "extract.page"
 
 
 def test_extract_unattributed_when_no_user(monkeypatch):
@@ -53,15 +71,20 @@ def test_extract_unattributed_when_no_user(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(
         usage_log, "log_gemini_usage",
-        lambda response, kind="extract", model="", user_id=None: captured.update(user_id=user_id),
+        lambda response, kind="extract", model="", user_id=None,
+               call_site=None: captured.update(user_id=user_id),
     )
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeExtractHttp())
+
     analyzer = ai_analyzer.AIAnalyzer()     # no user_id (e.g. a dead path)
-    analyzer.model = _FakeModel()
     analyzer._call_sync_multi("prompt", [b"x"])
     assert captured["user_id"] is None
 
 
 class _FakeHttp:
+    status_code = 200  # the grading call now checks for 429, as gemini_rest does
+
     def raise_for_status(self):
         pass
 
@@ -85,9 +108,11 @@ async def test_grade_call_attributes_user_id(monkeypatch):
 
     captured: dict = {}
 
-    def fake_log(response, kind="extract", model="", user_id=None):
+    def fake_log(response, kind="extract", model="", user_id=None,
+                 call_site=None):
         captured["kind"] = kind
         captured["user_id"] = user_id
+        captured["call_site"] = call_site
 
     monkeypatch.setattr(usage_log, "log_gemini_usage", fake_log)
     monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeHttp())
@@ -97,36 +122,19 @@ async def test_grade_call_attributes_user_id(monkeypatch):
     await sheet_reader.read_answer_sheet(b"rawphoto", 5)
 
     assert captured["kind"] == "grade"
+    assert captured["call_site"] == "grade.sheet"
     assert captured["user_id"] == 777
 
 
 # ── Aggregation: usage_summary scopes real tokens per user ───────────────────
 
-async def _usage_engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT user_id FROM gemini_usage LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_usage_summary_scopes_by_user():
+async def test_usage_summary_scopes_by_user(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.models.gemini_usage import GeminiUsage
     from app.services.usage_log import usage_summary
 
-    engine = await _usage_engine()
-    if engine is None:
-        pytest.skip("Postgres/gemini_usage not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
 
     a = int(uuid.uuid4().int % 10**11)
@@ -168,4 +176,3 @@ async def test_usage_summary_scopes_by_user():
         async with sm() as s:
             await s.execute(delete(GeminiUsage).where(GeminiUsage.user_id.in_([a, b])))
             await s.commit()
-        await engine.dispose()

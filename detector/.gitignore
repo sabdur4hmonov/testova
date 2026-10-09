@@ -1,0 +1,15 @@
+.venv/
+# Model weights never go into git (hundreds of MB); see README.md to rebuild.
+models/*
+!models/.gitkeep
+# Training data: teachers' texts, collected images and everything derived
+# from them never go into git. Only the empty folders and the meta example do.
+data/*
+!data/human/
+data/human/*
+!data/human/.gitkeep
+!data/human/meta.example.csv
+!data/ai_manual/
+data/ai_manual/*
+!data/ai_manual/.gitkeep
+models_sinov/

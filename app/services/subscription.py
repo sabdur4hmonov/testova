@@ -1,7 +1,7 @@
 """Subscription and usage-limit enforcement."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,7 +93,12 @@ async def check_and_increment_usage(
 
 
 def _reset_daily_if_needed(user: User) -> None:
-    today = date.today()
+    # UTC on BOTH sides. last_reset_date is written as datetime.now(timezone.utc)
+    # below, so comparing it against date.today() (LOCAL) made the two disagree
+    # for the hours between local midnight and UTC midnight — five hours every
+    # night at UTC+5. In that window the counter reset on EVERY call and the
+    # daily limit never applied. Latent until the clock crossed local midnight.
+    today = datetime.now(timezone.utc).date()
     last_reset = user.last_reset_date
     if last_reset is None or last_reset.date() < today:
         user.daily_projects_used = 0

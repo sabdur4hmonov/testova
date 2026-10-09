@@ -29,6 +29,8 @@ class CheckResult(Base):
         UUID(as_uuid=True), nullable=True, index=True
     )
     variant_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # CP-5: the edition a saved check was graded against (NULL for manual checks).
+    edition_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # Reserved for a later phase (naming graded students); included now so we
     # never have to migrate this table twice.
     student_name: Mapped[str | None] = mapped_column(String(100), nullable=True)

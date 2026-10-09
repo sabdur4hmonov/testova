@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.bot.keyboards.main_menu import MAIN_MENU_TEXTS, main_menu
@@ -43,19 +44,27 @@ WELCOME = {
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, db_user: User) -> None:
+async def cmd_start(message: Message, state: FSMContext, db_user: User) -> None:
+    # AUDIT B-38: /start must be a real escape hatch. It took no FSMContext and
+    # never reset, so a user wedged in UploadStates.waiting_for_test_name got
+    # the welcome and the menu — and their NEXT message was still swallowed as
+    # a test name. "⬅️ Orqaga" was the only universal escape, and it is not on
+    # the main keyboard.
+    await state.clear()
     lang = db_user.language.value
     text = WELCOME.get(lang, WELCOME["uz"]).format(name=message.from_user.first_name)
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu(lang))
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, db_user: User) -> None:
+async def cmd_help(message: Message, state: FSMContext, db_user: User) -> None:
+    await state.clear()      # B-38: same escape-hatch contract as /start
     lang = db_user.language.value
     texts = {
         "uz": (
             "📖 <b>Yordam</b>\n\n"
-            "1. <b>Variant yaratish</b>\n"
+            "1. <b>Tayyor testdan</b>\n"
+            "   «📄 Bitta fayldan» yoki «📚 Bir nechta fayldan» ni tanlang.\n"
             "   PDF, DOCX yoki rasm faylini yuboring.\n"
             "   Bot savollarni ajratib oladi va variant soni ni so'raydi.\n\n"
             "2. <b>Test tekshirish</b>\n"
@@ -67,7 +76,8 @@ async def cmd_help(message: Message, db_user: User) -> None:
         ),
         "en": (
             "📖 <b>Help</b>\n\n"
-            "1. <b>Create Variants</b>\n"
+            "1. <b>From a ready test</b>\n"
+            "   Pick \"📄 From one file\" or \"📚 From several files\".\n"
             "   Upload a PDF, DOCX, or image file.\n"
             "   The bot extracts questions and asks how many variants you need.\n\n"
             "2. <b>Check Test</b>\n"
@@ -79,7 +89,8 @@ async def cmd_help(message: Message, db_user: User) -> None:
         ),
         "ru": (
             "📖 <b>Помощь</b>\n\n"
-            "1. <b>Создать варианты</b>\n"
+            "1. <b>Из готового теста</b>\n"
+            "   Выберите «📄 Из одного файла» или «📚 Из нескольких файлов».\n"
             "   Загрузите PDF, DOCX или изображение.\n"
             "   Бот извлечёт вопросы и спросит количество вариантов.\n\n"
             "2. <b>Проверить тест</b>\n"

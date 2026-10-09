@@ -229,13 +229,13 @@ def _load_image_bytes(image_path: str) -> bytes | None:
 
     # Strategy 3: S3 / async storage — read synchronously via boto3 if configured
     try:
-        from app.config import settings
+        from app.config import secret_value, settings
         if settings.STORAGE_TYPE == "s3":
             import boto3
             s3 = boto3.client(
                 "s3",
-                aws_access_key_id=settings.S3_ACCESS_KEY,
-                aws_secret_access_key=settings.S3_SECRET_KEY,
+                aws_access_key_id=secret_value(settings.S3_ACCESS_KEY) or None,
+                aws_secret_access_key=secret_value(settings.S3_SECRET_KEY) or None,
                 endpoint_url=settings.S3_ENDPOINT_URL,
                 region_name=settings.S3_REGION,
             )
@@ -516,6 +516,15 @@ def _option_table(markups: list, ncols: int, indent: float, table_w: float,
     return tbl
 
 
+def _variant_label(variant: dict, template: str = "Variant {n}") -> str:
+    """"Variant 3", plus the edition code when the variant carries one
+    ("Variant 3 · K7Q2") — CP-5: the code matches a paper to the edition whose
+    key grades it. The code alphabet is plain A-Z/2-9, so nothing to escape."""
+    label = template.format(n=variant["variant_number"])
+    code = variant.get("edition_code")
+    return f"{label} · {code}" if code else label
+
+
 def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
     """exam_title is retained for signature compatibility but no longer
     printed — each variant starts with a handwriting fill-in block."""
@@ -541,7 +550,7 @@ def build_variants_pdf(variants: list[dict], exam_title: str = "Exam") -> bytes:
         story.append(Spacer(1, 1.5 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
-        story.append(Paragraph(f"Variant {vnum}", STYLES["variant_header_center"]))
+        story.append(Paragraph(_variant_label(variant), STYLES["variant_header_center"]))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(Spacer(1, 3 * mm))
@@ -1014,7 +1023,7 @@ def build_variants_pdf_compact(variants: list[dict], exam_title: str = "Exam") -
         story.append(Spacer(1, 1.5 * mm))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
-        story.append(Paragraph(f"Variant {vnum}", head))
+        story.append(Paragraph(_variant_label(variant), head))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor("#1a237e")))
         story.append(NextPageTemplate("twocol"))
@@ -1145,7 +1154,7 @@ def _format_answer(accepted) -> str:
 def _key_column_lines(variant: dict) -> tuple[str, list[str]]:
     """A variant's heading + its "N. answer" lines, in printed-position order."""
     key = variant.get("answer_key", {})
-    heading = f"{variant['variant_number']}-Variant"
+    heading = _variant_label(variant, "{n}-Variant")
     lines = [f"{pos}. {_format_answer(key[pos])}" for pos in sorted(key, key=int)]
     return heading, lines
 
@@ -1227,37 +1236,69 @@ def build_answer_key_pdf(variants: list[dict], exam_title: str = "Exam") -> byte
     if cur:
         blocks.append(cur)
 
-    # 3) Render each block as one outer table row of variant columns.
+    # 3) Render each block as ONE flat grid table: variants are COLUMNS, answer
+    #    positions are ROWS, with a thin empty spacer column between variants for
+    #    the visual gap.
+    #
+    #    CRITICAL (production LayoutError fix): the columns must NOT be built as
+    #    per-variant inner Tables placed inside an outer table's single row. A
+    #    ReportLab table cell cannot split across a page boundary, so a variant
+    #    with enough answers to exceed the page height (a ~46-question test made
+    #    a 968pt column) makes the whole flowable "too large on page N" and the
+    #    build hard-crashes — the teacher never gets the PDF. A single top-level
+    #    Table instead splits BY ROW across pages on its own (splitByRow is on by
+    #    default), and repeatRows=1 reprints the "N-Variant" headers on each page.
+    #    Side-by-side columns break at the same row, which is exactly right for
+    #    parallel answer lists.
     for block in blocks:
-        cells = []
-        for heading, lines, col_w in block:
-            inner_rows = [[Paragraph(_esc(heading), head_style)]]
-            for ln in lines:
-                inner_rows.append([Paragraph(_esc(ln), cell_style)])
-            inner = Table(inner_rows, colWidths=[col_w])
-            inner.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#1a237e")),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c5cae9")),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+        # Interleave content columns with COL_GAP-wide spacer columns.
+        col_widths: list[float] = []
+        content_cols: list[int] = []
+        for i, (_h, _l, col_w) in enumerate(block):
+            if i > 0:
+                col_widths.append(COL_GAP)           # spacer between variants
+            content_cols.append(len(col_widths))
+            col_widths.append(col_w)
+        ncols = len(col_widths)
+
+        max_rows = max(len(lines) for _h, lines, _w in block)
+        header_row: list = [""] * ncols
+        for ci, (heading, _lines, _w) in zip(content_cols, block):
+            header_row[ci] = Paragraph(_esc(heading), head_style)
+        data = [header_row]
+        for r in range(max_rows):
+            row: list = [""] * ncols
+            for ci, (_heading, lines, _w) in zip(content_cols, block):
+                if r < len(lines):
+                    row[ci] = Paragraph(_esc(lines[r]), cell_style)
+            data.append(row)
+
+        style_cmds: list = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ]
+        # Per-variant boxing/striping/header — applied to each CONTENT column so
+        # the spacer columns stay blank (the inter-variant gap).
+        for ci in content_cols:
+            style_cmds += [
+                ("BACKGROUND", (ci, 0), (ci, 0), colors.HexColor("#1a237e")),
+                ("GRID", (ci, 0), (ci, -1), 0.4, colors.HexColor("#c5cae9")),
+                ("ROWBACKGROUNDS", (ci, 1), (ci, -1),
                  [colors.white, colors.HexColor("#eef0fa")]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]))
-            cells.append(inner)
-        outer = Table([cells], colWidths=[c[2] for c in block], hAlign="LEFT")
-        outer.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            # inter-column gap on every column except the last
-            ("RIGHTPADDING", (0, 0), (-2, -1), COL_GAP),
-            ("RIGHTPADDING", (-1, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        story.append(outer)
+            ]
+        for sc in range(ncols):
+            if sc not in content_cols:                # spacer columns: no insets
+                style_cmds += [
+                    ("LEFTPADDING", (sc, 0), (sc, -1), 0),
+                    ("RIGHTPADDING", (sc, 0), (sc, -1), 0),
+                ]
+
+        table = Table(data, colWidths=col_widths, hAlign="LEFT", repeatRows=1)
+        table.setStyle(TableStyle(style_cmds))
+        story.append(table)
         story.append(Spacer(1, 6 * mm))
 
     doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)

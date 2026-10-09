@@ -49,6 +49,13 @@ class Question(Base):
     # for rows created before 008 (read via `correct_answers_ordered` fallback).
     correct_answers: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
+    # CP28: expected key points for an open-ended answer — a short checklist the
+    # model produced at generation time, stored for a FUTURE answer-checking
+    # upgrade. NULL for multiple-choice, for pre-CP28 rows, and for pooled written
+    # questions (the pool carries no rubric while its guard is off). Dormant data:
+    # today's grading reads correct_answers, never this.
+    answer_rubric: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     # Image support
     has_image: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     image_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)

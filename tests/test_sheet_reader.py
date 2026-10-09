@@ -54,6 +54,9 @@ async def test_malformed_safe_failure(patched):
     assert res == {
         "variant": None, "student_name": None, "name_unclear": False,
         "answers": {}, "texts": {}, "unclear": [],
+        # CP-2: a content-less read reports no blanks and every expected
+        # question as unread (the handler still shows "unreadable" first).
+        "blank": [], "unread": list(range(1, 11)),
     }
 
 
@@ -138,6 +141,39 @@ async def test_variant_from_text(patched):
     assert res["variant"] == 5
 
 
+# ── CP22: numeric-labelled tests (C2) ────────────────────────────────────────
+
+async def test_numeric_marks_read_as_options(patched):
+    # A numeric-labelled test (option_labels are digits): digit marks are
+    # MARKED OPTIONS, not written answers.
+    patched('{"answers": {"1":"2","2":"4","3":"1"}}')
+    res = await SR.read_answer_sheet(b"x", 3, option_labels=["1", "2", "3", "4"])
+    assert res["answers"] == {1: "2", 2: "4", 3: "1"}
+    assert res["texts"] == {}
+
+
+async def test_digit_stays_written_when_labels_are_not_numeric(patched):
+    # Same digit marks, but a LETTER-labelled test → they are written numeric
+    # answers, never misread as options (guards the CP22 ambiguity).
+    patched('{"answers": {"3":"5"}}')
+    res = await SR.read_answer_sheet(b"x", 3, option_labels=["A", "B", "C", "D"])
+    assert res["texts"] == {3: "5"}
+    assert res["answers"] == {}
+
+
+def test_labels_block_lists_numeric_labels():
+    block = SR._labels_block(["1", "2", "3", "4"])
+    assert "1, 2, 3, 4" in block
+
+
+def test_answer_sheet_prompt_does_not_force_letters():
+    # The body must describe labels generically (letters OR numbers), not insist
+    # on outputting a letter — that hardcoding was what broke numeric grading.
+    p = SR.ANSWER_SHEET_PROMPT
+    assert "NUMBERS" in p or "digit" in p
+    assert "or a number to a letter" in p   # explicit no-cross-convert rule
+
+
 # ── Confidence flags (Part 1: uncertainty flagging) ──────────────────────────
 
 async def test_name_flagged_unsure(patched):
@@ -184,7 +220,9 @@ async def test_unclear_not_regressed_by_name_flag(patched):
 
 async def test_name_flag_rides_one_gemini_call(patched):
     patched('{"student_name": "X", "name_unsure": true, "answers": {"22": "PHONE"}}')
-    await SR.read_answer_sheet(b"x", 22)
+    # CP-2: the canned response covers ONLY q22, so say that is the whole sheet —
+    # otherwise q1-q21 are unread and the (correct) retry would add calls.
+    await SR.read_answer_sheet(b"x", 1, expected_questions=[22])
     # ONE read per sheet: the name flag and the answers ride the SAME prompt.
     assert len(patched.calls) == 1
 
@@ -250,3 +288,14 @@ async def test_full_25_answer_read_not_retried(monkeypatch):
     res = await SR.read_answer_sheet(b"x", 25)
     assert len(res["answers"]) == 25
     assert calls["n"] == 1   # one call, no retry needed
+
+
+# ── CP32: numeric look-alike caution covers the observed 8-vs-5 misread ──────
+
+def test_the_prompt_flags_the_eight_vs_five_lookalike():
+    """The CP22 live run misread a written '8' as '5'. The reader's numeric
+    look-alike caution now names that pair, so an ambiguous 8/5 yields '?'
+    (teacher-checked) instead of a silent wrong grade."""
+    p = SR.ANSWER_SHEET_PROMPT
+    assert "8 vs 5" in p
+    assert "8 vs 6" in p and "8 vs 3" in p

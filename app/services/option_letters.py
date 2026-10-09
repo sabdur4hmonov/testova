@@ -30,12 +30,12 @@ _CYR_DE = "Д"  # Д
 _CYR_IE = "Е"  # Е
 _CYR_ES = "С"  # С (Es — visual twin of Latin C)
 
-# A–F: real tests use up to F (six options), often gapped (a, b, d, e). Kept as
+# A–H: real tests use up to eight options, often gapped (a, b, d, e). Kept as
 # a fixed generous set because the photo classifier has no per-question option
 # context; a letter that isn't a real option for a question just grades wrong via
-# is_correct, same as any wrong answer. (F has no Cyrillic look-alike, so it only
-# joins the Latin set.)
-_LATIN = set("ABCDEF")
+# is_correct, same as any wrong answer. Widened F→H for CP22's 3–8 option range
+# (G, H have no Cyrillic look-alike, so they only join the Latin set).
+_LATIN = set("ABCDEFGH")
 _CYRILLIC = {_CYR_A, _CYR_BE, _CYR_VE, _CYR_GHE, _CYR_DE, _CYR_IE, _CYR_ES}
 _OPTION_LETTERS = _LATIN | _CYRILLIC
 
@@ -48,7 +48,7 @@ _CANON = {
 
 # Regex character class covering every accepted option letter (for callers that
 # need to capture candidate letters before validating).
-OPTION_LETTER_CLASS = "A-F" + "".join(sorted(_CYRILLIC))
+OPTION_LETTER_CLASS = "A-H" + "".join(sorted(_CYRILLIC))
 
 # The Cyrillic option letters as a plain string, for callers that need to KEEP
 # them while stripping other characters (e.g. a bare "АБВГ" answer-key run).

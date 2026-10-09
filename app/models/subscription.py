@@ -1,3 +1,20 @@
+"""DEAD TABLE — mapped, migrated, and written by nothing.
+
+No code in this repo constructs a `Subscription`; the table holds 0 rows. It
+survives from migration 001, when the plan was to keep subscription state in
+its own table. That is not how this codebase works now: a user's plan is
+DERIVED from their limit columns on `users` (see app/services/plans.py), and
+`plans.plan_for()` is the one definition.
+
+It is deliberately NOT the home of the payment ledger — see
+app/models/payment.py for why (dead, wrong shape, legacy free/pro/center enum).
+Left in place rather than dropped: removing a table is a separate decision from
+adding one, and it costs nothing standing empty.
+
+DO NOT start writing this table without first resolving which of it and `users`
+is authoritative for a user's plan. Two answers to that question is how the
+dashboard's trial count went wrong (commit b58f4ed).
+"""
 from __future__ import annotations
 
 import uuid

@@ -1,0 +1,275 @@
+{% extends "base.html" %}
+{% block title %}{{ user.full_name }} — Testova Admin{% endblock %}
+{% block heading_mobile %}User{% endblock %}
+{% block content %}
+{% if flash %}<div class="alert alert-{{ flash.level }} py-2">{{ flash.message }}</div>{% endif %}
+
+<div class="mb-3">
+  <a href="/users" class="text-decoration-none">‹ Foydalanuvchilar</a>
+</div>
+<div class="d-flex flex-wrap justify-content-between align-items-center mb-3">
+  <h1 class="h4 mb-0">
+    {% if user.is_blocked %}⛔{% else %}✅{% endif %} {{ user.full_name }}
+    <span class="text-muted fs-6">
+      <code>{{ user.telegram_id }}</code>
+      {% if user.username %}· @{{ user.username }}{% endif %}
+    </span>
+  </h1>
+  <span class="badge text-bg-primary fs-6">{{ plan_name(user) }}</span>
+</div>
+
+<div class="row g-3">
+  <!-- Profile -->
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Profil</h2>
+      <table class="table table-sm mb-0">
+        <tr><th>Muddat</th><td>
+          {% if user.access_until is none %}cheksiz
+          {% elif user.access_until > now %}{{ user.access_until.strftime('%Y-%m-%d') }} ({{ (user.access_until - now).days }} kun)
+          {% else %}<span class="text-danger">tugagan ({{ user.access_until.strftime('%Y-%m-%d') }})</span>{% endif %}</td></tr>
+        <tr><th>Ishlatish (uses)</th><td>{% if user.uses_left is none %}∞{% else %}{{ user.uses_left }}{% endif %}</td></tr>
+        {# What the teacher actually PAID. A dash means nothing was recorded, so
+           the account page falls back to the plan's CURRENT price — set it with
+           /setprice in the bot. #}
+        <tr><th>To‘langan narx</th><td>{% if user.price_som_at_purchase is none %}<span class="text-muted">— (joriy narx)</span>{% else %}{{ '{:,}'.format(user.price_som_at_purchase) }} so‘m{% endif %}</td></tr>
+        <tr><th>Variant limiti (oy)</th><td>{{ user.variant_count_this_period }} / {{ user.monthly_variant_limit if user.monthly_variant_limit is not none else '∞' }}</td></tr>
+        <tr><th>Tekshirish limiti (oy)</th><td>{{ user.check_count_this_period }} / {{ user.monthly_check_limit if user.monthly_check_limit is not none else '∞' }}</td></tr>
+        <tr><th>Testlar (jami)</th><td>{{ user.total_projects }}</td></tr>
+        <tr><th>Izoh</th><td>{{ user.note or '—' }}</td></tr>
+        <tr><th>Oxirgi faollik</th><td>{{ user.updated_at.strftime('%Y-%m-%d %H:%M') }}</td></tr>
+      </table>
+    </div></div>
+  </div>
+
+  <!-- Cost -->
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Xarajat (30 kun)</h2>
+      <div class="h3 mb-1">${{ '%.4f'|format(cost30.cost.usd) }}
+        <span class="fs-6 text-muted">≈ {{ '{:,.0f}'.format(cost30.cost.som) }} so‘m · {{ cost30.calls }} chaqiruv</span></div>
+      {% if cost30.unpriced_calls %}<div class="small text-warning">⚠️ {{ cost30.unpriced_calls }} narxlanmagan model</div>{% endif %}
+      <table class="table table-sm mt-2 mb-0">
+        <thead><tr><th>Turi</th><th class="text-end">Chaqiruv</th><th class="text-end">USD</th></tr></thead>
+        <tbody>
+          {% for k in by_kind %}
+          <tr><td>{{ k.kind }}</td><td class="text-end">{{ k.calls }}</td><td class="text-end">${{ '%.4f'|format(k.usd) }}</td></tr>
+          {% else %}<tr><td colspan="3" class="text-muted">Xarajat yo‘q.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div></div>
+  </div>
+
+  <!-- Books + Payments -->
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Kitoblar</h2>
+      <p class="mb-1">Egalik: <b>{{ books_owned }}</b> / {{ user.book_limit if user.book_limit is not none else '∞' }}
+        {% if user.book_limit is not none and books_owned >= user.book_limit %}
+          <span class="badge text-bg-danger">limitga yetgan</span>
+        {% elif user.book_limit is not none and books_owned >= user.book_limit - 1 %}
+          <span class="badge text-bg-warning">limitga yaqin</span>{% endif %}</p>
+      <p class="mb-0 small text-muted">Kitob tahlili (oy): {{ user.book_analysis_count_this_period }} /
+        {{ user.monthly_book_analysis_limit if user.monthly_book_analysis_limit is not none else '∞' }}</p>
+      <hr>
+      <h2 class="h6 text-muted">To‘lovlar / foyda</h2>
+
+      {# Profit sits BESIDE the 30-day cost breakdown in the card to the left,
+         not on top of it: that card answers "what is this teacher costing us
+         lately", this one answers "have they paid for more than that, ever".
+         Both sides here are LIFETIME so the subtraction is meaningful. #}
+      <div class="row g-2 text-center mb-2">
+        <div class="col-4">
+          <div class="small text-muted">Tushum (jami)</div>
+          <div class="fs-6 fw-semibold">{{ '{:,}'.format(profit.revenue_som).replace(',', ' ') }}</div>
+        </div>
+        <div class="col-4">
+          <div class="small text-muted">Xarajat (jami)</div>
+          <div class="fs-6 fw-semibold">{{ '{:,}'.format(profit.cost_som|round|int).replace(',', ' ') }}</div>
+        </div>
+        <div class="col-4">
+          <div class="small text-muted">Foyda</div>
+          <div class="fs-6 fw-semibold {% if profit.profit_som < 0 %}text-danger{% elif profit.revenue_som %}text-success{% endif %}">
+            {{ '{:,}'.format(profit.profit_som|round|int).replace(',', ' ') }}</div>
+        </div>
+      </div>
+      <p class="small text-muted mb-2">
+        so‘mda. Marja:
+        {% if profit.margin_pct is none %}<span title="tushum yo‘q">—</span>
+        {% else %}{{ '%.1f'|format(profit.margin_pct) }}%{% endif %}
+        · xarajat ${{ '%.4f'|format(profit.cost_usd) }}
+        {% if profit.underwater %}
+          <span class="badge text-bg-danger">zarar</span>
+        {% endif %}
+      </p>
+      {# Not a footnote: most gemini_usage rows carry no user_id at all, so a
+         per-user cost is a FLOOR and this profit is a CEILING. Saying so here
+         is cheaper than someone pricing a tier off an optimistic number. #}
+      <p class="small text-muted mb-2">
+        Xarajat faqat shu foydalanuvchiga biriktirilgan chaqiruvlardan.
+        Umumiy taqsimot — <a href="/revenue">Revenue</a>.
+      </p>
+
+      {% if payments %}
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-2">
+          <thead><tr><th>Sana</th><th>Tarif</th><th class="text-end">So‘m</th><th>Izoh</th></tr></thead>
+          <tbody>
+          {% for p in payments %}
+            <tr>
+              <td class="text-nowrap">{{ p.paid_at.strftime('%Y-%m-%d') }}
+                {% if p.back_dated %}<span class="badge text-bg-secondary" title="keyin kiritilgan">←</span>{% endif %}
+              </td>
+              <td>{{ p.plan_label }}</td>
+              <td class="text-end">{{ '{:,}'.format(p.amount_som).replace(',', ' ') }}</td>
+              <td class="small text-muted">{{ p.reference or p.note or '' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+        <p class="small text-muted mb-2">To‘lov yozilmagan.</p>
+      {% endif %}
+
+      {# Recording a payment is ALSO how a plan gets sold through the panel:
+         one action writes the ledger and calls the same admin_users.set_plan
+         the bot's /plan uses. Untick "tarifni qo‘llash" to log history only
+         (a back-dated transfer whose window has already passed). #}
+      <form class="row g-1 align-items-center" method="post" action="/users/{{ user.telegram_id }}/payment">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <div class="col-4">
+          <select class="form-select form-select-sm" name="plan" aria-label="tarif">
+            {% for key, pl in plans.items() %}
+              <option value="{{ key }}">{{ pl.name }} — {{ '{:,}'.format(pl.price_som).replace(',', ' ') }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-4">
+          {# type=number's browser validation requires (value - min) % step == 0.
+             min="1" step="1000" accepted only 1, 1001, 2001, … — a real
+             tariff price (75000) was REJECTED, with the browser reporting
+             "nearest valid values are 74001 and 75001", because 75000 is not
+             1 + 1000*n. A payment is any positive so'm integer (discounts,
+             negotiated amounts, not just list prices), so the constraint is
+             "positive integer", not "a round thousand" — step="1" (the HTML
+             default, made explicit here) with min="1" imposes exactly that
+             and nothing more. #}
+          <input class="form-control form-control-sm" type="number" name="amount_som"
+                 min="1" step="1" placeholder="so‘m" required aria-label="summa">
+        </div>
+        <div class="col-4">
+          <input class="form-control form-control-sm" type="date" name="paid_at"
+                 aria-label="to‘lov sanasi" title="bo‘sh = bugun">
+        </div>
+        <div class="col-8">
+          <input class="form-control form-control-sm" type="text" name="reference" maxlength="128"
+                 placeholder="bank ref / izoh" aria-label="izoh">
+        </div>
+        <div class="col-4 d-grid">
+          <button class="btn btn-sm btn-success">To‘lovni yozish</button>
+        </div>
+        <div class="col-12">
+          <div class="form-check form-check-inline">
+            <input class="form-check-input" type="checkbox" name="apply_plan" value="1"
+                   id="apply_plan" checked>
+            <label class="form-check-label small text-muted" for="apply_plan">
+              tarifni qo‘llash (30 kun kirish + limitlar)</label>
+          </div>
+        </div>
+      </form>
+    </div></div>
+  </div>
+
+  <!-- Quick actions -->
+  <div class="col-12 col-lg-6">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h6 text-muted">Amallar</h2>
+      <div class="row g-2">
+        <div class="col-12">
+          <form class="row g-1 align-items-center" method="post" action="/users/{{ user.telegram_id }}/grant">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <div class="col-3"><input class="form-control form-control-sm" type="number" name="days" value="30" title="kun"></div>
+            <div class="col-3"><input class="form-control form-control-sm" type="number" name="uses" placeholder="uses"></div>
+            <div class="col-4"><input class="form-control form-control-sm" type="text" name="note" placeholder="izoh"></div>
+            <div class="col-2 d-grid"><button class="btn btn-sm btn-success">Grant</button></div>
+          </form>
+        </div>
+        <div class="col-6">
+          <form class="input-group input-group-sm" method="post" action="/users/{{ user.telegram_id }}/extend">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input class="form-control" type="number" name="days" value="30" title="kun">
+            <button class="btn btn-outline-primary">Extend</button>
+          </form>
+        </div>
+        <div class="col-6">
+          <form class="input-group input-group-sm" method="post" action="/users/{{ user.telegram_id }}/setuses">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input class="form-control" type="number" name="n" value="0" title="uses (-1=∞)">
+            <button class="btn btn-outline-primary">Set uses</button>
+          </form>
+        </div>
+        <div class="col-6">
+          <form class="input-group input-group-sm" method="post" action="/users/{{ user.telegram_id }}/setbooklimit">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input class="form-control" type="number" name="n" value="0" title="kitob limiti (-1=∞)">
+            <button class="btn btn-outline-primary">Book limit</button>
+          </form>
+        </div>
+        <div class="col-6 d-flex gap-2">
+          {% if user.is_blocked %}
+          <form class="d-grid flex-grow-1" method="post" action="/users/{{ user.telegram_id }}/unblock">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button class="btn btn-sm btn-success">Unblock</button></form>
+          {% else %}
+          <form class="d-grid flex-grow-1" method="post" action="/users/{{ user.telegram_id }}/revoke"
+                data-confirm="Ruxsatni bekor qilishni tasdiqlaysizmi?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button class="btn btn-sm btn-outline-danger">Revoke</button></form>
+          {% endif %}
+        </div>
+
+        {# Send THIS teacher a Telegram message. Same path as the bot's
+           /message command (broadcast.send_direct), same prefix, same audit
+           row — there is no second send path. #}
+        <div class="col-12">
+          <hr class="my-2">
+          <form method="post" action="/users/{{ user.telegram_id }}/message"
+                data-confirm="Xabar shu foydalanuvchiga Telegram orqali yuboriladi. Davom etasizmi?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input type="hidden" name="send_intent" value="{{ send_intent(request, 'direct:' ~ user.telegram_id) }}">
+            <input type="hidden" name="confirmed" value="0">
+            <label class="form-label small text-muted mb-1" for="dm_text">
+              Telegram xabari</label>
+            <textarea class="form-control form-control-sm mb-2" id="dm_text" name="text"
+                      rows="3" maxlength="3500" placeholder="Xabar matni…"
+                      required></textarea>
+            <button class="btn btn-sm btn-outline-primary">✉️ Xabar yuborish</button>
+          </form>
+        </div>
+      </div>
+    </div></div>
+  </div>
+</div>
+
+<!-- Usage history -->
+<div class="card mt-3"><div class="card-body">
+  <h2 class="h6 text-muted">Foydalanish tarixi (oxirgi {{ history|length }})</h2>
+  <div class="table-responsive">
+    <table class="table table-sm table-striped mb-0">
+      <thead><tr><th>Vaqt</th><th>Turi</th><th>Model</th><th class="text-end">Kirish</th><th class="text-end">Chiqish</th><th class="text-end">USD</th></tr></thead>
+      <tbody>
+        {% for h in history %}
+        <tr>
+          <td>{{ h.created_at.strftime('%m-%d %H:%M') }}</td>
+          <td>{{ h.kind }}</td><td><code>{{ h.model }}</code></td>
+          <td class="text-end">{{ '{:,}'.format(h.prompt_tokens) }}</td>
+          <td class="text-end">{{ '{:,}'.format(h.output_tokens) }}</td>
+          <td class="text-end">${{ '%.5f'|format(h.usd) }}</td>
+        </tr>
+        {% else %}<tr><td colspan="6" class="text-muted">Foydalanish tarixi yo‘q.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div></div>
+{% endblock %}

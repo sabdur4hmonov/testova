@@ -19,7 +19,7 @@ def _run(questions):
     a = _analyzer()
     calls = []
 
-    async def fake_call_multi(prompt, imgs):
+    async def fake_call_multi(prompt, imgs, call_site=None):
         calls.append(prompt)
         return ("[]", 0)     # empty recovery result
 

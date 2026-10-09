@@ -1,15 +1,16 @@
 """
 Access control — the 10 scenarios. Pure logic + real-DB atomicity where
-concurrency matters. The DB tests skip cleanly if Postgres is unreachable.
+concurrency matters. The DB tests run on the per-run test database from the
+conftest `engine` fixture, never the live one.
 """
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from app.models.user import User
 from app.services import access
+
+from tests.synthetic_ids import TEST_ADMIN_ID
 
 
 # Anchored to the REAL clock so FUTURE stays in the future and PAST in the past
@@ -123,25 +124,12 @@ def test_10_uses_zero_active_session_multi_resume_only():
     assert gate_denied(u, UPLOAD, has_active_session=True) is True   # single upload blocked
 
 
-# ── Real-DB atomicity (local NullPool engine; skips if unavailable) ──────────
+# ── Real-DB atomicity (conftest NullPool engine, per-run test database) ──────
 # NullPool opens/closes a connection per use so nothing caches across the
-# per-test event loop. Skips cleanly if Postgres is down OR migration 003
-# (the uses_left column) hasn't been applied yet.
-
-async def _local_engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT uses_left FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
+# per-test event loop. Real connections, not the savepoint `session` fixture:
+# test_concurrent_decrement_exactly_once races two sessions through
+# asyncio.gather, and one shared connection would serialise them into a test
+# that cannot fail.
 
 async def _mk_user(sm, uses_left):
     async with sm() as s:
@@ -160,13 +148,10 @@ async def _get_uses(sm, uid):
         return r.scalar_one().uses_left
 
 
-async def test_concurrent_decrement_exactly_once():
+async def test_concurrent_decrement_exactly_once(engine):
     # (4) uses_left=1 + two concurrent decrements → exactly one decrement
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
-    engine = await _local_engine()
-    if engine is None:
-        pytest.skip("Postgres/migration-003 not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     uid = await _mk_user(sm, 1)
     try:
@@ -182,15 +167,11 @@ async def test_concurrent_decrement_exactly_once():
         async with sm() as s:
             await s.execute(delete(User).where(User.id == uid))
             await s.commit()
-        await engine.dispose()
 
 
-async def test_unlimited_user_never_decrements():
+async def test_unlimited_user_never_decrements(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
-    engine = await _local_engine()
-    if engine is None:
-        pytest.skip("Postgres/migration-003 not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     uid = await _mk_user(sm, None)  # unlimited
     try:
@@ -201,17 +182,13 @@ async def test_unlimited_user_never_decrements():
         async with sm() as s:
             await s.execute(delete(User).where(User.id == uid))
             await s.commit()
-        await engine.dispose()
 
 
-async def test_2_multi_source_three_files_one_charge():
+async def test_2_multi_source_three_files_one_charge(engine):
     # (2) whole builder session = ONE decrement, on the first source only
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.builder import BuilderSession
-    engine = await _local_engine()
-    if engine is None:
-        pytest.skip("Postgres/migration-003 not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     uid = await _mk_user(sm, 3)
     async with sm() as s:
@@ -233,7 +210,6 @@ async def test_2_multi_source_three_files_one_charge():
             await s.execute(delete(BuilderSession).where(BuilderSession.id == sid))
             await s.execute(delete(User).where(User.id == uid))
             await s.commit()
-        await engine.dispose()
 
 
 # ── (3) failed extraction never decrements ───────────────────────────────────
@@ -332,7 +308,13 @@ async def test_7_non_admin_grant_refused(monkeypatch):
 
     non_admin = _user(is_admin=False)
     non_admin.telegram_id = 999
-    await admin.cmd_grant(_M(), CommandObject(command="grant", args="123 30"), non_admin)
+    m = _M()
+    cmd = CommandObject(command="grant", args="123 30")
+
+    async def call_next(ev, data):
+        return await admin.cmd_grant(ev, cmd, non_admin)
+
+    await admin.AdminOnlyMiddleware()(call_next, m, {"db_user": non_admin})
     assert called["db"] is False
     assert any("admin" in a.lower() for a in answers)
 
@@ -427,7 +409,11 @@ async def test_non_admin_revoke_callback_refused(monkeypatch):
     non_admin = _user(is_admin=False)
     non_admin.telegram_id = 999
     cb = _CB("adm:rev:ok:123")
-    await admin.handle_revoke_confirm(cb, non_admin)
+
+    async def call_next(ev, data):
+        return await admin.handle_revoke_confirm(ev, non_admin)
+
+    await admin.AdminOnlyMiddleware()(call_next, cb, {"db_user": non_admin})
     assert any("admin" in e.lower() for e in cb.message.edits)
 
 
@@ -442,7 +428,12 @@ async def test_non_admin_revoke_command_refused(monkeypatch):
     msg = _EditMsg()
     non_admin = _user(is_admin=False)
     non_admin.telegram_id = 999
-    await admin.cmd_revoke(msg, CommandObject(command="revoke", args="123"), non_admin)
+    cmd = CommandObject(command="revoke", args="123")
+
+    async def call_next(ev, data):
+        return await admin.cmd_revoke(ev, cmd, non_admin)
+
+    await admin.AdminOnlyMiddleware()(call_next, msg, {"db_user": non_admin})
     assert any("admin" in a.lower() for a in msg.answers)
 
 
@@ -455,22 +446,19 @@ class _NoOpCtx:
 
 # ── (8) grant → revoke → unblock lifecycle (real handlers, local engine) ──────
 
-async def test_8_grant_revoke_unblock_lifecycle(monkeypatch):
+async def test_8_grant_revoke_unblock_lifecycle(engine, monkeypatch):
     from sqlalchemy import delete, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from aiogram.filters import CommandObject
     from app.bot.handlers import admin
     from app.models.admin_log import AdminLog
 
-    engine = await _local_engine()
-    if engine is None:
-        pytest.skip("Postgres/migration-003 not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(admin, "async_session_factory", sm)
 
     tg = int(uuid.uuid4().int % 10**11)
     admin_user = _user(is_admin=True)
-    admin_user.telegram_id = 1
+    admin_user.telegram_id = TEST_ADMIN_ID
 
     class _M:
         async def answer(self, *a, **k):
@@ -511,7 +499,6 @@ async def test_8_grant_revoke_unblock_lifecycle(monkeypatch):
             await s.execute(delete(AdminLog).where(AdminLog.target == tg))
             await s.execute(delete(User).where(User.telegram_id == tg))
             await s.commit()
-        await engine.dispose()
 
 
 # ── /myaccess text ───────────────────────────────────────────────────────────

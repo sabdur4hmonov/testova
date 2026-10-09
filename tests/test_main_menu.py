@@ -14,7 +14,11 @@ def _rows(markup):
 
 def test_menu_layout_and_order():
     rows = _rows(main_menu("uz"))
-    assert rows[0] == ["📤 Variant yaratish", "📚 Ko'p manbadan test yaratish"]
+    # Row 0 changed with the Kitobdan restructuring: "Variant yaratish" and
+    # "Ko'p manbadan..." moved into the "Tayyor testdan" sub-menu (their flows
+    # are unchanged). Shape and ordering of the rest is untouched.
+    # See tests/test_menu_restructure.py.
+    assert rows[0] == ["📤 Tayyor testdan", "📚 Kitobdan"]
     assert rows[1] == ["✅ Test tekshirish"]
     assert rows[2] == ["💎 Hisobim", "💎 Tariflar"]
     assert rows[3] == ["🌐 Til", "💬 Yordam"]

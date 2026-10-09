@@ -1,6 +1,8 @@
 """
 User-management service layer.
 
+_LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\%", "_": "\_"})
+
 ALL access-control mutations and lookups live here so the Telegram admin
 handlers AND a future web admin panel call the SAME functions — no logic is
 duplicated between the two front-ends. Each function takes an AsyncSession,
@@ -19,6 +21,11 @@ from sqlalchemy import func, select
 from app.models.admin_log import AdminLog
 from app.models.builder import BuilderSession, BuilderStatus
 from app.models.user import User
+
+# AUDIT B-53. Same table book_library uses, kept local rather than imported
+# service-to-service. Escapes the LIKE metacharacters so `/find %` matches a
+# literal percent instead of every user in the database.
+_LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\%", "_": "\_"})
 
 
 def _now() -> datetime:
@@ -105,8 +112,8 @@ async def set_uses(session, admin_id: int, tg_id: int, n: int) -> User:
 
 
 async def set_plan(session, admin_id: int, tg_id: int, plan_key: str) -> User:
-    """Assign a paid plan (the ONE command for a manual sale). Sets BOTH monthly
-    limits to the plan's bundle, neutralises the old trial meter (uses_left =
+    """Assign a paid plan (the ONE command for a manual sale). Sets the plan's
+    WHOLE bundle - the shared test pool, the check limit and the book cap - neutralises the old trial meter (uses_left =
     NULL/unlimited), starts a fresh 30-day access window + quota cycle (zeroes
     both counters, period_start = now). Raises ValueError on an unknown plan
     BEFORE touching the DB (no row created / changed)."""
@@ -119,8 +126,16 @@ async def set_plan(session, admin_id: int, tg_id: int, plan_key: str) -> User:
 
     now = _now()
     user = await get_or_create(session, tg_id)
-    user.monthly_variant_limit = plan.variant_limit
+    user.monthly_variant_limit = plan.test_limit   # the SHARED book+variant pool
     user.monthly_check_limit = plan.check_limit
+    # What was SOLD, stamped at the sale. plans.price_som is a live constant, so
+    # without this every price rise silently re-prices existing subscribers'
+    # account pages. Written HERE and nowhere else: /resetquota is a renewal, not
+    # a sale, and leaves this alone — which is what makes a grandfathered price
+    # hold until an admin explicitly re-sells the teacher.
+    user.price_som_at_purchase = plan.price_som
+    user.book_limit = plan.book_limit     # assigned NOWHERE before this, which is
+                                          # why every tier was unlimited on books
     user.uses_left = None                 # paid users aren't gated by the trial counter
     user.variant_count_this_period = 0    # fresh full cycle from today
     user.check_count_this_period = 0
@@ -163,11 +178,76 @@ async def set_variant_limit(session, admin_id: int, tg_id: int, n: int) -> User:
     return user
 
 
+async def set_price(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Record what this teacher ACTUALLY paid, in so'm. n < 0 → NULL (clear).
+
+    The ONLY way to write a price that is not today's constant. set_plan stamps
+    plan.price_som, so re-running /plan on someone who paid 50,000 writes 75,000
+    and destroys the NULL that was at least falling back honestly — and /plan is
+    not a price-only operation either: it zeroes both period counters, restarts
+    period_start and pushes access_until out 30 days, so correcting a price
+    through it would hand the customer a free quota reset and a month of access.
+
+    Hence a setter that moves the price and NOTHING else — no counter, no
+    period, no limit, no access window. That isolation is the whole point, and
+    tests/test_grandfathered_price.py pins it field by field.
+
+    n < 0 → NULL means "forget what I recorded" (fall back to the live
+    constant), not "unlimited" as it does for the limit setters. Same -1
+    convention, so a mistyped price can be undone rather than replaced with
+    another wrong number.
+    """
+    user = await get_or_create(session, tg_id)
+    user.price_som_at_purchase = None if n < 0 else n
+    await _write_log(session, admin_id, "setprice", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def set_check_limit(session, admin_id: int, tg_id: int, n: int) -> User:
     """Set the monthly answer-checking limit. n < 0 → unlimited (NULL)."""
     user = await get_or_create(session, tg_id)
     user.monthly_check_limit = None if n < 0 else n
     await _write_log(session, admin_id, "setchecklimit", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_book_limit(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Set the TOTAL cap on books owned. n < 0 → unlimited (NULL).
+
+    NOT a monthly quota: this one never resets (a library is permanent) and is
+    enforced against a live COUNT of the user's books. See app/models/user.py.
+    """
+    user = await get_or_create(session, tg_id)
+    user.book_limit = None if n < 0 else n
+    await _write_log(session, admin_id, "setbooklimit", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_book_analysis_limit(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Set the monthly book-ANALYSIS limit (the recurring paid Gemini pass).
+    n < 0 → unlimited (NULL). Independent of the variant/check quotas and of
+    book_limit."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_book_analysis_limit = None if n < 0 else n
+    await _write_log(session, admin_id, "setbookanalysislimit", tg_id, n=n)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_book_generation_limit(session, admin_id: int, tg_id: int, n: int) -> User:
+    """Set the monthly book-GENERATION limit (the reasoning Gemini pass that
+    turns a saved theme into questions). n < 0 → unlimited (NULL). Independent
+    of book_analysis/variant/check quotas and of book_limit."""
+    user = await get_or_create(session, tg_id)
+    user.monthly_book_generation_limit = None if n < 0 else n
+    await _write_log(session, admin_id, "setbookgenerationlimit", tg_id, n=n)
     await session.commit()
     await session.refresh(user)
     return user
@@ -248,8 +328,13 @@ async def search_users(
     q = (query or "").strip().lstrip("@").strip()
     if not q:
         return [], 0
-    pattern = f"%{q}%"
-    cond = User.username.ilike(pattern) | User.full_name.ilike(pattern)
+    # AUDIT B-53: escape LIKE wildcards. Parameterised, so never an injection —
+    # but `/find %` matched EVERY user and `/find _` every 1-char name, which is
+    # a surprising admin tool at best. book_library already solves this the same
+    # way with its own _LIKE_ESCAPE.
+    pattern = f"%{q.translate(_LIKE_ESCAPE)}%"
+    cond = (User.username.ilike(pattern, escape="\\")
+            | User.full_name.ilike(pattern, escape="\\"))
     total = (await session.execute(
         select(func.count()).select_from(User).where(cond)
     )).scalar_one()

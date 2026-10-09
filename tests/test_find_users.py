@@ -1,36 +1,17 @@
 """
 Feature 3 — /find: partial, case-insensitive search over username OR full_name.
-Real Postgres; skips if unavailable.
+Real Postgres: the per-run test database from the conftest `engine` fixture,
+never the live one.
 """
 import uuid
 
-import pytest
 
-
-async def _engine():
-    from app.config import settings
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(text("SELECT 1 FROM users LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        return None
-    return engine
-
-
-async def test_search_matches_partial_username_and_name():
+async def test_search_matches_partial_username_and_name(engine):
     from sqlalchemy import delete
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.models.user import User
     from app.services import admin_users
 
-    engine = await _engine()
-    if engine is None:
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     tag = uuid.uuid4().hex[:8]                    # unique marker for cleanup
     a = int(uuid.uuid4().int % 10**11)
@@ -65,4 +46,3 @@ async def test_search_matches_partial_username_and_name():
         async with sm() as s:
             await s.execute(delete(User).where(User.telegram_id.in_([a, b, c])))
             await s.commit()
-        await engine.dispose()

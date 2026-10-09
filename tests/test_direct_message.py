@@ -2,15 +2,16 @@
 Feature 4 — /message: relay one admin message to a single user.
 
 Delivery + graceful blocked-bot handling proven with a fake bot (no network);
-the audit-log write proven against real Postgres.
+the audit-log write proven against real Postgres (the per-run test database
+from the conftest `engine` fixture, never the live one).
 """
 import uuid
-
-import pytest
 
 from aiogram.exceptions import TelegramForbiddenError
 
 from app.services import broadcast
+
+from tests.synthetic_ids import TEST_TARGET_ID
 
 
 class _Bot:
@@ -39,39 +40,28 @@ async def test_send_direct_blocked_user_returns_false_not_raise():
     assert ok is False           # reported as undelivered, no crash
 
 
-async def test_log_direct_message_writes_admin_log():
+async def test_log_direct_message_writes_admin_log(engine):
     from sqlalchemy import delete, select
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-    from sqlalchemy.pool import NullPool
-    from sqlalchemy import text as _text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from app.config import settings
     from app.models.admin_log import AdminLog
 
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    try:
-        async with engine.connect() as c:
-            await c.execute(_text("SELECT 1 FROM admin_log LIMIT 1"))
-    except Exception:
-        await engine.dispose()
-        pytest.skip("Postgres not available")
     sm = async_sessionmaker(engine, expire_on_commit=False)
     admin_id = int(uuid.uuid4().int % 10**11)
     try:
         async with sm() as s:
-            await broadcast.log_direct_message(s, admin_id, 5037603460, "Salom", True)
+            await broadcast.log_direct_message(s, admin_id, TEST_TARGET_ID, "Salom", True)
         async with sm() as s:
             row = (await s.execute(
                 select(AdminLog).where(AdminLog.admin_id == admin_id)
             )).scalar_one()
         assert row.action == "message"
-        assert row.target == 5037603460
+        assert row.target == TEST_TARGET_ID
         assert row.params["content"] == "Salom" and row.params["delivered"] is True
     finally:
         async with sm() as s:
             await s.execute(delete(AdminLog).where(AdminLog.admin_id == admin_id))
             await s.commit()
-        await engine.dispose()
 
 
 # ── handler: delivered vs undelivered reporting (no DB via stubs) ─────────────
